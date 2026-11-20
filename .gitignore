@@ -4,6 +4,7 @@
 .ddev/traefik/certs/
 .env
 /.claude
+/source
 
 # ds_store files
 .DS_Store
