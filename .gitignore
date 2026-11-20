@@ -1,6 +1,6 @@
 # the ddev folder and config
 # uncomment this for projects other than Craft-00-Boilerplate
-# /.ddev
+/.ddev
 .ddev/traefik/certs/
 .env
 /.claude
