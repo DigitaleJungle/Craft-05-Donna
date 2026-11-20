@@ -1,0 +1,755 @@
+<?php
+namespace verbb\formie\controllers;
+
+use verbb\formie\Formie;
+use verbb\formie\helpers\Plugin;
+use verbb\formie\models\Report;
+use verbb\formie\models\ReportExportFile;
+use verbb\formie\models\ReportSettings;
+use verbb\formie\services\Permissions;
+
+use Craft;
+use craft\helpers\Json;
+use craft\helpers\UrlHelper;
+use craft\web\Controller;
+use craft\web\Response;
+
+use yii\db\IntegrityException;
+use yii\web\ForbiddenHttpException;
+use yii\web\NotFoundHttpException;
+
+use Throwable;
+
+class ReportsController extends Controller
+{
+    // Properties
+    // =========================================================================
+
+    protected array|bool|int $allowAnonymous = ['download-export'];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function beforeAction($action): bool
+    {
+        if (!parent::beforeAction($action)) {
+            return false;
+        }
+
+        if ($action->id === 'download-export') {
+            return true;
+        }
+
+        // These run from the Submissions index, and only ever read what the user can export.
+        if (in_array($action->id, [
+            'submission-export',
+            'submission-export-options',
+            'submission-export-columns',
+            'submission-export-count',
+            'export-status',
+            'download-queued-export',
+        ], true)) {
+            $this->_requireExportPermission(true);
+
+            return true;
+        }
+
+        if (in_array($action->id, ['save', 'delete'], true)) {
+            $this->requirePermission(Permissions::PERM_MANAGE_REPORTS);
+        } elseif ($action->id === 'create' && $this->request->getIsPost()) {
+            $this->requirePermission(Permissions::PERM_MANAGE_REPORTS);
+        } else {
+            $this->requirePermission(Permissions::PERM_ACCESS_REPORTS);
+        }
+
+        return true;
+    }
+
+    public function actionIndex(?string $reportHandle = null): Response
+    {
+        $request = Craft::$app->getRequest();
+        $legacyReport = $request->getParam('report');
+
+        if ($legacyReport !== null && $legacyReport !== '') {
+            if (is_numeric($legacyReport)) {
+                $report = Formie::$plugin->getReports()->getReportById((int)$legacyReport);
+            } else {
+                $report = Formie::$plugin->getReports()->getReportByHandle((string)$legacyReport);
+            }
+
+            if ($report) {
+                return $this->redirect($report->getCpRunUrl());
+            }
+        }
+
+        if ($request->getParam('create')) {
+            return $this->redirect(UrlHelper::cpUrl('formie/reports/create'));
+        }
+
+        if ($reportHandle !== null && $reportHandle !== '') {
+            $report = Formie::$plugin->getReports()->getReportByHandle($reportHandle);
+
+            if (!$report) {
+                throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+            }
+        } else {
+            $reports = Formie::$plugin->getReports()->getAllReports();
+
+            if ($reports) {
+                return $this->redirect($reports[0]->getCpRunUrl());
+            }
+        }
+
+        return $this->_renderDashboard($reportHandle);
+    }
+
+    public function actionEdit(int $id = null, Report $report = null): Response
+    {
+        if (!$report && !$id) {
+            return $this->redirect(UrlHelper::cpUrl('formie/reports/create'));
+        }
+
+        $routeParams = Craft::$app->getUrlManager()->getRouteParams();
+        $postedSettings = $routeParams['postedSettings'] ?? null;
+
+        if (!$report) {
+            $report = Formie::$plugin->getReports()->getReportById($id);
+
+            if (!$report) {
+                throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+            }
+        }
+
+        $variables = compact('report');
+        $user = Craft::$app->getUser()->getIdentity();
+        $variables['canEdit'] = Formie::$plugin->getPermissions()->canEditReport($user, $report);
+        $variables['canManageReports'] = Formie::$plugin->getPermissions()->canManageReports($user);
+        $variables['fullPageForm'] = $variables['canEdit'];
+        $variables['title'] = $report->name;
+        $editorConfig = Formie::$plugin->getReportEditor()->getEditorConfig($report);
+
+        if (is_array($postedSettings)) {
+            $editorConfig['values'] = $postedSettings;
+        }
+
+        if ($report->hasErrors()) {
+            $editorConfig['errors'] = $report->getErrors();
+        }
+
+        Plugin::registerCpReportsAssets();
+        $this->view->registerJs('new Craft.Formie.Reports(' . Json::encode($editorConfig) . ');');
+
+        $variables['reportSettingsPayload'] = Json::encode($editorConfig['values']);
+        $variables['continueEditingUrl'] = 'formie/reports/edit/' . $report->id;
+
+        return $this->renderTemplate('formie/reports/edit', $variables);
+    }
+
+    public function actionSave(): ?Response
+    {
+        $this->requirePostRequest();
+
+        $request = $this->request;
+
+        $report = new Report();
+        $report->id = $request->getBodyParam('id');
+        $report->name = $request->getBodyParam('name');
+        $report->handle = $request->getBodyParam('handle');
+
+        $postedSettings = null;
+
+        if ($report->id) {
+            $existingReport = Formie::$plugin->getReports()->getReportById((int)$report->id);
+            $this->_requireEditableReport($existingReport);
+            $report->sortOrder = $existingReport?->sortOrder;
+
+            $postedSettings = $this->_decodeSettingsPayload();
+
+            if ($postedSettings === null) {
+                return $this->_failSave(
+                    $report,
+                    null,
+                    Craft::t('formie', 'The report could not be saved because its settings are invalid.'),
+                );
+            }
+
+            if (!Formie::$plugin->getReportEditor()->applyPayload($report, $postedSettings)) {
+                return $this->_failSave($report, $postedSettings);
+            }
+
+            $settings = $report->getSettingsModel();
+            $settings->filters['formIds'] = Formie::$plugin->getReportEditor()->resolveEditableFormIds(
+                $settings->filters['formIds'] ?? [],
+                $existingReport?->getSettingsModel()->filters['formIds'] ?? [],
+                Craft::$app->getUser()->getIdentity(),
+            );
+            $report->setSettingsModel($settings);
+        } else {
+            $report->setSettingsModel(new ReportSettings());
+        }
+
+        if (Formie::$plugin->getReports()->saveReport($report)) {
+            $this->setSuccessFlash(Craft::t('formie', 'Report saved.'));
+
+            return $this->redirectToPostedUrl($report);
+        }
+
+        return $this->_failSave($report, $postedSettings);
+    }
+
+    public function actionCreate(): Response
+    {
+        if (!$this->request->getIsPost()) {
+            $user = Craft::$app->getUser()->getIdentity();
+
+            if (!Formie::$plugin->getPermissions()->canManageReports($user)) {
+                return $this->redirect(UrlHelper::cpUrl('formie/reports'));
+            }
+
+            return $this->_renderDashboard(openCreate: true);
+        }
+
+        $this->requirePostRequest();
+
+        $report = new Report();
+        $report->name = trim((string)$this->request->getRequiredBodyParam('name'));
+        $report->handle = trim((string)$this->request->getRequiredBodyParam('handle'));
+
+        $formIds = $this->request->getBodyParam('formIds', []);
+
+        if (is_string($formIds)) {
+            $formIds = Json::decodeIfJson($formIds) ?? [];
+        }
+
+        $formIds = array_values(array_filter(array_map('intval', (array)$formIds)));
+        $formIds = Formie::$plugin->getReportEditor()->resolveEditableFormIds($formIds, [], Craft::$app->getUser()->getIdentity());
+
+        if ($formIds === []) {
+            return $this->asJson([
+                'success' => false,
+                'errors' => [
+                    'formIds' => [Craft::t('formie', 'Choose at least one form.')],
+                ],
+            ]);
+        }
+
+        $settings = new ReportSettings();
+        $settings->filters['formIds'] = $formIds;
+        $settings->columns = Formie::$plugin->getReportColumns()->getDefaultAttributeColumns();
+        $report->setSettingsModel($settings);
+
+        try {
+            if (!Formie::$plugin->getReports()->saveReport($report)) {
+                return $this->asJson([
+                    'success' => false,
+                    'errors' => $report->getErrors(),
+                ]);
+            }
+        } catch (IntegrityException) {
+            return $this->asJson([
+                'success' => false,
+                'errors' => [
+                    'handle' => [Craft::t('formie', 'That handle is already in use.')],
+                ],
+            ]);
+        }
+
+        return $this->asJson([
+            'success' => true,
+            'report' => [
+                'id' => (int)$report->id,
+                'name' => $report->name,
+                'handle' => $report->handle,
+            ],
+            'viewConfig' => Formie::$plugin->getReportViewer()->getViewConfig($report),
+            'redirect' => $report->getCpRunUrl(),
+        ]);
+    }
+
+    public function actionFormOptions(): Response
+    {
+        $this->requirePermission(Permissions::PERM_MANAGE_REPORTS);
+
+        return $this->asJson([
+            'formOptions' => Formie::$plugin->getReportEditor()->getFormOptions(Craft::$app->getUser()->getIdentity()),
+        ]);
+    }
+
+    public function actionViewConfig(int $id): Response
+    {
+        $report = Formie::$plugin->getReports()->getReportById($id);
+
+        if (!$report) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+        }
+
+        return $this->asJson(Formie::$plugin->getReportViewer()->getViewConfig($report));
+    }
+
+    public function actionFieldColumns(): Response
+    {
+        if ($this->request->getIsPost()) {
+            $this->requirePostRequest();
+        }
+
+        $formIds = $this->request->getBodyParam('formIds', $this->request->getParam('formIds', '*'));
+
+        if (is_string($formIds)) {
+            $formIds = Json::decodeIfJson($formIds) ?? $formIds;
+        }
+
+        $user = Craft::$app->getUser()->getIdentity();
+
+        return $this->asJson([
+            'fieldColumns' => Formie::$plugin->getReportColumns()->getFieldColumnsForFormIds($formIds, $user),
+            'fieldColumnGroups' => Formie::$plugin->getReportColumns()->getFieldColumnGroupsForFormIds($formIds, $user),
+        ]);
+    }
+
+    public function actionDelete(): Response
+    {
+        $this->requirePostRequest();
+
+        $reportId = (int)$this->request->getRequiredParam('id');
+        $this->_requireEditableReport(Formie::$plugin->getReports()->getReportById($reportId));
+
+        if (Formie::$plugin->getReports()->deleteReportById($reportId)) {
+            if ($this->request->getAcceptsJson()) {
+                return $this->asJson(['success' => true]);
+            }
+
+            $this->setSuccessFlash(Craft::t('formie', 'Report deleted.'));
+
+            return $this->redirectToPostedUrl();
+        }
+
+        if ($this->request->getAcceptsJson()) {
+            return $this->asJson(['error' => Craft::t('formie', 'Couldn’t delete report.')]);
+        }
+
+        $this->setFailFlash(Craft::t('formie', 'Couldn’t delete report.'));
+
+        return $this->redirectToPostedUrl();
+    }
+
+    public function actionView(int $id): Response
+    {
+        $report = Formie::$plugin->getReports()->getReportById($id);
+
+        if (!$report) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+        }
+
+        return $this->redirect($report->getCpRunUrl());
+    }
+
+    public function actionTableData(int $id): Response
+    {
+        $report = Formie::$plugin->getReports()->getReportById($id);
+
+        if (!$report) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+        }
+
+        if ($this->request->getIsPost()) {
+            $this->requirePostRequest();
+        }
+
+        $page = (int)$this->request->getParam('page', 1);
+        $defaultLimit = max(1, min(100, (int)Formie::$plugin->getSettings()->reportTablePageSize));
+        $limit = (int)$this->request->getParam('limit', $defaultLimit);
+        $columnOverride = $this->_decodeColumnOverride();
+        $viewer = $this->_decodeViewerParams();
+
+        return $this->asJson(
+            Formie::$plugin->getReportQuery()->getTableData($report, $page, $limit, null, $columnOverride, $viewer),
+        );
+    }
+
+    public function actionViewerData(int $id): Response
+    {
+        $report = Formie::$plugin->getReports()->getReportById($id);
+
+        if (!$report) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+        }
+
+        if ($this->request->getIsPost()) {
+            $this->requirePostRequest();
+        }
+
+        $viewer = $this->_decodeViewerParams();
+        $settings = $report->getSettingsModel();
+        $chartData = Formie::$plugin->getReportQuery()->getChartData($report, null, $viewer);
+
+        return $this->asJson([
+            'summary' => Formie::$plugin->getReportQuery()->getSummaryCounts($report, null, null, $viewer),
+            'chart' => [
+                'enabled' => (bool)($settings->chart['enabled'] ?? true),
+                'range' => $chartData['range'],
+                'data' => $chartData['rows'],
+            ],
+        ]);
+    }
+
+    public function actionExport(int $id): Response
+    {
+        $this->_requireExportPermission();
+
+        $report = Formie::$plugin->getReports()->getReportById($id);
+
+        if (!$report) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Report not found.'));
+        }
+
+        if ($this->request->getIsPost()) {
+            $this->requirePostRequest();
+        }
+
+        return $this->_sendReportExport($report, $this->_decodeColumnOverride());
+    }
+
+    public function actionSubmissionExportOptions(): Response
+    {
+        $user = Craft::$app->getUser()->getIdentity();
+        $sites = Craft::$app->getSites();
+
+        return $this->asJson([
+            'forms' => Formie::$plugin->getReportEditor()->getFormOptions($user),
+            'statuses' => array_map(static fn($status) => [
+                'value' => (string)$status->id,
+                'label' => $status->name,
+                'handle' => $status->handle,
+            ], Formie::$plugin->getSubmissionStatuses()->getAllStatuses()),
+            'sites' => Craft::$app->getIsMultiSite() ? array_map(static fn($site) => [
+                'value' => (string)$site->id,
+                'label' => $site->name,
+            ], $sites->getEditableSites()) : [],
+            'asyncExportRowThreshold' => max(1, (int)Formie::$plugin->getSettings()->reportAsyncExportRowThreshold),
+        ]);
+    }
+
+    public function actionSubmissionExportColumns(): Response
+    {
+        $this->requirePostRequest();
+
+        $user = Craft::$app->getUser()->getIdentity();
+        $report = Formie::$plugin->getReportExport()->createSubmissionExportReport($this->request->getBodyParams());
+
+        return $this->asJson([
+            'columns' => array_map(static fn(array $column) => [
+                'type' => $column['type'],
+                'handle' => $column['handle'],
+                'label' => $column['label'],
+                'enabled' => (bool)$column['enabled'],
+            ], Formie::$plugin->getReportExport()->getSubmissionExportColumns($report, null, $user)),
+            'groups' => array_map(static fn(array $group) => [
+                'formId' => $group['formId'],
+                'formTitle' => $group['formTitle'],
+                'handles' => array_column($group['columns'], 'handle'),
+            ], Formie::$plugin->getReportColumns()->getFieldColumnGroupsForFormIds($report->getSettingsModel()->filters['formIds'] ?? [], $user)),
+        ]);
+    }
+
+    public function actionSubmissionExportCount(): Response
+    {
+        $this->requirePostRequest();
+
+        $report = Formie::$plugin->getReportExport()->createSubmissionExportReport($this->request->getBodyParams());
+        $query = Formie::$plugin->getReportQuery()->buildViewerQuery($report, null, $this->_decodeViewerParams());
+
+        return $this->asJson([
+            'count' => Formie::$plugin->getReportExport()->getExportRowCount($query),
+        ]);
+    }
+
+    public function actionSubmissionExport(): Response
+    {
+        $this->requirePostRequest();
+
+        $report = Formie::$plugin->getReportExport()->createSubmissionExportReport($this->request->getBodyParams());
+        $columns = Formie::$plugin->getReportExport()->getSubmissionExportColumns(
+            $report,
+            $this->_decodeColumnOverride(),
+            Craft::$app->getUser()->getIdentity(),
+        );
+
+        return $this->_sendReportExport($report, $columns);
+    }
+
+    public function actionExportStatus(string $uid): Response
+    {
+        $this->_requireExportPermission(true);
+
+        $exportFile = Formie::$plugin->getReportExportFiles()->getExportFileByUid($uid);
+
+        if (!$exportFile) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        $this->_requireQueuedExportPermission($exportFile);
+
+        $user = Craft::$app->getUser()->getIdentity();
+
+        if ($exportFile->userId && $user?->id !== $exportFile->userId && !$user?->admin) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        return $this->asJson(Formie::$plugin->getReportExportFiles()->getStatusPayload($exportFile));
+    }
+
+    public function actionDownloadExport(): Response
+    {
+        $uid = (string)$this->request->getParam('uid');
+        $token = (string)$this->request->getParam('downloadToken');
+
+        if ($uid === '' || $token === '') {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        $exportFile = Formie::$plugin->getReportExportFiles()->getExportFileByToken($uid, $token);
+
+        if (!$exportFile || !$exportFile->isTokenDownloadable()) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        $response = $this->_sendExportFile($exportFile);
+
+        if (Formie::$plugin->getReportExportFiles()->shouldSingleUseDownload()
+            && !Formie::$plugin->getReportExportFiles()->markConsumed($exportFile)) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        return $response;
+    }
+
+    public function actionDownloadQueuedExport(string $uid): Response
+    {
+        $this->_requireExportPermission(true);
+
+        $exportFile = Formie::$plugin->getReportExportFiles()->getExportFileByUid($uid);
+
+        if (!$exportFile || $exportFile->source !== ReportExportFile::SOURCE_INTERACTIVE || !$exportFile->isDownloadable()) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        $this->_requireQueuedExportPermission($exportFile);
+
+        $user = Craft::$app->getUser()->getIdentity();
+
+        if ($exportFile->userId && $user?->id !== $exportFile->userId && !$user?->admin) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export not found.'));
+        }
+
+        return $this->_sendExportFile($exportFile);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    /**
+     * The single export path for saved reports and Submissions index exports.
+     */
+    private function _sendReportExport(Report $report, ?array $columnOverride): Response
+    {
+        $format = strtolower(trim((string)$this->request->getParam('format', 'csv')));
+        $viewer = $this->_decodeViewerParams();
+        $query = Formie::$plugin->getReportQuery()->buildViewerQuery($report, null, $viewer);
+        $rowCount = Formie::$plugin->getReportExport()->getExportRowCount($query);
+        $context = Formie::$plugin->getReportExport()->buildExportContext($viewer, $columnOverride, report: $report);
+
+        if (Formie::$plugin->getReportExport()->shouldQueueExport($rowCount)) {
+            $user = Craft::$app->getUser()->getIdentity();
+            $exportFile = Formie::$plugin->getReportExport()->queueExport(
+                report: $report,
+                format: $format,
+                context: $context,
+                userId: $user?->id ? (int)$user->id : null,
+                notifyEmail: $user?->email,
+            );
+
+            return $this->asJson([
+                'queued' => true,
+                'rowCount' => $rowCount,
+                'export' => Formie::$plugin->getReportExportFiles()->getStatusPayload($exportFile),
+                'statusUrl' => UrlHelper::cpUrl('formie/reports/export-status/' . $exportFile->uid),
+            ]);
+        }
+
+        $export = Formie::$plugin->getReportExport()->export(
+            report: $report,
+            format: $format,
+            query: $query,
+            columnOverride: $columnOverride,
+        );
+
+        $response = Craft::$app->getResponse()->sendFile($export['path'], $export['filename'], [
+            'mimeType' => $export['mimeType'],
+        ]);
+        $response->on(Response::EVENT_AFTER_SEND, static function() use ($export) {
+            if (is_file($export['path'])) {
+                @unlink($export['path']);
+            }
+        });
+
+        return $response;
+    }
+
+    private function _requireEditableReport(?Report $report): void
+    {
+        if ($report && !Formie::$plugin->getPermissions()->canEditReport(Craft::$app->getUser()->getIdentity(), $report)) {
+            throw new ForbiddenHttpException(Craft::t('formie', 'Only administrators can change a report with scheduled deliveries.'));
+        }
+    }
+
+    private function _requireExportPermission(bool $fromSubmissions = false): void
+    {
+        $permissions = Formie::$plugin->getPermissions();
+        $user = Craft::$app->getUser()->getIdentity();
+        $allowed = $fromSubmissions ? $permissions->canExportSubmissionsFromIndex($user) : $permissions->canExportSubmissions($user);
+
+        if (!$allowed) {
+            throw new ForbiddenHttpException(Craft::t('app', 'User is not permitted to perform this action'));
+        }
+    }
+
+    private function _requireQueuedExportPermission(ReportExportFile $exportFile): void
+    {
+        // Only index exports carry an unsaved report snapshot. Saved report downloads
+        // retain their Reports gate, even if the original report has been deleted.
+        $fromSubmissions = !$exportFile->reportId && isset($exportFile->context['report']);
+
+        if (!$fromSubmissions) {
+            $this->requirePermission(Permissions::PERM_ACCESS_REPORTS);
+        }
+
+        $this->_requireExportPermission($fromSubmissions);
+    }
+
+    private function _sendExportFile(ReportExportFile $exportFile): Response
+    {
+        if ($exportFile->isExpired()) {
+            throw new NotFoundHttpException(Craft::t('formie', 'This export link has expired.'));
+        }
+
+        $path = $exportFile->filePath;
+
+        if (!$path || !is_file($path)) {
+            throw new NotFoundHttpException(Craft::t('formie', 'Export file not found.'));
+        }
+
+        $mimeType = match ($exportFile->format) {
+            'json' => 'application/json',
+            'xml' => 'application/xml',
+            'text' => 'text/plain',
+            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            default => 'text/csv',
+        };
+
+        return Craft::$app->getResponse()->sendFile($path, $exportFile->filename ?: basename($path), [
+            'mimeType' => $mimeType,
+        ]);
+    }
+
+    private function _renderDashboard(?string $reportHandle = null, bool $openCreate = false): Response
+    {
+        Plugin::registerCpReportsAssets();
+
+        $dashboardConfig = Formie::$plugin->getReportViewer()->getDashboardConfig(
+            reportHandle: $reportHandle,
+            openCreate: $openCreate,
+        );
+        $this->view->registerJs('new Craft.Formie.Reports(' . Json::encode($dashboardConfig) . ');');
+
+        return $this->renderTemplate('formie/reports/index', [
+            'title' => Craft::t('formie', 'Reports'),
+            'selectedSubnavItem' => 'reports',
+        ]);
+    }
+
+    private function _decodeViewerParams(): array
+    {
+        $params = [
+            'search' => trim((string)$this->request->getBodyParam('search', $this->request->getParam('search', ''))),
+            'sort' => (string)$this->request->getBodyParam('sort', $this->request->getParam('sort', 'dateCreated')),
+            'sortDir' => (string)$this->request->getBodyParam('sortDir', $this->request->getParam('sortDir', 'desc')),
+        ];
+
+        foreach (['startDate', 'endDate'] as $key) {
+            if ($this->request->getBodyParam($key) !== null || $this->request->getParam($key) !== null) {
+                $params[$key] = $this->_decodeViewerDateParam($key);
+            }
+        }
+
+        return $params;
+    }
+
+    private function _decodeViewerDateParam(string $key): ?string
+    {
+        if (!$this->request->getBodyParam($key) && !$this->request->getParam($key)) {
+            return null;
+        }
+
+        $value = $this->request->getBodyParam($key, $this->request->getParam($key));
+
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        $value = trim((string)$value);
+
+        return $value !== '' ? $value : null;
+    }
+
+    private function _decodeColumnOverride(): ?array
+    {
+        $columnsJson = $this->request->getBodyParam('columns');
+
+        if (!is_string($columnsJson) || $columnsJson === '') {
+            return null;
+        }
+
+        try {
+            $decoded = Json::decode($columnsJson);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if (!is_array($decoded)) {
+            return null;
+        }
+
+        return Formie::$plugin->getReportColumns()->normalizeColumnsPayload($decoded);
+    }
+
+    private function _decodeSettingsPayload(): ?array
+    {
+        $settingsJson = $this->request->getBodyParam('settings');
+
+        if (!is_string($settingsJson) || $settingsJson === '') {
+            return null;
+        }
+
+        try {
+            $payload = Json::decode($settingsJson);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_array($payload) ? $payload : null;
+    }
+
+    private function _failSave(Report $report, ?array $postedSettings = null, ?string $message = null): ?Response
+    {
+        $this->setFailFlash($message ?? Craft::t('formie', 'Couldn’t save report.'));
+
+        Craft::$app->getUrlManager()->setRouteParams(array_filter([
+            'report' => $report,
+            'postedSettings' => $postedSettings,
+        ]));
+
+        return null;
+    }
+}

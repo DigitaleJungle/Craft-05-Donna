@@ -1,0 +1,14 @@
+{% extends "_snips/_layout.twig" %}
+{% set title = "Er ging iets mis" %}
+{% block body %}
+<section class="pb-18" data-animated-id="1">
+    <div class="container text-center">
+        <div class="content-404-wrapper">
+            <h1 class="fs-142px">{{ statusCode ?? 500 }}</h1>
+            <h4 class="fs-3 mb-5">Er ging iets mis</h4>
+            <p class="mb-11">{{ message ?? "Er is een onverwachte fout opgetreden. Probeer het later opnieuw." }}</p>
+            <a href="{{ currentSite.baseUrl }}" class="btn btn-dark btn-hover-border-primary btn-hover-bg-primary">Terug naar de homepage</a>
+        </div>
+    </div>
+</section>
+{% endblock %}

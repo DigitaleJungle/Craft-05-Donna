@@ -1,0 +1,60 @@
+{
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "require": {
+    "craftcms/ckeditor": "^5.9.0",
+    "craftcms/cms": "^5.12.1",
+    "craftcms/webhooks": "3.1.1",
+    "craftpulse/craft-colour-swatches": "5.1.0",
+    "digitale-jungle/craft-easy-gallery": "v1.2.4",
+    "ether/seo": "5.0.0",
+    "iwf/craft-control-panel-element-counter": "^5.1.1",
+    "johnfmorton/craft-llm-ready": "^1.15.0",
+    "justinholtweb/craft-free-nav": "^5.2.1",
+    "putyourlightson/craft-sprig": "3.7.1",
+    "rynpsc/craft-phone-number": "3.0.0",
+    "samuelreichor/craft-quick-edit": "^5.3.0",
+    "spicyweb/craft-embedded-assets": "^5.4.9",
+    "spicyweb/craft-odds-and-ends": "5.1.0",
+    "studioespresso/craft-splashingimages": "5.0.4",
+    "thomasvantuycom/craft-cloudinary": "^2.2.3",
+    "verbb/buttonbox": "^5.1.0",
+    "verbb/cp-nav": "^6.0.5",
+    "verbb/expanded-singles": "^3.0.11",
+    "verbb/formie": "^4.0.10",
+    "vlucas/phpdotenv": "^5.4.0",
+    "webdna/qrcode": "^3.0.3"
+  },
+  "require-dev": {
+    "craftcms/generator": "^2.0.0",
+    "yiisoft/yii2-shell": "^2.0.3"
+  },
+  "config": {
+    "allow-plugins": {
+      "craftcms/plugin-installer": true,
+      "yiisoft/yii2-composer": true
+    },
+    "sort-packages": true,
+    "optimize-autoloader": true,
+    "platform": {
+      "php": "8.2"
+    }
+  },
+  "scripts": {
+    "post-root-package-install": [
+      "@php -r \"file_exists('.env') || copy('.env.example.dev', '.env');\""
+    ]
+  },
+  "repositories": [
+    {
+      "type": "composer",
+      "url": "https://composer.craftcms.com",
+      "canonical": false
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "modules\\": "modules/"
+    }
+  }
+}

@@ -1,0 +1,219 @@
+<?php
+namespace verbb\formie\fields\subfields;
+
+use verbb\formie\Formie;
+use verbb\formie\base\ChildFieldInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Form;
+use verbb\formie\fields\Address;
+use verbb\formie\fields\SingleLineText;
+use verbb\formie\fields\subfields\traits\AddressTextSubmissionTrait;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\integrations\addressproviders\Google;
+use verbb\formie\models\SlotTag;
+use verbb\formie\theme\context\RenderContext;
+use verbb\formie\web\twig\Extension;
+
+use Craft;
+
+class AddressAutoComplete extends SingleLineText implements ChildFieldInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Address - Auto-Complete');
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    protected const DEFAULT_INPUT_TEMPLATE_PATH = 'fields/single-line-text';
+    protected const DEFAULT_REFERENCE_BLOCK_TEMPLATE_PATH = 'fields/single-line-text';
+    protected const SUBMISSION_INPUT_ATTRIBUTES = [
+        'data-formie-address-autocomplete-input' => true,
+        'autocomplete' => 'off',
+        'type' => 'search',
+        'aria-autocomplete' => 'list',
+    ];
+
+
+    // Traits
+    // =========================================================================
+
+    use AddressTextSubmissionTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $integrationHandle = null;
+    public bool $currentLocation = false;
+    public ?string $countryDefaultValue = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        $fields = parent::defineFormBuilderGeneralSchema();
+
+        $addressProviderOptions = $this->_getAddressProviderOptions();
+        $googlePlacesIf = $this->_getGooglePlacesIntegrationIf();
+
+        array_unshift($fields, SchemaHelper::selectField([
+            'label' => Craft::t('formie', 'Auto-Complete Integration'),
+            'instructions' => Craft::t('formie', 'Select which address provider this field should use.'),
+            'name' => 'integrationHandle',
+            'required' => true,
+            'options' => array_merge(
+                [['label' => Craft::t('formie', 'Select an option'), 'value' => '']],
+                $addressProviderOptions
+            ),
+        ]));
+
+        $fields[] = SchemaHelper::comboboxField([
+            'label' => Craft::t('formie', 'Country Default Value'),
+            'instructions' => Craft::t('formie', 'Bias Google Places address suggestions toward this country.'),
+            'name' => 'countryDefaultValue',
+            'if' => $googlePlacesIf,
+            'placeholder' => Craft::t('formie', 'Select an option'),
+            'options' => array_merge(
+                [['label' => Craft::t('formie', 'None'), 'value' => '']],
+                $this->_getCountryDefaultValueOptions()
+            ),
+        ]);
+
+        $fields[] = SchemaHelper::lightswitchField([
+            'label' => Craft::t('formie', 'Show Current Location Button'),
+            'instructions' => Craft::t('formie', 'Whether this field should show a "Use my location" button.'),
+            'name' => 'currentLocation',
+            'if' => $googlePlacesIf,
+        ]);
+
+        return $fields;
+    }
+
+    public function getInputTemplateVariables(Form $form, mixed $value): array
+    {
+        $config = parent::getInputTemplateVariables($form, $value);
+
+        $parent = $this->getParentField();
+
+        if ($parent instanceof Address && $parent->hasCurrentLocation() && $this->handle === 'autoComplete') {
+            $slotContext = RenderContext::from([
+                'form' => $form,
+                'field' => $this,
+            ], []);
+            $htmlTag = $this->renderSlotTag('locationLink', $slotContext);
+
+            if ($htmlTag) {
+                $twigContext = [
+                    'form' => $form,
+                    'field' => $this,
+                    'value' => $value,
+                ];
+                $config['fieldLabelSuffix'] = Extension::formatSlotTagHtml('locationLink', $htmlTag, $twigContext);
+            }
+        }
+
+        return $config;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        if ($key === 'locationLink') {
+            $parent = $this->getParentField();
+
+            if ($parent instanceof Address && $parent->hasCurrentLocation() && $this->handle === 'autoComplete') {
+                return $parent->createLocationLinkSlotTag($context);
+            }
+
+            return null;
+        }
+
+        $tag = parent::defineSlotTag($key, $context);
+
+        if ($tag && $key === 'fieldInput') {
+            $tag->mergeCoreAttributes([
+                'autocomplete' => 'autocomplete',
+                'data-autocomplete' => true,
+                'type' => 'search',
+                'aria-autocomplete' => 'list',
+                'data-formie-address-autocomplete-input' => true,
+            ]);
+        }
+
+        return $tag;
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        return array_merge(parent::defineClientRenderedInput(), [
+            'inputType' => 'search',
+        ]);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getAddressProviderOptions(): array
+    {
+        $addressProviderOptions = [];
+        $addressProviders = Formie::$plugin->getIntegrations()->getAllIntegrationsForType(Integration::TYPE_ADDRESS_PROVIDER);
+
+        foreach ($addressProviders as $addressProvider) {
+            if ($addressProvider->getEnabled()) {
+                $addressProviderOptions[] = [
+                    'label' => $addressProvider->getName(),
+                    'value' => $addressProvider->getHandle(),
+                    'data-type' => get_class($addressProvider),
+                ];
+            }
+        }
+
+        return $addressProviderOptions;
+    }
+
+    private function _getCountryDefaultValueOptions(): array
+    {
+        $parent = $this->getParentField();
+        $countrySubfield = $parent instanceof Address ? $parent->getFieldByHandle('country') : null;
+
+        if ($countrySubfield instanceof AddressCountry) {
+            return $countrySubfield->getCountryOptions();
+        }
+
+        return Formie::$plugin->getCountries()->getAddressCountries(
+            $parent instanceof Address ? $parent : null,
+        );
+    }
+
+    private function _getGooglePlacesIntegrationIf(): string
+    {
+        $handles = [];
+        $addressProviders = Formie::$plugin->getIntegrations()->getAllIntegrationsForType(Integration::TYPE_ADDRESS_PROVIDER);
+
+        foreach ($addressProviders as $addressProvider) {
+            if ($addressProvider instanceof Google && $addressProvider->getEnabled()) {
+                $handles[] = $addressProvider->getHandle();
+            }
+        }
+
+        if ($handles === []) {
+            return 'false';
+        }
+
+        return implode(' || ', array_map(static function(string $handle): string {
+            return 'integrationHandle == "' . addslashes($handle) . '"';
+        }, $handles));
+    }
+}

@@ -1,0 +1,9 @@
+baseUrl: '@web/fr'
+enabled: $ACTIVATE_FR
+handle: fr
+hasUrls: true
+language: fr
+name: Frans
+primary: false
+siteGroup: c5c66daa-734e-4c55-8b7a-fb3bc33dc9e8 # $PROJECT_NAME
+sortOrder: 3

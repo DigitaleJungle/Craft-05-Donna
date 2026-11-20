@@ -1,0 +1,453 @@
+<?php
+namespace verbb\formie\fields;
+
+use verbb\formie\Formie;
+use verbb\formie\base\Field;
+use verbb\formie\base\PreviewableFieldInterface;
+use verbb\formie\base\SortableFieldInterface;
+use verbb\formie\events\ModifyFieldUniqueUserQueryEvent;
+use verbb\formie\fields\definitions\FieldReferenceValue;
+use verbb\formie\fields\definitions\FieldValueType;
+use verbb\formie\fields\traits\UniqueValueFieldTrait;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\ValidationMessagesHelper;
+use verbb\formie\helpers\Variables;
+use verbb\formie\models\SlotTag;
+use verbb\formie\references\ReferenceType;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\elements\User;
+
+use yii\validators\EmailValidator;
+
+use Faker\Generator as FakerFactory;
+use GraphQL\Type\Definition\Type;
+
+class Email extends Field implements SortableFieldInterface, PreviewableFieldInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Email Address');
+    }
+
+    public static function getSvgIconPath(): string
+    {
+        return 'formie/_formfields/email/icon.svg';
+    }
+
+    public static function supportsGqlConfigProvider(): bool
+    {
+        return true;
+    }
+
+    public static function supportsIdn(): bool
+    {
+        return function_exists('idn_to_ascii') && defined('INTL_IDNA_VARIANT_UTS46');
+    }
+
+    public static function compatibleFieldTypes(): array
+    {
+        return [
+            SingleLineText::class,
+        ];
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_UNIQUE_USER_QUERY = 'modifyUniqueUserQuery';
+
+
+    // Traits
+    // =========================================================================
+
+    use UniqueValueFieldTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    public bool $validateDomain = false;
+    public array $blockedDomains = [];
+    public bool $blockFreeDomains = false;
+    public bool $uniqueUserEmail = false;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function themeConfigKey(): string
+    {
+        return 'emailAddress';
+    }
+
+    public function fieldKind(): string
+    {
+        return self::KIND_TEXT;
+    }
+
+    public function getElementValidationRules(): array
+    {
+        $rules = parent::getElementValidationRules();
+
+        $rules[] = [$this->handle, 'email', 'enableIDN' => self::supportsIdn(), 'enableLocalIDN' => false];
+
+        if ($this->validateDomain) {
+            $rules[] = [$this->handle, EmailValidator::class, 'skipOnEmpty' => true, 'checkDNS' => true];
+        }
+
+        if ($this->blockedDomains) {
+            $rules[] = [$this->handle, 'validateDomain'];
+        }
+
+        if ($this->blockFreeDomains) {
+            $rules[] = [$this->handle, 'validateFreeDomain'];
+        }
+
+        foreach ($this->getUniqueValueElementValidationRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        if ($this->uniqueUserEmail) {
+            $rules[] = [$this->handle, 'validateUniqueUserEmail', 'skipOnEmpty' => true];
+        }
+
+        return $rules;
+    }
+
+    public function validateUniqueUserEmail(ElementInterface $element): void
+    {
+        if (!$this->uniqueUserEmail) {
+            return;
+        }
+
+        $value = trim((string)$element->getFieldValue($this->valueKey()));
+
+        if ($value === '') {
+            return;
+        }
+
+        $query = User::find()
+            ->email($value)
+            ->status(null);
+
+        $event = new ModifyFieldUniqueUserQueryEvent([
+            'query' => $query,
+            'field' => $this,
+            'element' => $element,
+        ]);
+
+        $this->trigger(self::EVENT_MODIFY_UNIQUE_USER_QUERY, $event);
+
+        if ($event->query->exists()) {
+            $element->addError($this->valueKey(), $this->getValidationMessage(ValidationMessagesHelper::KEY_UNIQUE_USER_EMAIL));
+        }
+    }
+
+    public function validateDomain(ElementInterface $element): void
+    {
+        $emailDomains = Formie::$plugin->getEmailDomains();
+        $value = $element->getFieldValue($this->valueKey());
+        $domain = $emailDomains->extractDomainFromEmail((string)$value);
+
+        if (!$domain) {
+            return;
+        }
+
+        $blockedDomains = array_filter(array_map(function($blockedDomain) use ($emailDomains) {
+            return $emailDomains->normalizeDomain($this->_getBlockedDomainValue($blockedDomain));
+        }, $this->blockedDomains));
+
+        if (in_array($domain, $blockedDomains, true)) {
+            $element->addError($this->valueKey(), $this->getValidationMessage(ValidationMessagesHelper::KEY_BLOCKED_DOMAIN, [
+                'domain' => $domain,
+            ]));
+        }
+    }
+
+    public function validateFreeDomain(ElementInterface $element): void
+    {
+        $emailDomains = Formie::$plugin->getEmailDomains();
+        $value = $element->getFieldValue($this->valueKey());
+        $domain = $emailDomains->extractDomainFromEmail((string)$value);
+
+        if (!$domain) {
+            return;
+        }
+
+        if ($emailDomains->isFreeDomain($domain)) {
+            $element->addError($this->valueKey(), $this->getValidationMessage(ValidationMessagesHelper::KEY_BLOCKED_DOMAIN, [
+                'domain' => $domain,
+            ]));
+        }
+    }
+
+    public function defineFormBuilderPreviewSchema(): array
+    {
+        return [
+            SchemaHelper::previewInput([
+                'type' => 'email',
+            ]),
+        ];
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return array_merge(parent::getSettingGqlTypes(), [
+            'uniqueUserEmail' => [
+                'name' => 'uniqueUserEmail',
+                'type' => Type::boolean(),
+            ],
+            'blockedDomains' => [
+                'name' => 'blockedDomains',
+                'type' => Type::listOf(Type::string()),
+                'resolve' => function($field) {
+                    return array_map(fn($item) => $this->_getBlockedDomainValue($item), $field->blockedDomains);
+                },
+            ],
+        ]);
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::labelField(),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Placeholder'),
+                'instructions' => Craft::t('formie', 'The text that will be shown if the field doesn’t have a value.'),
+                'name' => 'placeholder',
+            ]),
+            SchemaHelper::variableTextField([
+                'label' => Craft::t('formie', 'Default Value'),
+                'instructions' => Craft::t('formie', 'Set a default value for the field when it doesn’t have a value.'),
+                'name' => 'defaultValue',
+                'variableConfig' => [
+                    'shapes' => ['inline'],
+                    'types' => [Variables::TYPE_TEXT],
+                    'groups' => [
+                        Variables::STATIC_FORM,
+                        Variables::STATIC_GENERAL,
+                        Variables::STATIC_SITE,
+                    ],
+                ],
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderSettingsSchema(): array
+    {
+        return [
+            SchemaHelper::prefillQueryParam(),
+            SchemaHelper::includeInEmailFieldSummariesField(),
+        ];
+    }
+
+    public function defineFormBuilderValidationSchema(): array
+    {
+        return [
+            SchemaHelper::requiredField(),
+            SchemaHelper::requiredValidationMessage(),
+            SchemaHelper::matchField([
+                'includedTypes' => [self::class],
+            ]),
+            SchemaHelper::matchValidationMessage(),
+            ...$this->defineUniqueValueValidationSchema(),
+            SchemaHelper::lightswitchField([
+                'label' => Craft::t('formie', 'Unique User Email'),
+                'instructions' => Craft::t('formie', 'Whether to require that the email address is not already associated with a Craft user account.'),
+                'name' => 'uniqueUserEmail',
+            ]),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Unique User Email Error Message'),
+                'instructions' => ValidationMessagesHelper::tokenInstructions(['label']),
+                'name' => 'validationMessages.uniqueUserEmail',
+                'if' => 'uniqueUserEmail',
+            ]),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Invalid Email Error Message'),
+                'instructions' => ValidationMessagesHelper::tokenInstructions(['label']),
+                'name' => 'validationMessages.email',
+            ]),
+            SchemaHelper::lightswitchField([
+                'label' => Craft::t('formie', 'Validate Domain (DNS)'),
+                'instructions' => Craft::t('formie', 'Whether to validate the domain name provided for the email via DNS record lookup. This can help ensure users enter valid email addresses.'),
+                'name' => 'validateDomain',
+            ]),
+            SchemaHelper::tableField([
+                'label' => Craft::t('formie', 'Blocked Domains'),
+                'instructions' => Craft::t('formie', 'Define a list of domain names to block. Users entering email addresses containing these domains will be blocked from using them.'),
+                'name' => 'blockedDomains',
+                'columns' => [
+                    [
+                        'type' => 'text',
+                        'name' => 'label',
+                        'label' => Craft::t('formie', 'Domain'),
+                        'required' => true,
+                    ],
+                ],
+            ]),
+            SchemaHelper::lightswitchField([
+                'label' => Craft::t('formie', 'Block Free Email Providers'),
+                'instructions' => Craft::t('formie', 'Whether to block email addresses from free email providers like `gmail.com` or `hotmail.com`.'),
+                'name' => 'blockFreeDomains',
+            ]),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Blocked Domain Error Message'),
+                'instructions' => ValidationMessagesHelper::tokenInstructions(['domain']),
+                'name' => 'validationMessages.blockedDomain',
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderAppearanceSchema(): array
+    {
+        return [
+            SchemaHelper::visibility(),
+            SchemaHelper::labelPosition($this),
+            SchemaHelper::instructions(),
+            SchemaHelper::instructionsPosition($this),
+            SchemaHelper::errorMessagePosition($this),
+        ];
+    }
+
+    public function defineFormBuilderAdvancedSchema(): array
+    {
+        return [
+            SchemaHelper::handleField(),
+            SchemaHelper::cssClasses(),
+            SchemaHelper::containerAttributesField(),
+            SchemaHelper::inputAttributesField(),
+            SchemaHelper::enableContentEncryptionField(),
+        ];
+    }
+
+    public function defineFormBuilderConditionsSchema(): array
+    {
+        return [
+            SchemaHelper::enableConditionsField(),
+            SchemaHelper::conditionsField(),
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineValueType(): FieldValueType
+    {
+        return FieldValueType::string();
+    }
+
+    protected function supportedDefaults(): array
+    {
+        return ['validateDomain', 'blockFreeDomains'];
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        foreach ($this->defineUniqueValueRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        $rules[] = [['uniqueUserEmail'], 'boolean'];
+
+        return $rules;
+    }
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        $form = $context->form;
+        $errors = $context->errors;
+
+        $id = $this->getHtmlId($form);
+        $dataId = $this->getHtmlDataId($form);
+
+        if ($key === 'fieldInput') {
+            return SlotTag::make('input')
+                ->core(array_merge([
+                    'type' => 'email',
+                    'id' => $id,
+                    'name' => $this->getHtmlName(),
+                    'placeholder' => $this->placeholder ?: null,
+                    'autocomplete' => 'email',
+                    'required' => $this->required ? true : null,
+                    'data-formie-input' => true,
+                    'data-formie-email-input' => true,
+                    'data-formie-input-id' => $dataId,
+                    'data-formie-input-type' => 'email',
+                    'data-formie-input-error-state' => $errors ? true : false,
+                    'aria-describedby' => $this->hasInstructions() ? "{$id}-instructions" : null,
+                ], ValidationMessagesHelper::emailValidationBrowserAttributes($this)))
+                ->theme([
+                    'class' => [
+                        'formie-input',
+                        'formie-email-input',
+                        $errors ? 'formie-input-error' : false,
+                    ],
+                ])
+                ->instanceAttributes($this->getInputAttributes());
+        }
+
+        return parent::defineSlotTag($key, $context);
+    }
+
+    protected function defineSubmissionHtml(mixed $value, ?ElementInterface $element, bool $inline): string
+    {
+        return Craft::$app->getView()->renderTemplate('formie/_formfields/email/input', [
+            'name' => $this->handle,
+            'value' => $value,
+            'field' => $this,
+        ]);
+    }
+
+    protected function defineValueForEmailPreview(FakerFactory $faker): mixed
+    {
+        return $faker->email;
+    }
+
+    protected function defineReferenceValues(): array
+    {
+        return [
+            FieldReferenceValue::primary(types: [ReferenceType::Text, ReferenceType::Email]),
+        ];
+    }
+
+    protected function supportsPlainTextHtmlSanitization(): bool
+    {
+        return true;
+    }
+
+    protected function defineBrowserValidationRules(): array
+    {
+        $validators = parent::defineBrowserValidationRules();
+        $validators[] = ['type' => 'email'];
+
+        return $validators;
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        return array_merge(parent::defineClientRenderedInput(), [
+            'inputType' => 'email',
+        ]);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getBlockedDomainValue(mixed $blockedDomain): string
+    {
+        // The builder only edits `label`, so a row's `value` can be missing or left behind by an earlier
+        // domain. Rows saved before that column changed may only hold `value`.
+        return (string)(($blockedDomain['label'] ?? '') ?: ($blockedDomain['value'] ?? ''));
+    }
+}

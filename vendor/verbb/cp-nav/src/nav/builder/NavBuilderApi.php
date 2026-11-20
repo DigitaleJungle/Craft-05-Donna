@@ -1,0 +1,374 @@
+<?php
+namespace verbb\cpnav\nav\builder;
+
+use verbb\cpnav\CpNav;
+use verbb\cpnav\helpers\CustomIcon;
+use verbb\cpnav\models\LayoutNavItem;
+use verbb\cpnav\nav\sources\NodeKey;
+
+use Craft;
+use craft\base\Component;
+
+/**
+ * JSON payloads for the React nav builder API.
+ */
+class NavBuilderApi extends Component
+{
+    // Public Methods
+    // =========================================================================
+
+    public function getLayoutTree(int $layoutId): array
+    {
+        $layout = CpNav::$plugin->getLayouts()->getLayoutById($layoutId);
+
+        if (!$layout) {
+            return [];
+        }
+
+        $navigations = CpNav::$plugin->getNavBuilder()->getLayoutNavItemsForLayout($layoutId);
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        $registryKeys = $this->_registryKeys();
+        $acknowledgedKeys = CpNav::$plugin->getNavCustomization()->getAcknowledgedRegistryKeys($layout->uid);
+
+        // Only surface items that appeared in the registry since the admin last acknowledged — not
+        // every stock Craft item on a fresh/reset layout.
+        $newItemKeys = $acknowledgedKeys === null
+            ? []
+            : array_values(array_filter(
+                array_diff($registryKeys, $acknowledgedKeys),
+                fn(string $key) => !NodeKey::isCustomizationOnly($key),
+            ));
+
+        // Build flat list first so canIndent / canOutdent see the full sibling context.
+        $flatNodes = [];
+
+        foreach ($navigations as $navigation) {
+            if ($navigation->getParent() !== null) {
+                continue;
+            }
+
+            $flatNodes[] = [
+                'builderId' => (int)$navigation->id,
+                'key' => (string)$navigation->nodeKey,
+                'parentKey' => null,
+                'parentId' => null,
+                'level' => 1,
+            ];
+
+            foreach ($navigation->getChildren() as $child) {
+                $flatNodes[] = [
+                    'builderId' => (int)$child->id,
+                    'key' => (string)$child->nodeKey,
+                    'parentKey' => (string)$navigation->nodeKey,
+                    'parentId' => (int)$navigation->id,
+                    'level' => 2,
+                ];
+            }
+        }
+
+        $nodes = [];
+        $capabilities = NavTreeReparent::getCapabilities($flatNodes);
+
+        foreach ($navigations as $navigation) {
+            // Resolved list is flat; children are nested on parents — skip duplicates.
+            if ($navigation->getParent() !== null) {
+                continue;
+            }
+
+            $nodes[] = $this->_serializeNode($navigation, $overlay, $newItemKeys, $capabilities);
+
+            foreach ($navigation->getChildren() as $child) {
+                $nodes[] = $this->_serializeNode($child, $overlay, $newItemKeys, $capabilities);
+            }
+        }
+
+        return [
+            'layout' => [
+                'id' => $layout->id,
+                'uid' => $layout->uid,
+                'name' => $layout->name,
+                'maxLevels' => NavTreeReparent::MAX_DEPTH,
+            ],
+            'nodes' => $nodes,
+            'meta' => [
+                'newItemCount' => count($newItemKeys),
+                'maxDepth' => NavTreeReparent::MAX_DEPTH,
+                'iconsPath' => CpNav::$plugin->getSettings()->iconsPath,
+            ],
+        ];
+    }
+
+    public function updateNode(int $layoutId, string $nodeKey, array $data): bool
+    {
+        if (!$this->_validNodeData($data)) {
+            return false;
+        }
+
+        $navigation = $this->_navigationByKey($layoutId, $nodeKey);
+
+        // Disabled items were previously omitted from the resolved builder tree; fall back to
+        // overlay + registry so toggles still work for keys already in project config.
+        if (!$navigation) {
+            $navigation = CpNav::$plugin->getNavBuilder()->getLayoutNavItemByKey($layoutId, $nodeKey);
+        }
+
+        if (!$navigation) {
+            return false;
+        }
+
+        if (array_key_exists('enabled', $data)) {
+            $navigation->enabled = filter_var($data['enabled'], FILTER_VALIDATE_BOOLEAN);
+        }
+
+        if (array_key_exists('currLabel', $data)) {
+            $navigation->currLabel = (string)$data['currLabel'];
+        }
+
+        if (array_key_exists('url', $data)) {
+            $navigation->url = (string)$data['url'];
+        }
+
+        if (array_key_exists('newWindow', $data)) {
+            $navigation->newWindow = filter_var($data['newWindow'], FILTER_VALIDATE_BOOLEAN);
+        }
+
+        if (array_key_exists('icon', $data)) {
+            $navigation->icon = $this->_normalizeIcon($data['icon']);
+        }
+
+        if (array_key_exists('customIcon', $data)) {
+            $navigation->customIcon = $this->_normalizeCustomIcon($data['customIcon']);
+        }
+
+        return CpNav::$plugin->getNavBuilder()->saveLayoutNavItem($navigation);
+    }
+
+    public function createNode(int $layoutId, array $data): ?array
+    {
+        if (!$this->_validNodeData($data)) {
+            return null;
+        }
+
+        $navigation = new LayoutNavItem();
+        $navigation->layoutId = $layoutId;
+        $navigation->type = (string)($data['type'] ?? LayoutNavItem::TYPE_MANUAL);
+        $navigation->currLabel = (string)($data['currLabel'] ?? '');
+        $navigation->prevLabel = $navigation->currLabel;
+        $navigation->url = (string)($data['url'] ?? '');
+        $navigation->prevUrl = $navigation->url;
+        $navigation->enabled = true;
+        $navigation->level = 1;
+        $navigation->newWindow = filter_var($data['newWindow'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $navigation->icon = $this->_normalizeIcon($data['icon'] ?? null);
+        $navigation->customIcon = $this->_normalizeCustomIcon($data['customIcon'] ?? null);
+
+        if (!CpNav::$plugin->getNavBuilder()->createLayoutNavItem($navigation)) {
+            return null;
+        }
+
+        return $this->_serializeNode($navigation, [], []);
+    }
+
+    public function deleteNode(int $layoutId, string $nodeKey): bool
+    {
+        $navigation = $this->_navigationByKey($layoutId, $nodeKey);
+
+        if (!$navigation) {
+            return false;
+        }
+
+        return CpNav::$plugin->getNavBuilder()->deleteLayoutNavItemByKey($layoutId, $nodeKey);
+    }
+
+    public function reorderNodes(int $layoutId, array $items): bool
+    {
+        return CpNav::$plugin->getNavBuilder()->reorder($layoutId, $items);
+    }
+
+    public function indentNode(int $layoutId, string $nodeKey): bool
+    {
+        return CpNav::$plugin->getNavBuilder()->indentNode($layoutId, $nodeKey);
+    }
+
+    public function outdentNode(int $layoutId, string $nodeKey): bool
+    {
+        return CpNav::$plugin->getNavBuilder()->outdentNode($layoutId, $nodeKey);
+    }
+
+    /** Reparent a node by canonical key, using null for top-level placement. */
+    public function reparentNode(int $layoutId, string $nodeKey, ?string $parentKey): bool
+    {
+        return CpNav::$plugin->getNavBuilder()->reparentNode($layoutId, $nodeKey, $parentKey);
+    }
+
+    public function resetLayout(int $layoutId): void
+    {
+        CpNav::$plugin->getNavBuilder()->resetLayout($layoutId);
+    }
+
+    public function refreshSources(): void
+    {
+        // Bump generation (evict shared cache) and rebuild immediately so Refresh is observable.
+        CpNav::$plugin->getNavSources()->invalidate();
+        CpNav::$plugin->getNavSources()->getTree(true);
+    }
+
+    public function acknowledgeNewItems(int $layoutId): void
+    {
+        $layout = CpNav::$plugin->getLayouts()->getLayoutById($layoutId);
+
+        if (!$layout) {
+            return;
+        }
+
+        CpNav::$plugin->getNavCustomization()->acknowledgeCurrentRegistry($layout->uid);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    /** Reject nested values before PHP coercion can corrupt a persisted node. */
+    private function _validNodeData(array $data): bool
+    {
+        foreach (['type', 'currLabel', 'url', 'icon', 'customIcon'] as $field) {
+            if (isset($data[$field]) && !is_string($data[$field])) {
+                return false;
+            }
+        }
+
+        foreach (['enabled', 'newWindow'] as $field) {
+            if (array_key_exists($field, $data)
+                && (is_array($data[$field]) || is_object($data[$field])
+                    || filter_var($data[$field], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) === null)) {
+                return false;
+            }
+        }
+
+        return $data === [] || !array_is_list($data);
+    }
+
+    private function _serializeNode(LayoutNavItem $navigation, array $overlay, array $newItemKeys, array $capabilities = []): array
+    {
+        $key = $navigation->nodeKey;
+        [$typeLabel, $typeClass, $typeColorRgb, $typeTextColorRgb] = $this->_typeMeta((string)$navigation->type);
+
+        return [
+            'builderId' => $navigation->id,
+            'key' => $key,
+            'title' => $navigation->currLabel,
+            'label' => $navigation->currLabel,
+            'defaultLabel' => $navigation->prevLabel,
+            'url' => $navigation->url,
+            'type' => $navigation->type,
+            'typeLabel' => $typeLabel,
+            'typeClass' => $typeClass,
+            'typeColorRgb' => $typeColorRgb,
+            'typeTextColorRgb' => $typeTextColorRgb,
+            'enabled' => (bool)$navigation->enabled,
+            'level' => (int)$navigation->level,
+            'parentId' => $navigation->parentId,
+            'parentKey' => $navigation->getParent()?->nodeKey,
+            'sort' => (int)$navigation->sortOrder,
+            'newWindow' => (bool)$navigation->newWindow,
+            'icon' => $navigation->icon,
+            'customIcon' => CustomIcon::normalizeStored($navigation->customIcon),
+            'customIconPreview' => $this->_serializeCustomIcon($navigation->customIcon),
+            'isCustomized' => $key && isset($overlay[$key]),
+            'isNew' => $key && in_array($key, $newItemKeys, true),
+            'isOrphan' => (bool)$navigation->isOrphan,
+            'hasDescendants' => count($navigation->getChildren()) > 0,
+            'canIndent' => $capabilities[$key]['canIndent'] ?? false,
+            'canOutdent' => $capabilities[$key]['canOutdent'] ?? false,
+            'deletable' => $navigation->isManual() || $navigation->isDivider(),
+        ];
+    }
+
+    /**
+     * Badge metadata per node type: [label, css class, base RGB, text RGB].
+     * Colours are hard-coded (Navigation-style) so builder badges stay stable.
+     */
+    private function _typeMeta(string $type): array
+    {
+        return match ($type) {
+            LayoutNavItem::TYPE_PLUGIN => [Craft::t('cp-nav', 'Plugin'), 'cpnav-type-plugin', '124, 58, 237', '124, 58, 237'],
+            LayoutNavItem::TYPE_MANUAL => [Craft::t('cp-nav', 'Manual'), 'cpnav-type-manual', '13, 148, 136', '13, 148, 136'],
+            LayoutNavItem::TYPE_DIVIDER => [Craft::t('cp-nav', 'Divider'), 'cpnav-type-divider', '107, 114, 128', '107, 114, 128'],
+            default => [Craft::t('cp-nav', 'Craft'), 'cpnav-type-craft', '37, 99, 235', '37, 99, 235'],
+        };
+    }
+
+    /**
+     * Store Craft system SVG names / paths as-is. Empty clears the override (registry default).
+     * Builder UI does not edit `icon` (Custom Icon only); this remains for migrate/API/registry merge.
+     */
+    private function _normalizeIcon(mixed $icon): ?string
+    {
+        if ($icon === null || $icon === '') {
+            return null;
+        }
+
+        $icon = trim((string)$icon);
+
+        if ($icon === '') {
+            return null;
+        }
+
+        if ($icon === 'title') {
+            return 'title';
+        }
+
+        return $icon;
+    }
+
+    /**
+     * Accept a relative SVG path under the plugin icons folder (or null to clear).
+     * Legacy `[assetId]` JSON / numeric ids are dropped — not portable in project config.
+     */
+    private function _normalizeCustomIcon(mixed $customIcon): ?string
+    {
+        return CustomIcon::normalizeStored($customIcon);
+    }
+
+    /** Serialize custom icon metadata when the stored value resolves. */
+    private function _serializeCustomIcon(mixed $customIcon): ?array
+    {
+        return CustomIcon::serializeForBuilder(is_string($customIcon) ? $customIcon : null);
+    }
+
+    private function _navigationByKey(int $layoutId, string $nodeKey): ?LayoutNavItem
+    {
+        foreach (CpNav::$plugin->getNavBuilder()->getLayoutNavItemsForLayout($layoutId) as $navigation) {
+            if ($navigation->nodeKey === $nodeKey) {
+                return $navigation;
+            }
+
+            foreach ($navigation->getChildren() as $child) {
+                if ($child->nodeKey === $nodeKey) {
+                    return $child;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function _registryKeys(): array
+    {
+        $keys = [];
+
+        $walk = function(array $nodes) use (&$keys, &$walk): void {
+            foreach ($nodes as $node) {
+                $keys[] = $node->key;
+
+                if ($node->children) {
+                    $walk($node->children);
+                }
+            }
+        };
+
+        $walk(CpNav::$plugin->getNavSources()->getTree());
+
+        return $keys;
+    }
+}

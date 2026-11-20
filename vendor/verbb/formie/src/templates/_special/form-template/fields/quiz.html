@@ -1,0 +1,16 @@
+{% set originalField = field %}
+
+{# Cast to a real field class for the selected presentation mode. #}
+{% set field = originalField.getDisplayTypeField() %}
+
+{% if originalField.displayType == 'dropdown' %}
+    {{ formieInclude('fields/dropdown') }}
+{% endif %}
+
+{% if originalField.displayType == 'checkboxes' %}
+    {{ formieInclude('fields/checkboxes') }}
+{% endif %}
+
+{% if originalField.displayType == 'radio' %}
+    {{ formieInclude('fields/radio') }}
+{% endif %}

@@ -1,0 +1,243 @@
+<?php
+
+/**
+ * LLM Ready plugin for Craft CMS
+ *
+ * @link      https://github.com/johnfmorton/craft-llm-ready
+ * @copyright Copyright (c) John F Morton
+ */
+
+/**
+ * LLM Ready config.php
+ *
+ * This file exists only as a template for the LLM Ready settings.
+ * It does nothing on its own.
+ *
+ * Don't edit this file. Instead, copy it to `config/` as `llm-ready.php`
+ * and make your changes there. Settings defined in `config/llm-ready.php`
+ * will override settings configured in the control panel.
+ *
+ * This file can be a standard PHP array, or a multi-environment config
+ * (see https://craftcms.com/docs/5.x/config/#multi-environment-configs)
+ */
+
+return [
+    // -----------------------------------------------------------------------
+    // General
+    // -----------------------------------------------------------------------
+
+    // Whether the plugin is globally enabled
+    'enabled' => true,
+
+    // -----------------------------------------------------------------------
+    // Markdown detection
+    // -----------------------------------------------------------------------
+
+    // Whether to serve Markdown when the request includes an
+    // `Accept: text/markdown` header
+    'enableContentNegotiation' => true,
+
+    // Whether to serve Markdown on the *canonical* URL to known AI crawlers
+    // (GPTBot, ClaudeBot, PerplexityBot, etc.). Off by default.
+    //
+    // Varying the canonical URL's response by User-Agent can't be made both
+    // cache-correct and cache-efficient: `Vary: User-Agent` is the correct
+    // declaration but has effectively unbounded cardinality, so shared caches
+    // — Cloudflare included — ignore it for HTML. That's what allowed a bot
+    // request to be cached and replayed to real browsers as raw Markdown.
+    //
+    // Crawlers are served through the `.md` URL, `/llms.txt`, and the
+    // discovery tag/header instead. Each is its own URL, so nothing varies
+    // and everything stays cacheable.
+    //
+    // Safe to turn on if no shared cache sits in front of this site — which
+    // usually differs per environment (bare origin in dev, CDN in
+    // production). A value here overrides the control panel, so make it
+    // follow the environment in one of two ways:
+    //
+    //   - read a variable from `.env` (add `use craft\helpers\App;` at the
+    //     top of config/llm-ready.php, and `LLM_READY_UA_DETECTION=true` to
+    //     the dev `.env`):
+    //
+    //       'enableUserAgentDetection' => App::parseBooleanEnv('$LLM_READY_UA_DETECTION') ?? false,
+    //
+    //   - or key the file on CRAFT_ENVIRONMENT (a multi-environment config):
+    //
+    //       return [
+    //           '*'   => ['enableUserAgentDetection' => false],
+    //           'dev' => ['enableUserAgentDetection' => true],
+    //       ];
+    'enableUserAgentDetection' => false,
+
+    // Additional bot user-agent strings to detect, appended to the built-in
+    // list. Example: ['MyCustomBot', 'InternalCrawler/1.0']
+    'additionalBotUserAgents' => [],
+
+    // Full replacement for the built-in bot user-agent list. When set (non-empty)
+    // these are used INSTEAD of the defaults below; `additionalBotUserAgents` is
+    // still appended and `excludeBotUserAgents` still applied on top.
+    //
+    // The built-in defaults (so you know what you're replacing) are, grouped:
+    //   OpenAI:     'GPTBot', 'ChatGPT-User', 'OAI-SearchBot'
+    //   Anthropic:  'ClaudeBot', 'Claude-SearchBot', 'Claude-User'
+    //   Perplexity: 'PerplexityBot', 'Perplexity-User'
+    //   Meta:       'Meta-ExternalAgent', 'Meta-ExternalFetcher', 'Meta-WebIndexer'
+    //   Other:      'Amazonbot', 'Bytespider', 'CCBot', 'cohere-ai'
+    // (Matched case-insensitively as substrings of the User-Agent header.)
+    'botUserAgents' => [],
+
+    // Bot user-agent strings to remove from the effective list. Lets you drop a
+    // specific default without re-listing all the others via `botUserAgents`.
+    // Example: ['Amazonbot', 'Bytespider']
+    'excludeBotUserAgents' => [],
+
+    // -----------------------------------------------------------------------
+    // Content extraction (automatic HTML-to-Markdown conversion)
+    // -----------------------------------------------------------------------
+
+    // CSS selectors for extracting main content from HTML (comma-separated).
+    // Used when no dedicated LLM template is configured for a section.
+    'contentSelector' => 'main, article, [role="main"], .content, #content',
+
+    // CSS selectors for elements to remove before conversion (comma-separated).
+    // Use for decorative or repeated regions inside the main content area, so
+    // they never reach the Markdown output. Tag names work too, custom elements
+    // included. Example: '.carousel, [data-nosnippet], newsletter-signup'
+    'excludeSelector' => '',
+
+    // Rewrite links that wrap a whole card (image, heading, date) into one
+    // line: the heading as the link, the rest as plain text after it. Listing
+    // pages often wrap each card in a single <a>, which otherwise converts to
+    // a multi-line link with a heading and an image inside it.
+    'flattenCardLinks' => true,
+
+    // HTML elements removed from the extracted content during conversion, with
+    // everything inside them (comma-separated tag names). This is the default
+    // list: take `header` and `footer` out of it if your articles use those
+    // elements for the title block or byline, or add elements of your own
+    // (`aside`, `dialog`, a custom element). An empty string removes nothing.
+    // For classes, IDs and attributes use `excludeSelector` instead.
+    'excludeElements' => 'script, style, nav, footer, header, audio, video, iframe, form, svg',
+
+    // Extra options for the league/html-to-markdown converter, merged over the
+    // plugin's own (`strip_tags` => true, `header_style` => 'atx', and
+    // `remove_nodes` from `excludeElements`) so a key here wins. Config-file only;
+    // there is no control panel field. The library documents every option:
+    // https://github.com/thephpleague/html-to-markdown#configuration-options
+    //
+    //   'htmlConverterOptions' => [
+    //       'list_item_style' => '*',   // bullets as * instead of -
+    //       'hard_break' => true,       // <br> becomes "\n" instead of "  \n"
+    //       'use_autolinks' => false,   // always [text](url), never <url>
+    //   ],
+    'htmlConverterOptions' => [],
+
+    // -----------------------------------------------------------------------
+    // Response headers & discovery
+    // -----------------------------------------------------------------------
+
+    // Whether to add an `X-Robots-Tag: noindex` header to Markdown responses
+    // to prevent search engines from indexing them
+    'noindexHeader' => true,
+
+    // Whether to auto-inject a `<link rel="alternate" type="text/markdown">`
+    // discovery tag into the <head> of HTML pages
+    'autoInjectDiscoveryTag' => true,
+
+    // Whether to also advertise the Markdown alternate via an HTTP `Link`
+    // response header (RFC 8288), emitted on both GET and HEAD requests, e.g.
+    // `Link: <https://example.com/blog/my-post.md>; rel="alternate"; type="text/markdown"`
+    // Useful for crawlers that inspect headers without parsing HTML.
+    'autoInjectLinkHeader' => true,
+
+    // -----------------------------------------------------------------------
+    // Front matter
+    // -----------------------------------------------------------------------
+
+    // Field handle/path used as the front-matter `title:` value. Leave empty to
+    // use the entry's native title. Supports dot notation (e.g. `seo.title`),
+    // `()` method-call syntax (e.g. `metaData.getTitle()`), Generated Field
+    // handles, and the SEOmatic resolver `seomatic:title`.
+    'titleField' => '',
+
+    // Author name written to every entry's front matter — e.g. an editorial
+    // team name instead of the individual editor's name. Leave empty to use
+    // each entry's own author.
+    'authorOverride' => '',
+
+    // -----------------------------------------------------------------------
+    // /llms.txt and listing pages
+    // -----------------------------------------------------------------------
+
+    // Whether to serve `/llms.txt` (and the `/.well-known/llms.txt` redirect).
+    // Set to false to turn the route off without disabling the rest of the
+    // plugin — `.md` URLs, content negotiation and discovery tags keep working.
+    // When off the routes are never registered, so they 404, and the home
+    // page stops advertising an `llms.txt` alternate.
+    'enableLlmsTxt' => true,
+
+    // Title used for the `/llms.txt` H1 heading. Leave empty to use the
+    // site's name. Example: 'Acme Developer Docs'
+    //
+    // Accepts a Craft object template exactly as `llmsTxtIntro` below does,
+    // e.g. '{{ siteInfo.llmTitle }}', so editors can manage it per site — a
+    // fixed string applies to every site. The result is collapsed to one
+    // line; a template that renders to nothing falls back to the site's name.
+    'llmsTxtTitle' => '',
+
+    // Introduction text for the `/llms.txt` file. Appears as a blockquote
+    // below the site name. Helps LLMs understand what the site is about.
+    // Example: 'Acme is a technical blog covering Craft CMS and web development.'
+    //
+    // A value containing `{` is rendered as a Craft object template with the
+    // site available as `site`, so the text can come from content that editors
+    // manage instead of from project config — a global set field, say:
+    //   '{{ siteInfo.llmDescription }}'
+    // or a field on a Single:
+    //   '{{ craft.entries.section("home").site(site).one().summary ?? "" }}'
+    // Rich text is reduced to plain text with paragraph breaks kept, and the
+    // cached file is rebuilt whenever a global set or entry is saved.
+    'llmsTxtIntro' => '',
+
+    // How many of each section's most recent entries `/llms.txt` lists.
+    // 0 lists every entry. A higher limit makes the file slower to build; run
+    // `php craft llm-ready/indexes/regenerate` after deploys to build it
+    // ahead of visitors.
+    'llmsTxtEntryLimit' => 50,
+
+    // How many of a section's most recent entries its listing page (e.g.
+    // `/blog.md`) lists. 0 lists every entry.
+    'listingPageEntryLimit' => 100,
+
+    // Field handle/path for entry descriptions in `/llms.txt` and listing pages.
+    // Leave empty to auto-extract from the first text field. Beyond a plain
+    // handle, this supports dot notation (e.g. `seo.seoDescription`), `()`
+    // method-call syntax (e.g. `metaData.getMetaDescription()`), Generated Field
+    // handles, and a native SEOmatic resolver via `seomatic:description` (also
+    // `seomatic:og-description`, `seomatic:twitter-description`).
+    // When explicitly set, the configured field is authoritative — if it
+    // resolves to nothing, the description is omitted rather than auto-extracted.
+    // See SEO-PLUGINS.md for SEOmatic / Ether SEO / SEOmate / SEO Fields recipes.
+    'descriptionField' => '',
+
+    // -----------------------------------------------------------------------
+    // Caching
+    // -----------------------------------------------------------------------
+
+    // How long to cache Markdown output, in seconds. `/llms.txt` and section
+    // listing pages are rebuilt in a queue job once their copy is this old, or
+    // as soon as content changes, and the previous copy is served until the
+    // new one is ready. Set to 0 to disable caching — they are then built on
+    // every request, which on a large site can be slow enough to time out.
+    'cacheTtl' => 3600,
+
+    // -----------------------------------------------------------------------
+    // Analytics
+    // -----------------------------------------------------------------------
+
+    // Whether to log AI bot requests for the analytics dashboard
+    'enableAnalytics' => false,
+
+    // Number of days to retain analytics data before it is eligible for purging
+    'analyticsRetentionDays' => 90,
+];

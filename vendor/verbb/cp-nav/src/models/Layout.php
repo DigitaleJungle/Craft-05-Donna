@@ -1,0 +1,64 @@
+<?php
+namespace verbb\cpnav\models;
+
+use verbb\cpnav\CpNav;
+
+use craft\base\Model;
+
+use DateTime;
+
+class Layout extends Model
+{
+    // Constants
+    // =========================================================================
+
+    public const MAX_NAME_LENGTH = 255;
+
+
+    // Properties
+    // =========================================================================
+
+    public ?int $id = null;
+    public ?string $name = null;
+    public bool $isDefault = false;
+    public ?array $permissions = null;
+    public ?int $sortOrder = null;
+    public ?DateTime $dateCreated = null;
+    public ?DateTime $dateUpdated = null;
+    public ?string $uid = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getLayoutNavItems(): array
+    {
+        if (!$this->id) {
+            return [];
+        }
+
+        return CpNav::$plugin->getNavBuilder()->getLayoutNavItemsForLayout($this->id);
+    }
+
+    public function getConfig(): array
+    {
+        return [
+            'name' => $this->name,
+            'isDefault' => $this->isDefault,
+            'permissions' => $this->permissions,
+            'sortOrder' => $this->sortOrder,
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineRules(): array
+    {
+        return [
+            [['name'], 'required'],
+            [['name'], 'string', 'max' => self::MAX_NAME_LENGTH],
+        ];
+    }
+}

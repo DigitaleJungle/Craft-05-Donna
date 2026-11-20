@@ -1,0 +1,28 @@
+{% from "_snips/_macros.twig" import translate, renderSocials %}
+{% set mandatoryLinks = [{
+    url: siteUrl~"terms-conditions",
+    label: translate('algemene voorwaarden')
+},{
+    url: siteUrl~"privacy-policy",
+    label: translate('privacybeleid')
+}] %}
+
+{{ craft.freenav.render('mainMenu') }}
+
+{% for link in mandatoryLinks %}
+    <a href={{link.url}} class="offcanvas-color ps-6" aria-label="{{ link.label }}">{{ link.label }}</a>
+{% endfor %}
+<span class="ps-6" >
+    © {{ "now"|date("Y") }} {{ company.companyName }}. All rights reserved.
+</span>
+
+{#
+{{ craft.freenav.render('mainMenu', {
+    preset: 'mega',
+    ulClass: 'nav-items',
+    liClass: 'nav-item',
+    aClass: 'nav-link',
+    activeClass: 'nav-active',
+    hasChildrenClass: 'nav-has-children',
+}) }}
+ #}

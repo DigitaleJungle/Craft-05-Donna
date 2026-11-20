@@ -1,0 +1,54 @@
+{%- set options = (options is defined ? options : []) %}
+{%- set value = (value is defined ? value : null) %}
+{%- set hasOptgroups = false -%}
+
+<div id="{{ name }}" class="buttonbox-textsize">
+    <select{%- if name is defined %} name="{{ name }}"{% endif %}>
+        {% for key, option in options %}
+            {% set optionLabel = (option.label is defined ? option.label : option) %}
+            {% set optionValue = (option.value is defined ? option.value : key) %}
+            {% set optionDisabled = (option.disabled is defined ? option.disabled : false) %}
+            
+            <option {{ attr({
+                value: optionValue,
+                selected: optionValue == value ? true : false,
+                disabled: optionDisabled ? true : false,
+                'data-buttonbox-pxval': option.pxVal ? option.pxVal : false,
+            }) }}>{{ optionLabel }}</option>
+        {% endfor %}
+    </select>
+
+    {% set displayValue = field.placeholderText | t('buttonbox') %}
+
+    {% apply spaceless %}
+        {% for key, option in options %}
+            {% set optionLabel = (option.label is defined ? option.label : option) %}
+            {% set optionValue = (option.value is defined ? option.value : key) %}
+
+            {% if optionValue == value %}
+                {% set displayValue %}
+                    <span{% if option.pxVal %} style="font-size: {{ option.pxVal }}px;"{% endif %}>{{ optionLabel }}</span>
+                {% endset %}
+            {% endif %}
+        {% endfor %}
+    {% endapply %}
+
+    <button type="button" class="btn menubtn" aria-label="{{ displayValue | striptags }}">
+        {{ displayValue }}
+    </button>
+
+    <div class="menu buttonbox-fancyoptions-menu">
+        <ul class="padded">
+            {% for key, option in options %}
+                {% set optionLabel = (option.label is defined ? option.label : option) %}
+                {% set optionValue = (option.value is defined ? option.value : key) %}
+                
+                <li>
+                    <a{% if optionValue == value %} class="sel"{% endif %} role="button" data-buttonbox-value="{{ optionValue }}">
+                        <span{% if option.pxVal %} style="font-size: {{ option.pxVal }}px;"{% endif %}>{{ optionLabel }}</span>
+                    </a>
+                </li>
+            {% endfor %}
+        </ul>
+    </div>
+</div>

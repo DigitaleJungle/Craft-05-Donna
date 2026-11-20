@@ -1,0 +1,26 @@
+{% from "_includes/forms" import text %}
+
+{% set elementSelect = include('_includes/forms/elementSelect', {
+    class: [
+        'clearafter',
+        'oddsandends-elementsearch',
+    ],
+    jsClass: 'OddsAndEnds.ElementSearchInput',
+    searchCriteria: null,
+}) %}
+
+{# Hacky stuff to replace the add element button with a search input #}
+{% set splitOnAddBtn = elementSelect|split('<div class="flex">') %}
+{{ splitOnAddBtn[0]|raw }}
+{% if splitOnAddBtn|length > 1 %}
+    {% set splitAfterAddBtn = splitOnAddBtn[1]|split('<div class="spinner hidden"></div>', 2) %}
+    <div class="texticon add icon">
+        {{ text({
+            width: 'auto',
+            placeholder: selectionLabel,
+            describedBy: describedBy ?? false,
+        }) }}
+        <div class="spinner hidden"></div>
+    {# </div> retained from _includes/forms/elementSelect #}
+    {{ splitAfterAddBtn[1]|raw }}
+{% endif %}

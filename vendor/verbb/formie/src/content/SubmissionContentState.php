@@ -1,0 +1,41 @@
+<?php
+namespace verbb\formie\content;
+
+use verbb\formie\conditions\ConditionState;
+use verbb\formie\models\SubmissionUploadClaims;
+
+class SubmissionContentState
+{
+    // Properties
+    // =========================================================================
+
+    public array $rawValuesByUid = [];
+    public array $normalizedValuesByUid = [];
+    public array $orphanedValuesByUid = [];
+    public array $lockedValuesByUid = [];
+    public array $invalidElementSelectionsByPath = [];
+    public ?SubmissionFieldCollection $fieldCollection = null;
+    public array $currentPageFieldHandleMapsByPageId = [];
+    public array $uploadedDataFiles = [];
+    public bool $isMergingPartialPayload = false;
+    public ?SubmissionUploadClaims $uploadClaims = null;
+    /** Normalized field paths mapped to the original request paths before repeater compaction. */
+    public array $requestFieldPaths = [];
+    public ConditionState $conditions;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct()
+    {
+        $this->conditions = new ConditionState();
+    }
+
+    public function resetFieldCollection(): void
+    {
+        $this->conditions->invalidate();
+        $this->fieldCollection = null;
+        $this->currentPageFieldHandleMapsByPageId = [];
+    }
+}

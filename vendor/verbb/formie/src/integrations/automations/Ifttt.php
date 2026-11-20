@@ -1,0 +1,115 @@
+<?php
+namespace verbb\formie\integrations\automations;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Automation;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\IntegrationSecrets;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+
+use Throwable;
+
+class Ifttt extends Automation
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsConnection(): bool
+    {
+        return false;
+    }
+
+    public static function displayName(): string
+    {
+        return 'IFTTT';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $webhookKey = null;
+
+    #[FormIntegrationSetting]
+    public ?string $eventName = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to IFTTT.');
+    }
+
+    public function getUrl(): string
+    {
+        $event = rawurlencode(IntegrationSecrets::resolveFormValue((string)$this->eventName));
+
+        if ($event === '.' || $event === '..') {
+            $event = str_replace('.', '%2E', $event);
+        }
+
+        $key = App::parseEnv($this->webhookKey);
+
+        return "https://maker.ifttt.com/trigger/$event/with/key/$key";
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $payload = $this->generatePayloadValues($submission);
+
+            $response = $this->deliverPayload($submission, $this->getUrl(), $payload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['webhookKey'], 'required'];
+        $rules[] = [['eventName'], 'required', 'on' => [Integration::SCENARIO_FORM]];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::textField([
+            'label' => Craft::t('formie', 'Event Name'),
+            'instructions' => Craft::t('formie', 'Enter the {name} event name.', ['name' => $this->displayName()]),
+            'name' => 'eventName',
+            'required' => true,
+        ]);
+
+        $schema[] = SchemaHelper::integrationSendTestPayloadButtonField();
+
+        return $schema;
+    }
+}

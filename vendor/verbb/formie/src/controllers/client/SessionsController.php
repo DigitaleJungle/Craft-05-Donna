@@ -1,0 +1,63 @@
+<?php
+namespace verbb\formie\controllers\client;
+
+use verbb\formie\Formie;
+use verbb\formie\controllers\AnonymousSiteRequestGuardTrait;
+use verbb\formie\controllers\CrossOriginRequestTrait;
+use verbb\formie\helpers\BrowserRequestProfile;
+use verbb\formie\models\SessionRefreshRequest;
+
+use craft\web\Controller;
+
+use yii\web\Response;
+
+class SessionsController extends Controller
+{
+    // Traits
+    // =========================================================================
+
+    use CrossOriginRequestTrait;
+    use AnonymousSiteRequestGuardTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    protected array|bool|int $allowAnonymous = ['refresh'];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function beforeAction($action): bool
+    {
+        $this->forbidGuestControlPanelAnonymousActions($action->id);
+        $profile = BrowserRequestProfile::enter($action->id === 'load');
+
+        if ($profile === BrowserRequestProfile::CROSS_ORIGIN) {
+            $this->enableCsrfValidation = false;
+        }
+        $this->enableCsrfValidation = $profile === BrowserRequestProfile::SAME_ORIGIN;
+
+        return parent::beforeAction($action);
+    }
+
+    public function actionRefresh(): Response
+    {
+        if ($response = $this->handleCrossOriginRequest()) {
+            return $response;
+        }
+
+        $this->requirePostRequest();
+
+        $session = Formie::$plugin->getFormSessions()->refreshSession(new SessionRefreshRequest([
+            'handle' => (string)$this->request->getBodyParam('handle', $this->request->getParam('handle', '')),
+            'siteId' => $this->request->getBodyParam('siteId') ? (int)$this->request->getBodyParam('siteId') : null,
+            'session' => (array)$this->request->getBodyParam('session', []),
+        ]), true);
+
+        $this->response->setNoCacheHeaders();
+
+        return $this->asJson($session->toArrayRecursive());
+    }
+}

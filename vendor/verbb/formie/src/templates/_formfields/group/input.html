@@ -1,0 +1,27 @@
+{% extends 'formie/_formfields/field' %}
+
+{% block field %}
+
+{# Keep track of the outer group field #}
+{% set groupField = field %}
+
+<div class="formie-group-field pane">
+    {% namespace field.handle %}
+        <div class="formie-nested-field-rows" data-formie-nested-field-rows>
+            {% for row in field.getRows() %}
+                <div class="formie-nested-field-row" data-formie-nested-field-row>
+                    {% for field in row.getFields() %}
+                        {% include 'formie/_formfields/group/field' with {
+                            field: field,
+                            fieldKey: "#{groupField.handle}.#{field.handle}",
+                            element: element,
+                            required: field.required,
+                        } only %}
+                    {% endfor %}
+                </div>
+            {% endfor %}
+        </div>
+    {% endnamespace %}
+</div>
+
+{% endblock %}

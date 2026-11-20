@@ -1,0 +1,383 @@
+<?php
+namespace verbb\formie\controllers\server;
+
+use verbb\formie\Formie;
+use verbb\formie\controllers\AnonymousSiteRequestGuardTrait;
+use verbb\formie\controllers\CrossOriginRequestTrait;
+use verbb\formie\elements\Form;
+use verbb\formie\elements\Submission;
+use verbb\formie\enums\SubmissionAuthorityType;
+use verbb\formie\enums\SubmissionOperation;
+use verbb\formie\errors\SubmissionUnavailableException;
+use verbb\formie\helpers\BrowserRequestProfile;
+use verbb\formie\helpers\ClientEventsHelper;
+use verbb\formie\helpers\SiteHelper;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\models\HtmlSubmissionRequest;
+use verbb\formie\models\PageTransitionRequest;
+use verbb\formie\models\SubmissionCommand;
+use verbb\formie\models\SubmissionErrors;
+use verbb\formie\models\SubmissionResponse;
+
+use Craft;
+use craft\web\Controller;
+
+use yii\web\BadRequestHttpException;
+use yii\web\Response;
+
+class SubmissionsController extends Controller
+{
+    // Constants
+    // =========================================================================
+
+    private const STALE_SUBMISSION_STATE_CODE = 'STALE_SUBMISSION_STATE';
+
+
+    // Traits
+    // =========================================================================
+
+    use CrossOriginRequestTrait;
+    use AnonymousSiteRequestGuardTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    protected array|bool|int $allowAnonymous = [
+        'submit' => self::ALLOW_ANONYMOUS_LIVE,
+        'set-page' => self::ALLOW_ANONYMOUS_LIVE,
+        'clear-submission' => self::ALLOW_ANONYMOUS_LIVE,
+    ];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function beforeAction($action): bool
+    {
+        $profile = BrowserRequestProfile::enter();
+        $this->forbidGuestControlPanelAnonymousActions($action->id);
+
+        if (in_array($action->id, ['submit', 'set-page', 'clear-submission'], true)) {
+            $settings = Formie::$plugin->getSettings();
+
+            if (Craft::$app->getUser()->isGuest && !$settings->enableCsrfValidationForGuests) {
+                $this->enableCsrfValidation = false;
+            }
+        }
+
+        if ($this->request->getIsLivePreview() || $this->request->getIsPreview()) {
+            $this->enableCsrfValidation = false;
+        }
+
+        if ($profile === BrowserRequestProfile::CROSS_ORIGIN) {
+            $this->enableCsrfValidation = false;
+        } elseif ($this->request->getHeaders()->has('X-Formie-Profile')) {
+            $this->enableCsrfValidation = true;
+        }
+
+        return parent::beforeAction($action);
+    }
+
+    public function actionSubmit(): Response
+    {
+        if ($response = $this->handleCrossOriginRequest()) {
+            return $response;
+        }
+
+        $this->requirePostRequest();
+
+        $siteId = SiteHelper::resolveSiteIdFromRequest(
+            Craft::$app->getSites()->getCurrentSite()->id
+        );
+
+        try {
+            $result = Formie::$plugin->getSubmissionRequests()->executeHtml(new HtmlSubmissionRequest([
+                'handle' => $this->_stringParam('handle'),
+                'operation' => SubmissionOperation::SUBMIT,
+                'siteId' => $siteId,
+                'expectedVersion' => $this->_nullableIntParam('expectedVersion'),
+                'operationId' => $this->_nullableStringParam('operationId'),
+                'renderId' => $this->_nullableStringParam('renderId'),
+                'requestToken' => $this->_stringParam('requestToken'),
+                'draftContext' => $this->_nullableStringParam('draftContext'),
+                'draftContextToken' => $this->_nullableStringParam('draftContextToken'),
+                'resumeToken' => $this->_nullableStringParam('resumeToken'),
+                'submissionUid' => $this->_nullableStringParam('submissionUid'),
+                'submitAction' => $this->_nullableStringParam('submitAction'),
+                'pageId' => $this->_nullableIntParam('pageId'),
+                'targetPageId' => $this->_nullableIntParam('targetPageId'),
+                'uploadPayloadVersion' => $this->_nullableIntParam('formieUploadPayloadVersion'),
+            ]), SubmissionAuthorityType::VISITOR);
+        } catch (SubmissionUnavailableException $exception) {
+            return $this->_staleSubmissionStateResponse($exception->form, $exception->source, $exception->value);
+        }
+
+        $submissionRequest = $result->command;
+        $response = $result->response;
+        $form = $response->form;
+        $submission = $response->submission;
+        $saveResumePayload = [];
+
+        if ($response->success && $response->submitAction === 'save') {
+            $saveResumePayload = $this->_createSaveResumePayload($form, $submission);
+        }
+
+        $this->response->setNoCacheHeaders();
+        $this->response->setStatusCode($response->httpStatus);
+
+        return $this->asJson($this->_createSubmitJsonResponsePayload(
+            $response,
+            $response->submitAction,
+            $saveResumePayload,
+            $submissionRequest,
+        ));
+    }
+
+    public function actionSetPage(): Response
+    {
+        if ($response = $this->handleCrossOriginRequest(['POST', 'OPTIONS'])) {
+            return $response;
+        }
+
+        $this->requirePostRequest();
+
+        $handle = $this->_stringParam('handle');
+        $pageId = $this->_nullableIntParam('pageId');
+        $siteId = SiteHelper::resolveSiteIdFromRequest(
+            Craft::$app->getSites()->getCurrentSite()->id
+        );
+
+        if (!$pageId) {
+            throw new BadRequestHttpException('Missing required pageId.');
+        }
+
+        $result = Formie::$plugin->getFormSessions()->persistPageState(new PageTransitionRequest([
+            'handle' => $handle,
+            'siteId' => $siteId,
+            'targetPageId' => (string)$pageId,
+            'values' => $this->request->getBodyParam('fields', []),
+            'session' => [
+                'version' => $this->_nullableIntParam('expectedVersion'),
+                'tokens' => [
+                    'render' => $this->_nullableStringParam('renderId'),
+                    'request' => $this->_nullableStringParam('requestToken'),
+                ],
+                'continuation' => array_filter([
+                    'draftContext' => $this->_nullableStringParam('draftContext'),
+                    'draftContextToken' => $this->_nullableStringParam('draftContextToken'),
+                    'progressId' => $this->_nullableStringParam('progressId'),
+                ], static function($value) {
+                    return $value !== null && $value !== '';
+                }),
+            ],
+        ]));
+        $this->response->setNoCacheHeaders();
+        $this->response->setStatusCode($result->httpStatus);
+
+        return $this->asJson([
+            'success' => $result->success,
+            'pageId' => $result->currentPageId,
+            'errors' => SubmissionErrors::fromClient($result->errors, Formie::$plugin->getForms()->getFormByHandle($handle))->toValuePathMap(),
+            'session' => $result->session?->toArrayRecursive(),
+        ]);
+    }
+
+    public function actionClearSubmission(): Response
+    {
+        if ($response = $this->handleCrossOriginRequest(['POST', 'OPTIONS'])) {
+            return $response;
+        }
+
+        $this->requirePostRequest();
+
+        $handle = $this->_stringParam('handle');
+        $siteId = SiteHelper::resolveSiteIdFromRequest(
+            Craft::$app->getSites()->getCurrentSite()->id
+        );
+
+        if ($handle === '') {
+            throw new BadRequestHttpException('Missing required handle.');
+        }
+
+        $form = Formie::$plugin->getSubmissionRequests()->requireFormByHandle($handle, $siteId);
+        $draftContext = $this->_nullableStringParam('draftContextToken')
+            ? $form->resolveDraftContextToken($this->_nullableStringParam('draftContextToken'))
+            : $this->_nullableStringParam('draftContext');
+
+        Formie::$plugin->getSubmissionRequests()->applyFormRequestContext(
+            $form,
+            $this->_nullableStringParam('renderId'),
+            $draftContext,
+        );
+        Formie::$plugin->getSubmissionProgress()->clearProgressState($form);
+        $this->response->setNoCacheHeaders();
+
+        return $this->asJson([
+            'success' => true,
+        ]);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _createSubmitJsonResponsePayload(
+        SubmissionResponse $response,
+        string $submitAction,
+        array $payload = [],
+        ?SubmissionCommand $submissionRequest = null,
+    ): array {
+        $form = $response->form;
+        $submission = $response->submission;
+        $nextPage = $response->nextPage;
+        $pages = $form->getPages();
+        $nextPageId = $nextPage?->id ?? null;
+
+        $payload['success'] = $response->success;
+        $this->_appendPaymentResponsePayload($payload, $response);
+        $payload['submissionUid'] = $submission->uid;
+        $payload['submitAction'] = $submitAction;
+        $payload['outcome'] = $response->outcome?->type->value;
+        $payload['version'] = $response->outcome?->version;
+        $payload['events'] = [];
+        $submitData = $form->getSubmitData();
+
+        if ($submitData) {
+            $payload['submitData'] = $submitData;
+        }
+
+        if (!$response->success) {
+            // Terminal spam can be corrected, but its saved record cannot be resumed.
+            $payload['resetSubmissionIdentity'] = $submission->isSpam && !$submission->isIncomplete;
+            $payload['errors'] = SubmissionErrors::fromSubmission($submission)->toValuePathMap();
+            $this->_appendPaymentResponsePayload($payload, $response);
+
+            return $payload;
+        }
+
+        if ($submitAction === 'save') {
+            $payload['nextPageId'] = null;
+            $payload['totalPages'] = count($pages);
+            $payload['isFinalPage'] = false;
+            $payload['successMessage'] = Craft::t('formie', 'Your progress has been saved.');
+        } else {
+            $payload['nextPageId'] = $nextPageId;
+            $payload['totalPages'] = count($pages);
+            $payload['isFinalPage'] = $nextPageId === null;
+        }
+
+        $payload['summaryTokens'] = $response->getSummaryTokens();
+
+        $payload['completion'] = $response->outcome->data['completion'] ?? null;
+        $payload['redirect'] = $response->outcome->data['redirect'] ?? null;
+
+        if ($completion = $payload['completion']) {
+            $payload['redirectUrl'] = $completion['url'];
+            $payload['redirectTarget'] = $completion['target'];
+            $payload['successMessage'] = $completion['message'];
+        }
+
+        if (array_key_exists('successMessage', $payload)) {
+            $payload['submitActionMessage'] = $payload['successMessage'];
+        }
+
+        if ($response->quizResult) {
+            $payload['quizResult'] = $response->quizResult;
+        }
+
+        if ($submissionRequest && $response->success) {
+            $pageId = (int)($submissionRequest->pageId ?? 0);
+
+            if ($pageId <= 0) {
+                if ($response->nextPage) {
+                    $previousPage = $form->getPreviousPage($response->nextPage, $submission);
+                    $pageId = $previousPage?->id ? (int)$previousPage->id : 0;
+                } else {
+                    $pages = $form->getPages();
+                    $pageId = $pages ? (int)$pages[0]->id : 0;
+                }
+            }
+
+            $clientEvents = ClientEventsHelper::resolveForSubmittedPage(
+                $form,
+                $submission,
+                $pageId ?: null,
+                $submitAction,
+            );
+
+            if ($clientEvents) {
+                $payload['clientEvents'] = $clientEvents;
+            }
+        }
+
+        return $payload;
+    }
+
+    private function _appendPaymentResponsePayload(array &$payload, SubmissionResponse $response): void
+    {
+        $payload['payment'] = $response->payment;
+
+        if (isset($payload['payment']['message'])) {
+            $payload['payment']['message'] = StringHelper::sanitizeMessageHtml($payload['payment']['message']);
+        }
+    }
+
+    private function _createSaveResumePayload(Form $form, Submission $submission): array
+    {
+        $baseResumeUrl = Formie::$plugin->getSubmissionRequests()->resolveTrustedResumeBaseUrl(
+            $this->request->getReferrer(),
+            (string)$this->request->getUrl()
+        );
+
+        return Formie::$plugin->getSubmissionRequests()->createSaveResumePayload($form, $submission, $baseResumeUrl);
+    }
+
+    private function _staleSubmissionStateResponse(Form $form, string $source, string $value): Response
+    {
+        $message = Craft::t('formie', 'Your previous submission session is no longer available. Please review the form and submit again.');
+
+        Formie::warning('Recovered stale submission continuity state for form "{form}" ({source}: {value}).', [
+            'form' => $form->handle,
+            'source' => $source,
+            'value' => $value,
+        ]);
+
+        Formie::$plugin->getSubmissionProgress()->clearProgressState($form);
+        $this->response->setNoCacheHeaders();
+
+        return $this->asJson([
+            'success' => false,
+            'code' => self::STALE_SUBMISSION_STATE_CODE,
+            'message' => $message,
+            'errors' => [
+                'form' => [$message],
+            ],
+            'recoverable' => true,
+            'resetState' => true,
+        ]);
+    }
+
+    private function _stringParam(string $name): string
+    {
+        return trim((string)$this->request->getParam($name, ''));
+    }
+
+    private function _nullableStringParam(string $name): ?string
+    {
+        $value = trim((string)$this->request->getParam($name, ''));
+
+        return $value !== '' ? $value : null;
+    }
+
+    private function _nullableIntParam(string $name): ?int
+    {
+        $value = $this->request->getParam($name);
+
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        return (int)$value;
+    }
+}

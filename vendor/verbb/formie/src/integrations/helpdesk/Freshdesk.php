@@ -1,0 +1,748 @@
+<?php
+namespace verbb\formie\integrations\helpdesk;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\HelpDesk;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\ModifyFieldIntegrationValuesEvent;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+use verbb\formie\references\ReferenceContext;
+use verbb\formie\references\ReferenceSlot;
+use verbb\formie\references\ReferenceSlotKind;
+use verbb\formie\references\ReferenceUsage;
+
+use Craft;
+use craft\elements\Asset;
+use craft\elements\db\AssetQuery;
+use craft\elements\ElementCollection;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Psr7\Utils;
+
+class Freshdesk extends HelpDesk
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Freshdesk';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    public ?string $apiDomain = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToContact = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToTicket = false;
+
+    #[FormIntegrationSetting]
+    public ?array $contactFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $ticketFieldMapping = null;
+
+    private array $_attachments = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            // Get Contact fields
+            if ($this->mapToContact && $this->settingsContext->dataKey === 'contact') {
+                $fields = $this->request('GET', 'contact_fields');
+
+                $settings['contact'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                        'required' => true,
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone',
+                        'name' => Craft::t('formie', 'Phone'),
+                        'type' => IntegrationField::TYPE_PHONE,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'mobile',
+                        'name' => Craft::t('formie', 'Mobile'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'twitter_id',
+                        'name' => Craft::t('formie', 'Twitter ID'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_id',
+                        'name' => Craft::t('formie', 'Company ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'description',
+                        'name' => Craft::t('formie', 'Description'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'job_title',
+                        'name' => Craft::t('formie', 'Job Title'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'time_zone',
+                        'name' => Craft::t('formie', 'Timezone'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                ], $this->_getCustomFields($fields));
+            }
+
+            // Get Ticket fields
+            if ($this->mapToTicket && $this->settingsContext->dataKey === 'ticket') {
+                $fields = $this->request('GET', 'ticket_fields');
+
+                $settings['ticket'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                        'required' => true,
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone',
+                        'name' => Craft::t('formie', 'Phone'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'unique_external_id',
+                        'name' => Craft::t('formie', 'Unique External ID'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'subject',
+                        'name' => Craft::t('formie', 'Subject'),
+                        'required' => true,
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'type',
+                        'name' => Craft::t('formie', 'Type'),
+                        'type' => IntegrationField::TYPE_STRING,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'status',
+                        'name' => Craft::t('formie', 'Status'),
+                        'required' => true,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Source'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'Open'),
+                                    'value' => 2,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Pending'),
+                                    'value' => 3,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Resolved'),
+                                    'value' => 4,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Closed'),
+                                    'value' => 5,
+                                ],
+                            ],
+                        ],
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'priority',
+                        'name' => Craft::t('formie', 'Priority'),
+                        'required' => true,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Source'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'Low'),
+                                    'value' => 1,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Medium'),
+                                    'value' => 2,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'High'),
+                                    'value' => 3,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Urgent'),
+                                    'value' => 4,
+                                ],
+                            ],
+                        ],
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'description',
+                        'name' => Craft::t('formie', 'Description'),
+                        'required' => true,
+                        'type' => IntegrationField::TYPE_STRING,
+                        'acceptsHtml' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'responder_id',
+                        'name' => Craft::t('formie', 'Responder ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'attachments',
+                        'name' => Craft::t('formie', 'Attachments'),
+                        'type' => IntegrationField::TYPE_ARRAY,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'cc_emails',
+                        'name' => Craft::t('formie', 'CC Emails'),
+                        'type' => IntegrationField::TYPE_ARRAY,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'due_by',
+                        'name' => Craft::t('formie', 'Due By'),
+                        'type' => IntegrationField::TYPE_DATETIME,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email_config_id',
+                        'name' => Craft::t('formie', 'Email Config ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'fr_due_by',
+                        'name' => Craft::t('formie', 'First Response Due By'),
+                        'type' => IntegrationField::TYPE_DATETIME,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'group_id',
+                        'name' => Craft::t('formie', 'Group ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'product_id',
+                        'name' => Craft::t('formie', 'Product ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'source',
+                        'name' => Craft::t('formie', 'Source'),
+                        'required' => true,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Source'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'Email'),
+                                    'value' => 1,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Portal'),
+                                    'value' => 2,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Phone'),
+                                    'value' => 3,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Chat'),
+                                    'value' => 7,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Feedback Widget'),
+                                    'value' => 9,
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Outbound Email'),
+                                    'value' => 10,
+                                ],
+                            ],
+                        ],
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'tags',
+                        'name' => Craft::t('formie', 'Tags'),
+                        'type' => IntegrationField::TYPE_ARRAY,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_id',
+                        'name' => Craft::t('formie', 'Company ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                ], $this->_getCustomFields($fields));
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'tickets');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public function getConfigValue(string $key): mixed
+    {
+        $fields = parent::getConfigValue($key);
+
+        // Ticket descriptions are HTML, including in metadata cached before fields declared it.
+        if ($key === 'ticket' && is_array($fields)) {
+            foreach ($fields as $index => $field) {
+                if ($field instanceof IntegrationField && $field->handle === 'description') {
+                    $fields[$index] = clone $field;
+                    $fields[$index]->acceptsHtml = true;
+                }
+            }
+        }
+
+        return $fields;
+    }
+
+    public function getFieldMappingMultipartValues(Submission $submission, ?array $fieldMapping, mixed $fieldSettings = [])
+    {
+        // Public callers must resolve attachments for this submission too.
+        $this->_requiresMultipart($fieldMapping, $submission);
+        $fieldSettings = is_string($fieldSettings) ? $this->getConfigValue($fieldSettings) : $fieldSettings;
+        $fieldValues = [];
+
+        if (!is_array($fieldMapping)) {
+            $fieldMapping = [];
+        }
+
+        foreach ($fieldMapping as $tag => $fieldKey) {
+            $slot = ReferenceSlot::fromStored($fieldKey);
+
+            // Don't let in un-mapped fields
+            if ($slot->value === '') {
+                continue;
+            }
+
+            // Prep custom field names for multipart
+            if (str_starts_with($tag, 'custom:')) {
+                $name = 'custom_fields[' . str_replace('custom:', '', $tag) . ']';
+            } else {
+                $name = $tag;
+            }
+
+            // Attachment references resolve to assets, not their ordinary URL projection.
+            if ($tag === 'attachments') {
+                foreach ($this->_attachments as $attachment) {
+                    $fieldValues[] = [
+                        'name' => $name . '[]',
+                        'contents' => Utils::tryFopen($attachment->getImageTransformSourcePath(), 'r'),
+                        'filename' => $attachment->filename,
+                    ];
+                }
+
+                continue;
+            }
+
+            $integrationField = ArrayHelper::firstWhere($fieldSettings ?? [], 'handle', $tag) ?? new IntegrationField();
+            $value = $this->resolveMappedFieldValue($fieldKey, $submission, $integrationField);
+
+            if (is_array($value)) {
+                foreach ($value as $key => $contents) {
+                    $fieldValues[] = [
+                        'name' => is_string($key) ? "{$name}[{$key}]" : "{$name}[]",
+                        'contents' => $contents,
+                    ];
+                }
+            } elseif ($value !== '' && $value !== null) {
+                $fieldValues[] = [
+                    'name' => $name,
+                    'contents' => $value,
+                ];
+            }
+        }
+
+        $event = new ModifyFieldIntegrationValuesEvent([
+            'fieldValues' => $fieldValues,
+            'submission' => $submission,
+            'fieldMapping' => $fieldMapping,
+            'fieldSettings' => $fieldSettings,
+            'integration' => $this,
+        ]);
+
+        $this->trigger(Integration::EVENT_MODIFY_FIELD_MAPPING_VALUES, $event);
+
+        return $event->fieldValues;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            // Send Contact payload
+            if ($this->mapToContact) {
+                $contactValues = $this->getFieldMappingValues($submission, $this->contactFieldMapping, 'contact');
+
+                // Directly modify the field values first
+                $contactFields = $this->_prepCustomFields($contactValues);
+
+                // Only add custom fields if array not empty to prevent validation error
+                if ($contactFields) {
+                    $contactPayload = array_merge($contactValues, [
+                        'custom_fields' => $contactFields,
+                    ]);
+                } else {
+                    $contactPayload = $contactValues;
+                }
+
+                try {
+                    $response = $this->deliverPayload($submission, 'contacts', $contactPayload);
+
+                    if ($response === false) {
+                        return $this->resultForPayload(true);
+                    }
+
+                    $contactId = $response['id'] ?? '';
+
+                    if (!$contactId) {
+                        Integration::error($this, Craft::t('formie', 'Missing return “contactId” {response}. Sent payload {payload}', [
+                            'response' => Json::encode($response),
+                            'payload' => Json::encode($contactPayload),
+                        ]), true);
+                    }
+                } catch (Throwable $e) {
+                    $contactId = $e instanceof RequestException ? $this->_getDuplicateContactId($e) : null;
+
+                    if ($contactId === null) {
+                        throw $e;
+                    }
+
+                    try {
+                        $this->deliverPayload($submission, "contacts/{$contactId}", $contactPayload, 'PUT');
+                    } catch (Throwable $e) {
+                        // Transport failures have no response to inspect.
+                        if (!$e instanceof RequestException || !$e->getResponse()) {
+                            throw $e;
+                        }
+
+                        $updateResponse = Json::decode((string)$e->getResponse()->getBody());
+                        $statusCode = $e->getResponse()->getStatusCode();
+
+                        if ($statusCode === 405 && ($updateResponse['message'] ?? null) === 'PUT method is not allowed. It should be one of these method(s): GET') {
+                            // Deleted or spam contacts cannot be updated, but can still have tickets.
+                            Integration::error($this, Craft::t('formie', '{message} {response}. Sent payload {payload}', [
+                                'message' => Integration::getExceptionLogMessage($e),
+                                'response' => Json::encode($updateResponse),
+                                'payload' => Json::encode($contactPayload),
+                            ]), false);
+                        } elseif ($statusCode === 404 && $updateResponse === null) {
+                            // Agents are not available through the contacts endpoint.
+                            Integration::info($this, Craft::t('formie', '{message} {response}. Sent payload {payload}', [
+                                'message' => Integration::getExceptionLogMessage($e),
+                                'response' => Json::encode($updateResponse),
+                                'payload' => Json::encode($contactPayload),
+                            ]), false);
+                        } else {
+                            throw $e;
+                        }
+                    }
+                }
+            }
+
+            // Send Ticket payload
+            if ($this->mapToTicket) {
+                $requiresMultipart = $this->_requiresMultipart($this->ticketFieldMapping, $submission);
+
+                if ($requiresMultipart) {
+                    $ticketPayload = $this->getFieldMappingMultipartValues($submission, $this->ticketFieldMapping, 'ticket');
+                    $contentType = 'multipart';
+                } else {
+                    $ticketPayload = $this->getFieldMappingValues($submission, $this->ticketFieldMapping, 'ticket');
+                    $ticketFields = $this->_prepCustomFields($ticketPayload);
+
+                    if ($ticketFields) {
+                        $ticketPayload['custom_fields'] = $ticketFields;
+                    }
+
+                    // Extra payload prep - some fields are finicky
+                    if (isset($ticketPayload['status'])) {
+                        $ticketPayload['status'] = (int)$ticketPayload['status'];
+                    }
+
+                    if (isset($ticketPayload['priority'])) {
+                        $ticketPayload['priority'] = (int)$ticketPayload['priority'];
+                    }
+
+                    if (isset($ticketPayload['source'])) {
+                        $ticketPayload['source'] = (int)$ticketPayload['source'];
+                    }
+
+                    // Unset any attachments field, empty or otherwise, since
+                    // _requiresMultipart() has already determined we don't need it
+                    unset($ticketPayload['attachments']);
+
+                    $contentType = 'json';
+                }
+
+                $response = $this->deliverPayload($submission, 'tickets', $ticketPayload, 'POST', $contentType);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $ticketId = $response['id'] ?? '';
+
+                if (!$ticketId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “ticketId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($ticketPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey', 'apiDomain'], 'required'];
+
+        $contact = $this->getConfigValue('contact');
+        $ticket = $this->getConfigValue('ticket');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['contactFieldMapping'], 'validateFieldMapping', 'params' => $contact, 'when' => function($model) {
+                return $model->enabled && $model->mapToContact;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['ticketFieldMapping'], 'validateFieldMapping', 'params' => $ticket, 'when' => function($model) {
+                return $model->enabled && $model->mapToTicket;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        $url = rtrim(App::parseEnv($this->apiDomain), '/');
+
+        return Craft::createGuzzleClient([
+            'base_uri' => "$url/api/v2/",
+            'auth' => [App::parseEnv($this->apiKey), 'password'],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToContact',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Contact']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Contacts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'contactFieldMapping',
+            'if' => 'mapToContact',
+            'dataLabel' => 'Contact',
+            'dataKey' => 'contact',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToTicket',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Ticket']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Tickets']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'ticketFieldMapping',
+            'if' => 'mapToTicket',
+            'dataLabel' => 'Ticket',
+            'dataKey' => 'ticket',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getDuplicateContactId(RequestException $exception): ?string
+    {
+        $response = $exception->getResponse();
+
+        if (!$response || !in_array($response->getStatusCode(), [400, 409], true)) {
+            return null;
+        }
+
+        $body = json_decode((string)$response->getBody(), true);
+        $errors = is_array($body) ? ($body['errors'] ?? null) : null;
+
+        if (!is_array($errors) || count($errors) !== 1 || !is_array($errors[0] ?? null)) {
+            return null;
+        }
+
+        $error = $errors[0];
+        $id = $error['additional_info']['user_id'] ?? null;
+
+        if (($error['field'] ?? null) !== 'email' || ($error['code'] ?? null) !== 'duplicate_value' || (!is_int($id) && !is_string($id)) || !preg_match('/^[1-9][0-9]*$/D', (string)$id)) {
+            return null;
+        }
+
+        return (string)$id;
+    }
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'custom_date' => IntegrationField::TYPE_DATETIME,
+            'custom_checkbox' => IntegrationField::TYPE_BOOLEAN,
+            'custom_decimal' => IntegrationField::TYPE_FLOAT,
+            'custom_number' => IntegrationField::TYPE_NUMBER,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields, array $excludeNames = []): array
+    {
+        $customFields = [];
+
+        $supportedFields = [
+            'custom_text',
+            'custom_dropdown',
+            'custom_paragraph',
+            'custom_date',
+            'custom_checkbox',
+            'custom_decimal',
+            'custom_number',
+        ];
+
+        foreach ($fields as $key => $field) {
+            if ($field['default']) {
+                continue;
+            }
+
+            // Only allow supported types
+            if (!in_array($field['type'], $supportedFields)) {
+                continue;
+            }
+
+            // Exclude any names
+            if (in_array($field['name'], $excludeNames)) {
+                continue;
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => 'custom:' . $field['name'],
+                'name' => $field['label'],
+                'type' => $this->_convertFieldType($field['type']),
+                'sourceType' => $field['type'],
+                'required' => $field['required_for_customers'],
+            ]);
+        }
+
+        return $customFields;
+    }
+
+    private function _prepCustomFields(&$fields): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $value) {
+            if (str_starts_with($key, 'custom:')) {
+                $field = ArrayHelper::remove($fields, $key);
+
+                $customFields[str_replace('custom:', '', $key)] = $value;
+            }
+        }
+
+        return $customFields;
+    }
+
+    private function _requiresMultipart(?array $mapping, Submission $submission): bool
+    {
+        // Never retain attachments when the provider is reused for another submission.
+        $this->_attachments = [];
+        $slot = ReferenceSlot::fromStored($mapping['attachments'] ?? '');
+
+        if ($slot->kind !== ReferenceSlotKind::Exact) {
+            return false;
+        }
+
+        $value = $slot->resolve(ReferenceContext::forSubmission($submission, usage: ReferenceUsage::Integration));
+
+        if ($value instanceof AssetQuery || $value instanceof ElementCollection) {
+            $this->_attachments = array_values(array_filter($value->all(), static fn($asset) => $asset instanceof Asset));
+        }
+
+        return $this->_attachments !== [];
+    }
+}

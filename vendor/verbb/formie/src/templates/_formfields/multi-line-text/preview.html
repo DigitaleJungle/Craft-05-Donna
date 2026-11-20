@@ -1,0 +1,9 @@
+<div className="formie-field-preview-control formie-field-preview-control--multiline">
+    <textarea
+        className="formie-field-preview-input formie-field-preview-textarea"
+        placeholder={field.placeholder}
+        value={field.defaultValue || ''}
+        readOnly
+    />
+    <span className="formie-field-preview-icon" dangerouslySetInnerHTML={{ __html: fieldType.icon || '' }} />
+</div>

@@ -1,0 +1,32 @@
+{% extends 'verbb-base/_layouts/settings' %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% do view.registerAssetBundle('craft\\web\\assets\\admintable\\AdminTableAsset') -%}
+{% do craft.formie.getPlugin().registerCpPluginSettingsAssets() -%}
+
+{% set crumbs = [
+    { label: 'Settings' | t('app'), url: url('settings') },
+    { label: 'Plugins' | t('app'), url: url('settings/plugins') },
+    { label: craft.formie.getPluginName() | t('formie'), url: url('formie/settings') },
+] | merge(crumbs ?? []) %}
+
+{% set selectedSubnavItem = 'settings' %}
+
+{# Build pageTabs with URLs; getSettingsNavItems() only provides title/heading. #}
+{% set pageTabs = {} %}
+{% for handle, item in craft.formie.getSettingsNavItems() %}
+    {% if item.heading is defined %}
+        {% set pageTabs = pageTabs | merge({ (handle): item }) %}
+    {% else %}
+        {% set pageTabs = pageTabs | merge({ (handle): item | merge({
+            url: url('formie/settings/' ~ handle),
+        }) }) %}
+    {% endif %}
+{% endfor %}
+
+{% set pageTitle = pageTitle ?? false %}
+{% if title is not defined %}
+    {% set title = pageTitle ?: (craft.formie.getPluginName() | t('formie')) %}
+{% endif %}

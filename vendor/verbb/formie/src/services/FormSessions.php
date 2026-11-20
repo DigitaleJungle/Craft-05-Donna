@@ -1,0 +1,277 @@
+<?php
+namespace verbb\formie\services;
+
+use verbb\formie\Formie;
+use verbb\formie\elements\Form;
+use verbb\formie\elements\Submission;
+use verbb\formie\enums\SubmissionAuthorityType;
+use verbb\formie\helpers\UploadAccess;
+use verbb\formie\models\FormSession;
+use verbb\formie\models\FormSubmitRequest;
+use verbb\formie\models\FormSubmitResult;
+use verbb\formie\models\PageTransitionRequest;
+use verbb\formie\models\SessionRefreshRequest;
+
+use Craft;
+
+use yii\base\Component;
+use yii\web\ForbiddenHttpException;
+use yii\web\TooManyRequestsHttpException;
+
+class FormSessions extends Component
+{
+    // Constants
+    // =========================================================================
+
+    private const RATE_SCOPE_BOOTSTRAP = 'bootstrap';
+    private const RATE_SCOPE_REFRESH = 'refresh';
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function issueInitialSession(Form $form, ?string $currentPageId = null, bool $enforceAbuseLimit = false, ?bool $includeProgressContinuation = null, ?string $continuationGrantToken = null): FormSession
+    {
+        if ($enforceAbuseLimit) {
+            $this->_enforceAnonymousFormRateLimit($form, self::RATE_SCOPE_BOOTSTRAP);
+        }
+
+        return $this->_buildSession($form, $currentPageId, $includeProgressContinuation, $continuationGrantToken);
+    }
+
+    public function refreshSession(SessionRefreshRequest $request, bool $enforceAbuseLimit = false): FormSession
+    {
+        $form = Formie::$plugin->getSubmissionRequests()->requireFormByHandle($request->handle, $request->siteId);
+        $requests = Formie::$plugin->getSubmissionRequests();
+        $session = $request->session;
+
+        // Refresh must not restore render identity from caller-supplied token values.
+        if (is_array($session['tokens'] ?? null)) {
+            unset($session['tokens']['render']);
+        }
+
+        $requests->applySessionRequestContext($form, $session);
+
+        if ($authorizeScope = $request->getScopeAuthorizer()) {
+            if (!$authorizeScope($form, $requests->getRequiredSessionMutationScope($form, $session))) {
+                throw new ForbiddenHttpException('Submission is unavailable.');
+            }
+        }
+
+        $form->resetRequestToken();
+
+        if (($request->session['continuation']['purpose'] ?? null) === SubmissionGrants::REVISE) {
+            $grant = Formie::$plugin->getSubmissionGrants()->bound($form, SubmissionGrants::REVISE, (int)($request->session['continuation']['submissionId'] ?? 0));
+
+            if (!$grant) {
+                throw new ForbiddenHttpException('Submission is unavailable.');
+            }
+            $form->setSubmission(Submission::find()->id($grant->submissionId)->isIncomplete(false)->status(null)->one());
+        }
+        $currentPageId = (string)($request->session['currentPageId'] ?? ($form->getCurrentPage()?->id ?? ''));
+
+        if ($enforceAbuseLimit) {
+            $this->_enforceAnonymousFormRateLimit($form, self::RATE_SCOPE_REFRESH);
+        }
+
+        $continuation = (array)($request->session['continuation'] ?? []);
+        $purpose = ($continuation['purpose'] ?? null) === SubmissionGrants::REVISE
+            ? SubmissionGrants::REVISE
+            : SubmissionGrants::CONTINUE;
+        $grantToken = $continuation['grantToken'] ?? null;
+
+        if (!is_string($grantToken) || !Formie::$plugin->getSubmissionGrants()->verify($grantToken, $purpose, $form)) {
+            $grantToken = null;
+        }
+
+        return $this->_buildSession($form, $currentPageId, null, $grantToken);
+    }
+
+    public function persistPageState(PageTransitionRequest $request): FormSubmitResult
+    {
+        return Formie::$plugin->getSubmissionRequests()->execute(new FormSubmitRequest([
+            'handle' => $request->handle,
+            'siteId' => $request->siteId,
+            'action' => 'back',
+            'targetPageId' => $request->targetPageId ? (int)$request->targetPageId : null,
+            'session' => $request->session,
+            'values' => $request->values,
+            'operationId' => $request->operationId,
+            'scopeAuthorizer' => $request->getScopeAuthorizer(),
+        ]), SubmissionAuthorityType::VISITOR);
+    }
+
+    public function enforceAnonymousRateLimit(Form $form, string $scope = self::RATE_SCOPE_REFRESH): void
+    {
+        $this->_enforceAnonymousFormRateLimit($form, $scope);
+    }
+
+    public function buildTokenPayload(Form $form, bool $enforceAbuseLimit = false): array
+    {
+        if ($enforceAbuseLimit) {
+            $this->_enforceAnonymousFormRateLimit($form, self::RATE_SCOPE_REFRESH);
+        }
+
+        Craft::$app->getSession()->open();
+
+        $request = Craft::$app->getRequest();
+        $csrfToken = null;
+        $csrfName = null;
+
+        if (method_exists($request, 'getCsrfToken')) {
+            $csrfToken = $request->getCsrfToken();
+            $csrfName = $request->csrfParam ?? null;
+        }
+
+        $payload = array_filter([
+            'csrf' => ($csrfToken && $csrfName) ? [
+                'param' => $csrfName,
+                'token' => $csrfToken,
+            ] : null,
+            'requestToken' => $form->getRequestToken(),
+            'renderId' => $form->getRenderId(),
+            'uploadCreateToken' => UploadAccess::issueCreateToken($form),
+        ], static function($value) {
+            return $value !== null && $value !== '';
+        });
+        $captchas = [];
+
+        foreach (Formie::$plugin->getIntegrations()->getAllEnabledCaptchasForForm($form, null, true) as $captcha) {
+            if ($jsVariables = $captcha->getRefreshData($form)) {
+                $captchas[$captcha->handle] = $jsVariables;
+            }
+        }
+
+        if ($captchas) {
+            $payload['captchas'] = $captchas;
+        }
+
+        return $payload;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _buildSession(Form $form, ?string $currentPageId, ?bool $includeProgressContinuation = null, ?string $continuationGrantToken = null): FormSession
+    {
+        $tokens = $this->buildTokenPayload($form);
+
+        return new FormSession([
+            'id' => (string)$form->getRenderId(),
+            'version' => $form->getCurrentSubmission()?->stateVersion ?? 0,
+            'currentPageId' => $currentPageId ?: (string)($form->getCurrentPage()?->id ?? ''),
+            'tokens' => [
+                'csrf' => isset($tokens['csrf']) ? [
+                    'name' => $tokens['csrf']['param'],
+                    'value' => $tokens['csrf']['token'],
+                ] : null,
+                'request' => $tokens['requestToken'] ?? null,
+                'render' => $tokens['renderId'] ?? null,
+                'uploadCreate' => $tokens['uploadCreateToken'],
+                'captchas' => $tokens['captchas'] ?? [],
+            ],
+            'continuation' => $this->_buildContinuation($form, $includeProgressContinuation, $continuationGrantToken),
+        ]);
+    }
+
+    private function _buildContinuation(Form $form, ?bool $includeProgressContinuation = null, ?string $continuationGrantToken = null): ?array
+    {
+        if ($form->isEditingSubmission() && ($submission = $form->getCurrentSubmission()) && !$submission->isIncomplete) {
+            return [
+                'purpose' => SubmissionGrants::REVISE,
+                'submissionId' => (int)$submission->id,
+                'draftContext' => $form->getDraftContext(),
+                'draftContextToken' => $form->getDraftContextToken(),
+                'grantToken' => $continuationGrantToken,
+            ];
+        }
+        $progressState = Formie::$plugin->getSubmissionProgress()->getProgressState($form);
+        // Default follows the form setting: automatic restore advertises leftover
+        // progress on bootstrap; disabled forms only get a progress reference when a caller
+        // forces include (e.g. post-submit session rebuild for the next page).
+        $includeProgressContinuation ??= $form->settings->automaticSubmissionState;
+        $progressId = $includeProgressContinuation
+            ? ($progressState?->id ? (string)$progressState->id : null)
+            : null;
+        $continuation = array_filter([
+            'draftContext' => $form->getDraftContext(),
+            'draftContextToken' => $form->getDraftContextToken(),
+            'progressId' => $progressId,
+            'grantToken' => $continuationGrantToken,
+        ], static function($value) {
+            return $value !== null && $value !== '';
+        });
+
+        return $continuation ?: null;
+    }
+
+    private function _enforceAnonymousFormRateLimit(Form $form, string $scope): void
+    {
+        $settings = Formie::$plugin->getSettings();
+        $limit = match ($scope) {
+            self::RATE_SCOPE_BOOTSTRAP => (int)$settings->anonymousFormBootstrapRateLimit,
+            self::RATE_SCOPE_REFRESH => (int)$settings->anonymousFormRefreshRateLimit,
+            default => 0,
+        };
+
+        if ($limit < 1) {
+            return;
+        }
+
+        $window = max(1, (int)$settings->anonymousFormRateWindowSeconds);
+        $fingerprint = $this->_resolveFormRateLimitFingerprint($form, $scope);
+        $cacheKey = 'formie.form-rate-limit.' . md5($fingerprint);
+        $mutexKey = 'formie.form-rate-limit-lock.' . md5($fingerprint);
+        $cache = Craft::$app->getCache();
+        $mutex = Craft::$app->getMutex();
+        $now = time();
+
+        $lockAcquired = $mutex?->acquire($mutexKey, 3) ?? false;
+
+        if (!$lockAcquired) {
+            throw new TooManyRequestsHttpException('Please retry shortly.');
+        }
+
+        try {
+            $entry = $cache->get($cacheKey);
+
+            if (!is_array($entry) || !isset($entry['count'], $entry['resetAt']) || (int)$entry['resetAt'] <= $now) {
+                $entry = [
+                    'count' => 0,
+                    'resetAt' => $now + $window,
+                ];
+            }
+
+            $count = (int)$entry['count'];
+            $resetAt = max($now + 1, (int)$entry['resetAt']);
+
+            if ($count >= $limit) {
+                $retryAfter = max(1, $resetAt - $now);
+                Craft::$app->getResponse()->getHeaders()->set('Retry-After', (string)$retryAfter);
+
+                throw new TooManyRequestsHttpException('Too many requests. Please try again shortly.');
+            }
+
+            $entry['count'] = $count + 1;
+            $cache->set($cacheKey, $entry, max(1, $resetAt - $now));
+        } finally {
+            if ($lockAcquired) {
+                $mutex?->release($mutexKey);
+            }
+        }
+    }
+
+    private function _resolveFormRateLimitFingerprint(Form $form, string $scope): string
+    {
+        $request = Craft::$app->getRequest();
+        $ip = trim((string)($request->getUserIP() ?? 'unknown'));
+
+        // The shared address budget must survive client/session header changes.
+        return implode('|', [
+            $scope,
+            (string)$form->uid,
+            $ip !== '' ? $ip : 'unknown',
+        ]);
+    }
+}

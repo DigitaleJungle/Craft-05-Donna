@@ -1,0 +1,41 @@
+{% apply spaceless %}
+    {% set showForm = form.isAvailable() %}
+    {% set currentPage = form.getCurrentPage() %}
+    {% set errors = submission.submissionErrors.forValuePath('form') ?? null %}
+
+    {% set submitted = craft.formie.plugin.service.getFlash(form.getFlashNamespace(), 'submitted') %}
+    {% set flashNotice = craft.formie.plugin.service.getFlash(form.getFlashNamespace(), 'notice') %}
+    {% set flashError = craft.formie.plugin.service.getFlash(form.getFlashNamespace(), 'error') %}
+    {% set savedProgress = craft.formie.plugin.service.getFlash(form.getFlashNamespace(), 'savedProgress') %}
+
+    {# A saved draft needs a portable link even when completion notices or the form are hidden. #}
+    {% if savedProgress %}
+        {{ formieInclude('form/message-saved') }}
+        {% set flashNotice = null %}
+    {% endif %}
+
+    {{ formieInclude('form/message-unavailable') }}
+
+    {% if submitted and form.settings.completionBehavior == 'message' and form.settings.hideFormAfterSubmit %}
+        {% set showForm = false %}
+    {% endif %}
+
+    {% if showForm %}
+        {% formtag 'form' %}
+            {{ formieInclude('form/hidden-inputs') }}
+            {{ formieInclude('form/honeypot') }}
+
+            {{ formieInclude('form/header') }}
+            {{ formieInclude('form/messages-top') }}
+            {{ formieInclude('form/navigation') }}
+            {{ formieInclude('form/body') }}
+            {{ formieInclude('form/footer') }}
+            {{ formieInclude('form/messages-bottom') }}
+        {% endformtag %}
+    {% endif %}
+
+    {# A hidden form still displays its completion notice at either supported position. #}
+    {% if submitted and not showForm and flashNotice and form.settings.successMessagePosition in ['top-form', 'bottom-form'] %}
+        {{ formieInclude('form/message-success') }}
+    {% endif %}
+{% endapply %}

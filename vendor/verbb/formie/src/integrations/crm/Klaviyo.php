@@ -1,0 +1,227 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\ArrayHelper;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Klaviyo extends Crm
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Klaviyo';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $publicApiKey = null;
+
+    #[Sensitive]
+    public ?string $privateApiKey = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToProfile = false;
+
+    #[FormIntegrationSetting]
+    public ?array $profileFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToProfile && $this->settingsContext->dataKey === 'profile') {
+                $settings['profile'] = [
+                    new IntegrationField([
+                        'handle' => 'first_name',
+                        'name' => Craft::t('formie', 'First Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'last_name',
+                        'name' => Craft::t('formie', 'Last Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone_number',
+                        'name' => Craft::t('formie', 'Phone Number'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'address1',
+                        'name' => Craft::t('formie', 'Address 1'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'address2',
+                        'name' => Craft::t('formie', 'Address 2'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'city',
+                        'name' => Craft::t('formie', 'City'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'region',
+                        'name' => Craft::t('formie', 'Region'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'country',
+                        'name' => Craft::t('formie', 'Country'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'zip',
+                        'name' => Craft::t('formie', 'ZIP / Postal Code'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'organization',
+                        'name' => Craft::t('formie', 'Organization'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'title',
+                        'name' => Craft::t('formie', 'Title'),
+                    ]),
+                ];
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'lists');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $profileValues = $this->getFieldMappingValues($submission, $this->profileFieldMapping, 'profile');
+
+            // Location values should be separate
+            $location = array_filter([
+                'address1' => ArrayHelper::remove($profileValues, 'address1'),
+                'address2' => ArrayHelper::remove($profileValues, 'address2'),
+                'city' => ArrayHelper::remove($profileValues, 'city'),
+                'region' => ArrayHelper::remove($profileValues, 'region'),
+                'zip' => ArrayHelper::remove($profileValues, 'zip'),
+                'country' => ArrayHelper::remove($profileValues, 'country'),
+            ]);
+
+            if ($location) {
+                $profileValues['location'] = $location;
+            }
+
+            $profilePayload = [
+                'data' => [
+                    'type' => 'profile',
+                    'attributes' => $profileValues,
+                ],
+            ];
+
+            $response = $this->deliverPayload($submission, 'profile-import', $profilePayload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['publicApiKey', 'privateApiKey'], 'required'];
+
+        $profile = $this->getConfigValue('profile');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['profileFieldMapping'], 'validateFieldMapping', 'params' => $profile, 'when' => function($model) {
+                return $model->enabled && $model->mapToProfile;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        return Craft::createGuzzleClient([
+            'base_uri' => 'https://a.klaviyo.com/api/',
+            'headers' => [
+                'Authorization' => 'Klaviyo-API-Key ' . App::parseEnv($this->privateApiKey),
+                'revision' => '2024-05-15',
+            ],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToProfile',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Profile']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Profiles']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'profileFieldMapping',
+            'if' => 'mapToProfile',
+            'dataLabel' => 'Profile',
+            'dataKey' => 'profile',
+        ]);
+
+        return $schema;
+    }
+}

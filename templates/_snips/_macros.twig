@@ -1,0 +1,67 @@
+{#} Translation Module {#}
+
+{#}
+in head op page/block
+{% from "_partials/snips/_macros.twig" import translate %}
+
+{{ translate("word") }}
+or
+{{ translate("word", entry.translations ) }}
+{#}
+
+{% macro translate(string, TranslationsRepo = null) %}
+    {% set string = '#' ~ string ~ '#' %}
+    {% set TranslationsRepo = TranslationsRepo ?? translations.translations %}
+
+    {% set TranslationsArray = [] %}
+    {% for row in TranslationsRepo %}
+        {% set TranslationsArray = TranslationsArray|merge({("#" ~ row.key|lower ~ "#"): row.trans}) %}
+    {% endfor %}
+
+    {{ TranslationsArray[string|lower] ?? string }}
+{% endmacro %}
+
+
+{% macro addressList(addresses) %}
+    <ul>
+    {% for address in addresses %}
+        <li>
+            {% if address.title %}
+                <strong>{{ address.title }}</strong>
+            {% endif %}
+            {% if address.addressLine1 %}
+                <br>{{ address.addressLine1 }}
+            {% endif %}
+            {% if address.addressLine2 %}
+                <br>{{ address.addressLine2 }}
+            {% endif %}
+            {% if address.addressLine3 %}
+                <br>{{ address.addressLine3 }}
+            {% endif %}
+            {% if address.postalCode or address.locality %}
+                <br>{{ address.postalCode }} {{ address.locality }}
+            {% endif %}
+            {% if address.country %}
+                <br>{{ address.country }}
+            {% endif %}
+        </li>
+    {% endfor %}
+    </ul>
+{% endmacro %}
+
+{% macro contactList(contacts) %}
+    <ul>
+    {% for contact in contacts %}
+        <li>
+            <strong>{{ contact.title }}</strong>
+            {% if contact.function %}
+                </br><i>{{contact.function }}</i>
+            {% endif %}
+            {% if contact.showPhone %}
+                <br><a href="{{ contact.telephone.format('rfc3966') }}">{{ contact.telephone.format('international') }}</a>
+            {% endif %}
+            </br><a href="mailto:{{ contact.email }}">{{ contact.email }}</a>
+        </li>
+    {% endfor %}
+    </ul>
+{% endmacro %}

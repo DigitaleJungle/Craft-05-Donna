@@ -1,0 +1,206 @@
+<?php
+namespace verbb\cpnav\nav\sources;
+
+/**
+ * Stable node identity for nav sources + customization merge.
+ */
+final class NodeKey
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function craft(string $relativeUrl): string
+    {
+        return self::NS_CRAFT . ':' . self::_normalizePath($relativeUrl);
+    }
+
+    public static function craftSubnav(string $parentRelativeUrl, string $subHandle): string
+    {
+        $parent = self::_normalizePath($parentRelativeUrl);
+        $childPath = trim($parent . '/' . $subHandle, '/');
+
+        return self::NS_CRAFT . ':' . $childPath;
+    }
+
+    public static function plugin(string $pluginHandle, ?string $subHandle = null, ?string $relativeUrl = null): string
+    {
+        // Keep provider routes and literal handles distinct. Query parameters are
+        // request metadata, not the identity of a plugin's root navigation item.
+        $path = self::_normalizePath(explode('?', explode('#', $relativeUrl ?? $pluginHandle, 2)[0], 2)[0]);
+        $key = self::NS_PLUGIN . ':' . str_replace('%2F', '/', rawurlencode($path));
+
+        if ($subHandle !== null && $subHandle !== '') {
+            return $key . ':' . rawurlencode($subHandle);
+        }
+
+        return $key;
+    }
+
+    public static function manual(string $uuid): string
+    {
+        return self::NS_MANUAL . ':' . $uuid;
+    }
+
+    public static function divider(string $uuid): string
+    {
+        return self::NS_DIVIDER . ':' . $uuid;
+    }
+
+    /**
+     * Derive a key from a Craft CP nav item array (post-{@see \craft\web\twig\variables\Cp::nav()}).
+     */
+    public static function fromNavItem(array $item, ?string $parentKey = null, ?string $subHandle = null): string
+    {
+        if ($subHandle !== null && $parentKey) {
+            $parentUrl = self::_parentRelativeUrlFromKey($parentKey);
+
+            if (str_starts_with($parentKey, self::NS_PLUGIN . ':')) {
+                return $parentKey . ':' . rawurlencode($subHandle);
+            }
+
+            return self::craftSubnav($parentUrl, $subHandle);
+        }
+
+        $relativeUrl = (string)($item['relativeUrl'] ?? $item['url'] ?? '');
+
+        // Plugin top-level items typically use their handle as the first URL segment.
+        $pluginHandle = self::_guessPluginHandle($relativeUrl);
+
+        if ($pluginHandle) {
+            return self::plugin($pluginHandle, null, $relativeUrl);
+        }
+
+        return self::craft($relativeUrl);
+    }
+
+    /**
+     * Encode a canonical key as a Craft project-config path segment.
+     *
+     * Uses base64url so `/`, `:`, and `_` in the path cannot collide. Legacy
+     * underscore encoding is still decoded when reading (canonical `key` in the
+     * stored value is authoritative).
+     */
+    public static function encodePathKey(string $key): string
+    {
+        [$namespace, $path] = self::split($key);
+        $encodedPath = rtrim(strtr(base64_encode($path), '+/', '-_'), '=');
+
+        return $namespace . '__b64_' . $encodedPath;
+    }
+
+    /** Pre-v6.0.0-beta.3 path encoding — kept for cleanup of orphan PC segments. */
+    public static function encodePathKeyLegacy(string $key): string
+    {
+        [$namespace, $path] = self::split($key);
+
+        return $namespace . '__' . str_replace(['/', ':'], '_', $path);
+    }
+
+    public static function decodePathKey(string $encoded, ?string $canonicalKey = null): string
+    {
+        if ($canonicalKey) {
+            return $canonicalKey;
+        }
+
+        if (preg_match('/^([a-z]+)__b64_(.+)$/i', $encoded, $matches)) {
+            $padded = strtr($matches[2], '-_', '+/');
+            $padLen = (4 - strlen($padded) % 4) % 4;
+            $path = base64_decode($padded . str_repeat('=', $padLen), true);
+
+            if ($path !== false) {
+                return $matches[1] . ':' . $path;
+            }
+        }
+
+        if (!str_contains($encoded, '__')) {
+            return $encoded;
+        }
+
+        [$namespace, $path] = explode('__', $encoded, 2);
+
+        // Strip optional b64_ prefix if regex above missed.
+        if (str_starts_with($path, 'b64_')) {
+            $path = substr($path, 4);
+        }
+
+        return $namespace . ':' . str_replace('_', '/', $path);
+    }
+
+    public static function split(string $key): array
+    {
+        $pos = strpos($key, ':');
+
+        if ($pos === false) {
+            return ['', $key];
+        }
+
+        return [substr($key, 0, $pos), substr($key, $pos + 1)];
+    }
+
+    public static function isCustomizationOnly(string $key): bool
+    {
+        return str_starts_with($key, self::NS_MANUAL . ':') || str_starts_with($key, self::NS_DIVIDER . ':');
+    }
+
+    public static function isDivider(string $key): bool
+    {
+        return str_starts_with($key, self::NS_DIVIDER . ':');
+    }
+
+    /** UUID segment of a `divider:{uuid}` key, or null. */
+    public static function dividerUuid(string $key): ?string
+    {
+        if (!self::isDivider($key)) {
+            return null;
+        }
+
+        [, $uuid] = self::split($key);
+
+        return $uuid !== '' ? $uuid : null;
+    }
+
+    public static function isManual(string $key): bool
+    {
+        return str_starts_with($key, self::NS_MANUAL . ':');
+    }
+
+
+    private static function _normalizePath(string $path): string
+    {
+        $path = trim($path);
+        $path = trim($path, '/');
+
+        return $path === '' ? 'dashboard' : $path;
+    }
+
+    private static function _parentRelativeUrlFromKey(string $parentKey): string
+    {
+        [, $path] = self::split($parentKey);
+
+        return $path;
+    }
+
+    private static function _guessPluginHandle(string $relativeUrl): ?string
+    {
+        $relativeUrl = self::_normalizePath($relativeUrl);
+        $segment = preg_split('/[\/?#]/', $relativeUrl)[0] ?? null;
+
+        if (!$segment) {
+            return null;
+        }
+
+        $plugin = \Craft::$app->getPlugins()->getPlugin($segment);
+
+        return $plugin?->handle;
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const NS_CRAFT = 'craft';
+    public const NS_PLUGIN = 'plugin';
+    public const NS_EVENT = 'event';
+    public const NS_MANUAL = 'manual';
+    public const NS_DIVIDER = 'divider';
+}

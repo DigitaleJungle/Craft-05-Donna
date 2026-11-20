@@ -1,0 +1,58 @@
+<?php
+namespace verbb\formie\jobs;
+
+use verbb\formie\Formie;
+use verbb\formie\compatibility\delivery\LegacyDeliveryJobTrait;
+
+use Craft;
+use craft\queue\BaseJob;
+
+use yii\queue\RetryableJobInterface;
+
+use RuntimeException;
+
+class TriggerIntegration extends BaseJob implements DeliveryJobInterface, RetryableJobInterface
+{
+    // Traits
+    // =========================================================================
+
+    use DebuggableJobTrait;
+    use LegacyDeliveryJobTrait;
+    use RetryInterruptedJobTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    public string $deliveryAttemptUid;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDeliveryAttemptUid(): string
+    {
+        return $this->resolveDeliveryAttemptUid();
+    }
+
+    public function execute($queue): void
+    {
+        $uid = $this->getDeliveryAttemptUid();
+        $result = Formie::$plugin->getIntegrationRunner()->runQueuedAttempt($uid);
+
+        if ($result->shouldFailQueue()) {
+            throw new RuntimeException('Integration delivery ' . $result->status->value . '. Open the Diagnostics panel for more information.');
+        }
+
+        $this->setProgress($queue, 1);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defaultDescription(): string
+    {
+        return Craft::t('formie', 'Delivering form integrations.');
+    }
+}

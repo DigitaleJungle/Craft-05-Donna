@@ -1,0 +1,306 @@
+<?php
+namespace verbb\formie\integrations\miscellaneous;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Miscellaneous;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\IntegrationSecrets;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+
+use Throwable;
+
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\models\Token;
+use verbb\auth\providers\Google as GoogleProvider;
+
+class GoogleSheets extends Miscellaneous implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return GoogleProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'Google Sheets';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $proxyRedirect = null;
+    public ?string $spreadsheetId = null;
+
+    #[FormIntegrationSetting]
+    public ?string $sheetId = null;
+
+    #[FormIntegrationSetting]
+    public ?array $fieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getProxyRedirect(): ?bool
+    {
+        return App::parseBooleanEnv($this->proxyRedirect);
+    }
+
+    public function getSpreadsheetId(): ?string
+    {
+        return App::parseEnv($this->spreadsheetId);
+    }
+
+    public function getSheetId(): ?string
+    {
+        return $this->sheetId === null ? null : IntegrationSecrets::resolveFormValue($this->sheetId);
+    }
+
+    public function getBaseApiUrl(?Token $token): ?string
+    {
+        $spreadsheetId = $this->getSpreadsheetId();
+
+        return "https://sheets.googleapis.com/v4/spreadsheets/{$spreadsheetId}/";
+    }
+
+    public function getOAuthProviderConfig(): array
+    {
+        $config = parent::getOAuthProviderConfig();
+        $config['baseApiUrl'] = fn(?Token $token) => $this->getBaseApiUrl($token);
+
+        return $config;
+    }
+
+    public function getAuthorizationUrlOptions(): array
+    {
+        $options = parent::getAuthorizationUrlOptions();
+        $options['access_type'] = 'offline';
+        $options['prompt'] = 'consent';
+
+        $options['scope'] = [
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/spreadsheets',
+        ];
+
+        return $options;
+    }
+
+    public function getRedirectUri(): string
+    {
+        $uri = parent::getRedirectUri();
+
+        // Allow a proxy to our server to forward on the request - just for local dev ease
+        if ($this->getProxyRedirect()) {
+            return "https://proxy.verbb.io?return=$uri";
+        }
+
+        return $uri;
+    }
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to Google Sheets.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            $formId = Craft::$app->getRequest()->getParam('formId');
+            $form = Formie::$plugin->getForms()->getFormById($formId);
+
+            $spreadsheetId = $this->getSpreadSheetId();
+
+            $spreadsheet = $this->request('GET', $spreadsheetId);
+            $allSheets = $spreadsheet['sheets'] ?? [];
+            $sheets = [];
+            $savedColumns = [];
+
+            foreach ($allSheets as $sheet) {
+                $response = $this->request('GET', "values/'{$sheet['properties']['title']}'!A1:ZZZ1", [
+                    'query' => ['majorDimension' => 'ROWS'],
+                ]);
+
+                $allColumns = $response['values'][0] ?? [];
+
+                // Save this for later, we need to when sending
+                $savedColumns[$sheet['properties']['title']] = $allColumns;
+
+                // But we want to only show columns with a header to map
+                $allColumns = array_filter($allColumns);
+
+                $columns = [];
+
+                foreach ($allColumns as $column) {
+                    $columns[] = new IntegrationField([
+                        'handle' => $column,
+                        'name' => $column,
+                    ]);
+                }
+
+                $sheets[] = [
+                    'id' => $sheet['properties']['title'],
+                    'name' => $sheet['properties']['title'],
+                    'fields' => $columns,
+                ];
+            }
+
+            $settings = [
+                'sheets' => $sheets,
+                'columns' => $savedColumns,
+            ];
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $fieldValues = $this->getFieldMappingValues($submission, $this->fieldMapping);
+
+            $spreadsheetId = $this->getSpreadsheetId();
+            $sheetId = $this->getSheetId();
+
+            // Fetch the columns from our private stash
+            $columns = $this->getConfig()->get('columns')[$sheetId] ?? [];
+            $rowValues = [];
+
+            // Just in case...
+            $columns = array_values(array_filter($columns));
+
+            foreach ($columns as $key => $column) {
+                $rowValues[$key] = $fieldValues[$column] ?? '';
+            }
+
+            $payload = [
+                'values' => [$rowValues],
+            ];
+
+            // Statically set the first column to determine where to start our range. Google will sometimes set the
+            // 'table' of content to be incorrect, if there are gaps in columns. Here, we account for that.
+            //
+            // This does require column `A` to not be hidden, otherwise it won't append values.
+            $range = "'{$sheetId}'!A1";
+
+            $response = $this->deliverPayload($submission, "{$spreadsheetId}/values/{$range}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS", $payload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['clientId', 'clientSecret', 'spreadsheetId'], 'required'];
+
+        // Validate the following when saving form settings
+        $rules[] = [['spreadsheetId'], 'safe', 'on' => [Integration::SCENARIO_FORM]];
+        $rules[] = [['sheetId'], 'required', 'on' => [Integration::SCENARIO_FORM]];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+
+        $selectedSheetId = (string)($this->getSheetId() ?? '');
+
+        if ($selectedSheetId === '') {
+            $selectedSheetId = $this->_getFirstSheetId();
+        }
+
+        $schema[] = SchemaHelper::comboboxField([
+            'name' => 'sheetId',
+            'label' => Craft::t('formie', 'Sheet'),
+            'instructions' => Craft::t('formie', 'Select which {name} sheet to add rows to.', ['name' => $this->displayName()]),
+            'required' => true,
+            'placeholder' => Craft::t('formie', 'Select an option'),
+            'options' => $this->_getSheetOptions(),
+        ]);
+
+        $schemaFields = $this->convertIntegrationFieldsToSchema($this->_getSheetFields($selectedSheetId));
+        $fieldMappingSchema = array_map(fn(array $f) => SchemaHelper::fieldSelectField([
+            'name' => $f['handle'],
+            'label' => $f['name'],
+            'required' => $f['required'],
+            'options' => $f['options'] ?? [],
+        ]), $schemaFields);
+
+        if ($fieldMappingSchema) {
+            $schema[] = SchemaHelper::groupField([
+                'name' => 'fieldMapping',
+                'label' => Craft::t('formie', 'Field Mapping'),
+                'instructions' => Craft::t('formie', 'Choose how your form fields should map to your {name} columns.', ['name' => $this->displayName()]),
+                'children' => $fieldMappingSchema,
+            ]);
+        }
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getSheetOptions(): array
+    {
+        $options = [];
+
+        foreach ($this->getConfigValue('sheets') as $sheet) {
+            $options[] = ['label' => $sheet['name'], 'value' => $sheet['id']];
+        }
+
+        return $options;
+    }
+
+    private function _getFirstSheetId(): string
+    {
+        return $this->_getSheetOptions()[0]['value'] ?? '';
+    }
+
+    private function _getSheetFields(string $sheetId): array
+    {
+        $sheet = ArrayHelper::firstWhere($this->getConfigValue('sheets'), 'id', $sheetId);
+
+        return $sheet['fields'] ?? [];
+    }
+}

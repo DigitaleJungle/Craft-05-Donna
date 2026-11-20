@@ -1,0 +1,238 @@
+{% import '_includes/forms' as forms %}
+{% extends 'formie/_layouts' %}
+
+{% set canEdit = isNewIntegration or integration.canEdit() %}
+
+{% set crumbs = [
+    { label: craft.formie.getPluginName() | t('formie'), url: url('formie') },
+    { label: 'Integrations' | t('formie'), url: url('formie/integrations/email-marketing') },
+    { label: typeName | t('formie'), url: url(baseUrl) },
+] %}
+
+{% set bodyClass = 'fui-integrations-settings' %}
+{% set selectedSubnavItem = 'integrations' %}
+
+{% if canEdit %}
+    {% set fullPageForm = true %}
+    {% set saveShortcutRedirect = continueEditingUrl %}
+
+    {% set formActions = [
+        {
+            label: 'Save and continue editing' | t('app'),
+            redirect: continueEditingUrl | hash,
+            shortcut: true,
+            retainScroll: true,
+        },
+        not isNewIntegration ? {
+            destructive: true,
+            label: 'Delete integration' | t('formie'),
+            action: 'formie/integrations/delete-integration',
+            redirect: baseUrl | hash,
+            confirm: 'Are you sure you want to delete this integration?' | t('formie'),
+        }
+    ] | filter %}
+{% endif %}
+
+{% set tabs = {
+    integration: { label: 'Integration' | t('formie'), url: '#integration' },
+    provider: { label: 'Provider' | t('formie'), url: '#provider' },
+} %}
+
+{% block content %}
+
+<input type="hidden" name="action" value="formie/integrations/save-integration">
+{{ redirectInput(baseUrl) }}
+
+{% if isNewIntegration %}
+    <input type="hidden" name="scope" value="{{ integration.scope }}">
+{% else %}
+    <input type="hidden" name="sortOrder" value="{{ integration.sortOrder }}">
+    <input type="hidden" name="id" value="{{ integration.id }}">
+{% endif %}
+
+{% if not canEdit %}
+    <p class="warning with-icon">
+        {{ 'This project integration is read-only in the current environment.' | t('formie') | md(inlineOnly=true) }}
+    </p>
+{% endif %}
+
+{# Show an error when connecting to OAuth, instead of just in logs #}
+{% set message = craft.app.session.getFlash('formie-error') %}
+
+{% if message %}
+    <pk-alert
+        variant="error"
+        size="lg"
+        heading="{{ 'Connection error' | t('formie') }}"
+        announce="assertive"
+        style="margin-bottom: 24px;"
+    >
+        <span class="code">{{ message }}</span>
+    </pk-alert>
+{% endif %}
+
+<div id="integration">
+    {{ forms.textField({
+        first: true,
+        label: 'Name' | t('formie'),
+        instructions: 'What this integration will be called in the control panel.' | t('formie'),
+        id: 'name',
+        name: 'name',
+        value: (integration is defined ? integration.getName() : null),
+        errors: (integration is defined ? integration.getErrors('name') : null),
+        autofocus: true,
+        required: true,
+        disabled: not canEdit,
+    }) }}
+
+    {{ forms.textField({
+        label: 'Handle' | t('formie'),
+        instructions: 'How you’ll refer to this integration in the templates.' | t('formie'),
+        id: 'handle',
+        name: 'handle',
+        class: 'code',
+        autocorrect: false,
+        autocapitalize: false,
+        value: (integration is defined ? integration.handle : null),
+        errors: (integration is defined ? integration.getErrors('handle') : null),
+        required: true,
+        disabled: not canEdit,
+    }) }}
+</div>
+
+<div id="provider" class="hidden">
+    {{ missingIntegrationPlaceholder | raw }}
+
+    {% for integrationType in integrationTypes %}
+        {% set isCurrent = (integrationType == className(integration)) %}
+
+        <div class="integration-provider-{{ integrationType | id }} {% if not isCurrent %}hidden{% endif %}">
+            {% namespace 'types[' ~ integrationType ~ ']' %}
+                {% if isCurrent %}
+                    {{ integration.getSettingsHtml() | raw }}
+                {% else %}
+                    {{ integrationInstances[integrationType].getSettingsHtml() | raw }}
+                {% endif %}
+            {% endnamespace %}
+        </div>
+    {% endfor %}
+</div>
+
+{% endblock %}
+
+{% block details %}
+
+<div class="meta">
+    {{ forms.selectField({
+        label: 'Provider' | t('formie'),
+        id: 'type',
+        name: 'type',
+        options: integrationTypeOptions,
+        value: className(integration),
+        toggle: true,
+        targetPrefix: '.integration-provider-',
+        required: true,
+        disabled: not canEdit,
+    }) }}
+
+    {{ forms.lightswitchField({
+        label: 'Enabled' | t('formie'),
+        id: 'enabled',
+        name: 'enabled',
+        on: isNewIntegration ? true : integration.getEnabled(),
+        disabled: not canEdit,
+    }) }}
+
+    {% if not isNewIntegration and integration.getScopeLabel() %}
+        {{ forms.textField({
+            label: 'Scope' | t('formie'),
+            id: 'scope',
+            value: integration.getScopeLabel(),
+            readonly: true,
+        }) }}
+    {% endif %}
+
+    {% if not isNewIntegration and integration.supportsConnection() %}
+        {% set connected = integration.getIsConnected() %}
+
+        {% if integration.supportsOAuthConnection() %}
+            {% if not canEdit %}
+                <form id="fui-integration-oauth-form" class="field lightswitch-field pk-connect-field" method="post" accept-charset="UTF-8">
+                    {{ csrfInput() }}
+            {% else %}
+                <div class="field lightswitch-field pk-connect-field">
+            {% endif %}
+                    <pk-connect-oauth
+                        {% if connected %}connected{% endif %}
+                        {% if not canEdit %}skip-dirty-watch{% endif %}
+                        connect-action="formie/integrations/connect"
+                        disconnect-action="formie/integrations/disconnect"
+                        param-name="integration"
+                        param-value="{{ integration.handle }}"
+                        connect-redirect="{{ craft.app.request.url | hash }}"
+                        disconnect-redirect="{{ craft.app.request.url | hash }}"
+                        label-connected="{{ 'Connected' | t('formie') }}"
+                        label-not-connected="{{ 'Not connected' | t('formie') }}"
+                        label-connect="{{ 'Connect' | t('formie') }}"
+                        label-disconnect="{{ 'Disconnect' | t('formie') }}"
+                        label-save-to-connect="{{ 'Save this integration to connect.' | t('formie') }}"
+                    ></pk-connect-oauth>
+            {% if not canEdit %}
+                </form>
+            {% else %}
+                </div>
+            {% endif %}
+        {% elseif integration.supportsConnection() and canEdit %}
+            {% set connectionStatus = integration.getIsConnected() ? 'connected' : 'disconnected' %}
+            <div class="field lightswitch-field pk-connect-field" data-connection-status="{{ connectionStatus }}">
+                <pk-connect
+                    action="formie/integrations/check-connection"
+                    id-param="id"
+                    status="{{ connectionStatus }}"
+                    source-id="{{ integration.id }}"
+                    type="{{ className(integration) }}"
+                    label-connected="{{ 'Connected' | t('formie') }}"
+                    label-not-connected="{{ 'Not connected' | t('formie') }}"
+                    label-connecting="{{ 'Connecting...' | t('formie') }}"
+                    label-error="{{ 'Error' | t('formie') }}"
+                    label-connect="{{ 'Connect' | t('formie') }}"
+                    label-refresh="{{ 'Refresh' | t('formie') }}"
+                    label-save-to-connect="{{ 'Save this integration to connect.' | t('formie') }}"
+                    label-error-heading="{{ 'Connection error' | t('formie') }}"
+                    label-generic-error="{{ 'An error occurred while checking the integration connection.' | t('formie') }}"
+                    label-show-details="{{ 'Show details' | t('formie') }}"
+                    label-hide-details="{{ 'Hide details' | t('formie') }}"
+                    label-close="{{ 'Close' | t('app') }}"
+                ></pk-connect>
+            </div>
+        {% endif %}
+    {% endif %}
+</div>
+
+{% if not isNewIntegration %}
+    {% if canEdit %}
+        <hr>
+    {% endif %}
+
+    <div class="meta read-only">
+        <div class="data">
+            <h5 class="heading">{{ 'Date Created' | t('app') }}</h5>
+            <div class="value">{{ integration.dateCreated | date('short') }} {{ integration.dateCreated | time('short') }}</div>
+        </div>
+
+        <div class="data">
+            <h5 class="heading">{{ 'Date Updated' | t('app') }}</h5>
+            <div class="value">{{ integration.dateUpdated | date('short') }} {{ integration.dateUpdated | time('short') }}</div>
+        </div>
+    </div>
+{% endif %}
+
+{% endblock %}
+
+{% js %}
+
+{% if integration is not defined or not integration.handle %}
+    new Craft.HandleGenerator('#name', '#handle');
+{% endif %}
+
+{% endjs %}

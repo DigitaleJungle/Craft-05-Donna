@@ -1,0 +1,15 @@
+{% fieldtag 'nestedField' %}
+    {% fieldtag 'nestedFieldWrapper' %}
+        {% fieldtag 'nestedFieldRows' %}
+            {% for row in field.getRows(index) %}
+                {% fieldtag 'nestedFieldRow' %}
+                    {% for field in row.getFields() %}
+                        {{ craft.formie.renderField(form, field) }}
+                    {% endfor %}
+                {% endfieldtag %}
+            {% endfor %}
+        {% endfieldtag %}
+
+        {{ fieldtag('fieldRemoveButton') }}
+    {% endfieldtag %}
+{% endfieldtag %}

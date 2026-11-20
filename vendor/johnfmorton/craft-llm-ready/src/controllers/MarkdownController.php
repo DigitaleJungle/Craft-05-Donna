@@ -1,0 +1,243 @@
+<?php
+
+declare(strict_types=1);
+
+namespace johnfmorton\llmready\controllers;
+
+use Craft;
+use craft\elements\Entry;
+use craft\web\Controller;
+use johnfmorton\llmready\helpers\HttpErrors;
+use johnfmorton\llmready\LlmReady;
+use yii\web\Response;
+
+/**
+ * Serves Markdown responses for entries and llms.txt
+ */
+class MarkdownController extends Controller
+{
+    /** @inheritdoc */
+    protected array|bool|int $allowAnonymous = true;
+
+    /**
+     * Serve Markdown for an entry resolved by its URI path
+     */
+    public function actionServe(string $path = ''): Response
+    {
+        $plugin = LlmReady::getInstance();
+        $settings = $plugin->getSettings();
+
+        if (!$settings->enabled) {
+            throw HttpErrors::notFound();
+        }
+
+        $site = Craft::$app->getSites()->getCurrentSite();
+
+        // Try to resolve the path as an entry
+        $element = Craft::$app->getElements()->getElementByUri($path, $site->id);
+
+        if ($element instanceof Entry) {
+            return $this->serveEntry($element, $site);
+        }
+
+        // Try to match a section for listing pages
+        $section = $this->resolveSectionFromPath($path, $site);
+        if ($section !== null) {
+            return $this->serveListingPage($section, $site);
+        }
+
+        throw HttpErrors::notFound();
+    }
+
+    /**
+     * Serve the /llms.txt file
+     */
+    public function actionLlmsTxt(): Response
+    {
+        $plugin = LlmReady::getInstance();
+        $settings = $plugin->getSettings();
+
+        // enableLlmsTxt is enforced here as well as by withholding the URL
+        // rules, so the action stays unreachable via its `actions/…` URL.
+        if (!$settings->enabled || !$settings->enableLlmsTxt) {
+            throw HttpErrors::notFound();
+        }
+
+        $site = Craft::$app->getSites()->getCurrentSite();
+        $content = $plugin->indexCacheService->get($site);
+        if ($content === null) {
+            return $this->buildingResponse();
+        }
+
+        $response = Craft::$app->getResponse();
+        $response->format = Response::FORMAT_RAW;
+        $response->getHeaders()->set('Content-Type', 'text/markdown; charset=utf-8');
+
+        if ($settings->noindexHeader) {
+            $response->getHeaders()->set('X-Robots-Tag', 'noindex');
+        }
+
+        $response->data = $content;
+
+        if ($settings->enableAnalytics) {
+            $plugin->analyticsService->logRequest(
+                $site->id,
+                null,
+                'llmstxt',
+                $plugin->analyticsService->identifyBot(Craft::$app->getRequest()),
+                Craft::$app->getRequest()->getPathInfo(),
+            );
+        }
+
+        return $response;
+    }
+
+    /**
+     * Redirect /.well-known/llms.txt → /llms.txt (RFC 8615)
+     */
+    public function actionWellKnownLlmsTxt(): Response
+    {
+        $settings = LlmReady::getInstance()->getSettings();
+
+        if (!$settings->enabled || !$settings->enableLlmsTxt) {
+            throw HttpErrors::notFound();
+        }
+
+        $site = Craft::$app->getSites()->getCurrentSite();
+
+        return $this->redirect($site->getBaseUrl() . 'llms.txt', 301);
+    }
+
+    /**
+     * Serve Markdown for an entry with permission checks
+     */
+    private function serveEntry(Entry $entry, \craft\models\Site $site): Response
+    {
+        $plugin = LlmReady::getInstance();
+        $settings = $plugin->getSettings();
+        $markdownService = $plugin->markdownService;
+
+        // Check if section is enabled
+        if (!$markdownService->isSectionEnabled($entry->sectionId, $site->id)) {
+            throw HttpErrors::notFound();
+        }
+
+        $isPreview = Craft::$app->getRequest()->getIsPreview();
+
+        // Only serve live entries with URLs (allow drafts during live preview)
+        if (!$isPreview && ($entry->status !== Entry::STATUS_LIVE || !$entry->getUrl())) {
+            throw HttpErrors::notFound();
+        }
+
+        // An SEO plugin marking the entry noindex, or an EVENT_INCLUDE_ENTRY
+        // handler excluding it, means "don't surface this URL" — so the .md
+        // representation 404s too. Previewing is exempt, so authors can still
+        // check their Markdown from the control panel.
+        if (!$isPreview && !$markdownService->isEntryIncluded($entry, $site)) {
+            throw HttpErrors::notFound();
+        }
+
+        $content = $markdownService->renderMarkdown($entry, $site);
+
+        $response = Craft::$app->getResponse();
+        $response->format = Response::FORMAT_RAW;
+        $response->getHeaders()->set('Content-Type', 'text/markdown; charset=utf-8');
+
+        if ($settings->noindexHeader) {
+            $response->getHeaders()->set('X-Robots-Tag', 'noindex');
+        }
+
+        // Add alternate link header pointing to the HTML version
+        $response->getHeaders()->set('Link', "<{$entry->getUrl()}>; rel=\"canonical\"");
+
+        $response->data = $content;
+
+        if ($settings->enableAnalytics) {
+            $plugin->analyticsService->logRequest(
+                $site->id,
+                $entry->getCanonicalId(),
+                'entry',
+                $plugin->analyticsService->identifyBot(Craft::$app->getRequest()),
+                Craft::$app->getRequest()->getPathInfo(),
+            );
+        }
+
+        return $response;
+    }
+
+    /**
+     * Serve a listing page for a section
+     */
+    private function serveListingPage(\craft\models\Section $section, \craft\models\Site $site): Response
+    {
+        $plugin = LlmReady::getInstance();
+        $settings = $plugin->getSettings();
+        $markdownService = $plugin->markdownService;
+
+        if (!$markdownService->isSectionEnabled($section->id, $site->id)) {
+            throw HttpErrors::notFound();
+        }
+
+        $content = $plugin->indexCacheService->get($site, $section);
+        if ($content === null) {
+            return $this->buildingResponse();
+        }
+
+        $response = Craft::$app->getResponse();
+        $response->format = Response::FORMAT_RAW;
+        $response->getHeaders()->set('Content-Type', 'text/markdown; charset=utf-8');
+
+        if ($settings->noindexHeader) {
+            $response->getHeaders()->set('X-Robots-Tag', 'noindex');
+        }
+
+        $response->data = $content;
+
+        if ($settings->enableAnalytics) {
+            $plugin->analyticsService->logRequest(
+                $site->id,
+                null,
+                'listing',
+                $plugin->analyticsService->identifyBot(Craft::$app->getRequest()),
+                Craft::$app->getRequest()->getPathInfo(),
+            );
+        }
+
+        return $response;
+    }
+
+    /**
+     * Try to resolve a URL path to a section (for listing pages)
+     */
+    private function resolveSectionFromPath(string $path, \craft\models\Site $site): ?\craft\models\Section
+    {
+        $sections = Craft::$app->getEntries()->getAllSections();
+
+        foreach ($sections as $section) {
+            $baseUri = LlmReady::getInstance()->markdownService->getListingBaseUri($section, $site);
+
+            if ($baseUri !== null && $baseUri === $path) {
+                return $section;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * An index file (`/llms.txt` or a listing page) that has never been built,
+     * while another request is building it. Ask the client to come back
+     * instead of holding a worker until the gateway gives up (#46).
+     */
+    private function buildingResponse(): Response
+    {
+        $response = Craft::$app->getResponse();
+        $response->format = Response::FORMAT_RAW;
+        $response->setStatusCode(503);
+        $response->getHeaders()->set('Retry-After', '30');
+        $response->getHeaders()->set('Content-Type', 'text/plain; charset=utf-8');
+        $response->data = "This file is being generated. Try again shortly.\n";
+
+        return $response;
+    }
+}

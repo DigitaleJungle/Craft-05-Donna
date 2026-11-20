@@ -1,0 +1,64 @@
+{
+    "name": "craftpulse/craft-colour-swatches",
+    "description": "Let clients choose from a predefined set of colours and utilise associated colour codes and class names in your templates.",
+    "type": "craft-plugin",
+    "version": "5.1.0",
+    "keywords": [
+        "craft",
+        "cms",
+        "craftcms",
+        "craft-plugin",
+        "colour-swatches",
+        "color-swatches",
+        "colors",
+        "colours",
+        "swatches"
+    ],
+    "support": {
+        "email": "support@percipio.london",
+        "docs": "https://github.com/percipioglobal/craft-colour-swatches/blob/v4/README.md",
+        "issues": "https://github.com/percipioglobal/craft-colour-swatches/issues"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Craft Pulse",
+            "homepage": "https://github.com/craftpulse"
+        }
+    ],
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require": {
+        "php": "^8.0.2",
+        "craftcms/cms": "^5.0.0"
+    },
+    "require-dev": {
+        "craftcms/cms": "^5.0.0",
+        "craftcms/phpstan": "dev-main",
+        "craftcms/rector": "dev-main"
+    },
+    "autoload": {
+        "psr-4": {
+            "percipiolondon\\colourswatches\\": "src/"
+        }
+    },
+    "extra": {
+        "name": "Colour Swatches",
+        "handle": "colour-swatches",
+        "description": "Adding custom selectable colour palettes, gradients, classes and more to your field types.",
+        "developer": "craftpulse",
+        "developerUrl": "https://github.com/craftpulse",
+        "documentationUrl": "https://github.com/craftpulse/craft-colour-swatches/blob/v4/README.md",
+        "changelogUrl": "https://github.com/craftpulse/craft-colour-swatches/blob/v4/CHANGELOG.md",
+        "class": "percipiolondon\\colourswatches\\ColourSwatches"
+    },
+    "scripts": {
+        "phpstan": "phpstan --memory-limit=1G"
+    },
+    "config": {
+        "allow-plugins": {
+            "yiisoft/yii2-composer": true,
+            "craftcms/plugin-installer": true
+        }
+    }
+}

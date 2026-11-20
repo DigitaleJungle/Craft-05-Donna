@@ -1,0 +1,890 @@
+<?php
+namespace verbb\formie\services;
+
+use verbb\formie\Formie;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\MailEvent;
+use verbb\formie\events\MailRenderEvent;
+use verbb\formie\fields\FileUpload;
+use verbb\formie\helpers\Assets;
+use verbb\formie\helpers\DeliveryAttempt;
+use verbb\formie\helpers\DeliveryDiagnostics;
+use verbb\formie\helpers\References;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\jobs\DeliveryJobInterface;
+use verbb\formie\models\EmailPreviewAsset;
+use verbb\formie\models\Notification;
+use verbb\formie\models\Settings;
+use verbb\formie\references\ReferenceOutputContext;
+
+use Craft;
+use craft\base\LocalFsInterface;
+use craft\elements\Asset;
+use craft\elements\db\AssetQuery;
+use craft\helpers\App;
+use craft\helpers\HtmlPurifier;
+use craft\helpers\Json;
+use craft\helpers\Template;
+use craft\mail\Message;
+
+use yii\base\Component;
+use yii\base\Exception;
+
+use Throwable;
+
+use Html2Text\Html2Text;
+use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
+
+class Emails extends Component
+{
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_RENDER_VARIABLES = 'modifyRenderVariables';
+    public const EVENT_BEFORE_RENDER_EMAIL = 'beforeRenderEmail';
+    public const EVENT_AFTER_RENDER_EMAIL = 'afterRenderEmail';
+    public const EVENT_BEFORE_SEND_MAIL = 'beforeSendEmail';
+    public const EVENT_AFTER_SEND_MAIL = 'afterSendEmail';
+
+
+    // Properties
+    // =========================================================================
+
+    private array $_tempAttachments = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function renderEmail(Notification $notification, Submission $submission): array
+    {
+        // Set Craft to the site template mode
+        $view = Craft::$app->getView();
+        $view->setTemplateMode($view::TEMPLATE_MODE_SITE);
+
+        $form = $submission->getForm();
+
+        $renderVariables = compact('notification', 'submission', 'form');
+
+        $mailer = Craft::$app->getMailer();
+
+        /** @var Message $newEmail */
+        $newEmail = Craft::createObject([
+            'class' => $mailer->messageClass,
+            'mailer' => $mailer,
+        ]);
+
+        // Site-aware mail settings were added in Craft 5.6.
+        if ($newEmail->canSetProperty('siteId')) {
+            $newEmail->siteId = $submission->siteId;
+        }
+
+        $event = new MailEvent([
+            'email' => $newEmail,
+            'notification' => $notification,
+            'submission' => $submission,
+        ]);
+        $this->trigger(self::EVENT_BEFORE_RENDER_EMAIL, $event);
+
+        // Update the email from the event
+        $newEmail = $event->email;
+
+        // Don't fall back on Craft settings here, that'll be site-resolved in `Craft::$app->getMailer()->send()`
+        try {
+            $fromEmail = $this->_parseNotificationEmailSetting($notification->from, $submission, $notification);
+            $fromName = $this->_parseNotificationTextSetting($notification->fromName, $submission, $notification);
+
+            $fromEmail = $this->_getParsedEmails($fromEmail, false)[0] ?? null;
+            $fromName = $this->_getFilteredString($fromName, false);
+
+            if ($fromEmail) {
+                if ($fromName) {
+                    $newEmail->setFrom([$fromEmail => $fromName]);
+                } else {
+                    $newEmail->setFrom($fromEmail);
+                }
+            }
+        } catch (Throwable $e) {
+            Craft::$app->getErrorHandler()->logException($e);
+
+            $error = Craft::t('formie', 'Notification email parse error for From: {value}”. Template error: “{message}” {file}:{line}', [
+                'value' => $notification->from,
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+        }
+
+        // To:
+        try {
+            $to = $this->_parseNotificationEmailSetting($notification->getToEmail($submission), $submission, $notification);
+            $to = $this->_getParsedEmails($to, false);
+
+            if ($to) {
+                $newEmail->setTo($to);
+            }
+        } catch (Throwable $e) {
+            Craft::$app->getErrorHandler()->logException($e);
+
+            $error = Craft::t('formie', 'Notification email parse error for “To: {value}”. Template error: “{message}” {file}:{line}', [
+                'value' => $notification->getToEmail($submission),
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+        }
+
+        if (!$newEmail->getTo()) {
+            $error = Craft::t('formie', 'Notification email error. No recipient email address found.');
+
+            return ['error' => $error, 'email' => $newEmail];
+        }
+
+        // Sender:
+        if ($notification->sender) {
+            try {
+                $sender = $this->_parseNotificationEmailSetting($notification->sender, $submission, $notification);
+                $sender = $this->_getParsedEmails($sender, false)[0] ?? null;
+
+                if ($sender) {
+                    $newEmail->setSender($sender);
+                }
+            } catch (Throwable $e) {
+                Craft::$app->getErrorHandler()->logException($e);
+
+                $error = Craft::t('formie', 'Notification email parse error for “Sender: {value}”. Template error: “{message}” {file}:{line}', [
+                    'value' => $notification->sender,
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+            }
+        }
+
+        // BCC:
+        if ($notification->bcc) {
+            try {
+                $bcc = $this->_parseNotificationEmailSetting($notification->bcc, $submission, $notification);
+                $bcc = $this->_getParsedEmails($bcc, false);
+
+                if ($bcc) {
+                    $newEmail->setBcc($bcc);
+                }
+            } catch (Throwable $e) {
+                Craft::$app->getErrorHandler()->logException($e);
+
+                $error = Craft::t('formie', 'Notification email parse error for “BCC: {value}”. Template error: “{message}” {file}:{line}', [
+                    'value' => $notification->bcc,
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+            }
+        }
+
+        // CC:
+        if ($notification->cc) {
+            try {
+                $cc = $this->_parseNotificationEmailSetting($notification->cc, $submission, $notification);
+                $cc = $this->_getParsedEmails($cc, false);
+
+                if ($cc) {
+                    $newEmail->setCc($cc);
+                }
+            } catch (Throwable $e) {
+                Craft::$app->getErrorHandler()->logException($e);
+
+                $error = Craft::t('formie', 'Notification email parse error for CC: {value}”. Template error: “{message}” {file}:{line}', [
+                    'value' => $notification->cc,
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+            }
+        }
+
+        // Reply To:
+        if ($notification->replyTo) {
+            try {
+                $replyTo = $this->_parseNotificationEmailSetting($notification->replyTo, $submission, $notification);
+                $replyTo = $this->_getParsedEmails($replyTo, false);
+
+                $replyToName = $this->_parseNotificationTextSetting($notification->replyToName, $submission, $notification);
+                $replyToName = $this->_getFilteredString($replyToName, false);
+
+                if ($replyTo) {
+                    if ($replyToName) {
+                        $newEmail->setReplyTo([$replyTo[0] => $replyToName]);
+                    } else {
+                        $newEmail->setReplyTo($replyTo);
+                    }
+                }
+            } catch (Throwable $e) {
+                Craft::$app->getErrorHandler()->logException($e);
+
+                $error = Craft::t('formie', 'Notification email parse error for ReplyTo: {value}”. Template error: “{message}” {file}:{line}', [
+                    'value' => $notification->replyTo,
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ]);
+
+                return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+            }
+        }
+
+        // Subject:
+        try {
+            $subject = $this->_parseNotificationTextSetting($notification->subject, $submission, $notification);
+            $subject = $this->_getFilteredString($subject, false);
+
+            $newEmail->setSubject($subject);
+        } catch (Throwable $e) {
+            Craft::$app->getErrorHandler()->logException($e);
+
+            $error = Craft::t('formie', 'Notification email parse error for Subject: {value}”. Template error: “{message}” {file}:{line}', [
+                'value' => $notification->subject,
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+        }
+
+        // We always need a template, so log the error, but use the default built-in one.
+        $templatePath = '';
+
+        // Fetch the email template for the notification - if we're using one
+        if ($notification->templateId) {
+            $emailTemplate = Formie::$plugin->getEmailTemplates()->getTemplateById($notification->templateId);
+
+            // Check to see if an email template has been set for the form
+            if ($emailTemplate) {
+                // Check to see the template is valid
+                if (!$view->doesTemplateExist($emailTemplate->template)) {
+                    // Let's press on if we can't find the template - use the default
+                    Formie::error('Notification email template does not exist at “{templatePath}”.', [
+                        'templatePath' => $emailTemplate->template,
+                    ]);
+                } else {
+                    $templatePath = $emailTemplate->template;
+                }
+            }
+        }
+
+        // Render HTML body
+        try {
+            // Render the body content for the notification
+            $parsedContent = References::parseContent($notification->getParsedContent(), $submission, [
+                'outputContext' => ReferenceOutputContext::Html,
+                'allowFieldHtml' => true,
+                'notification' => $notification,
+                'parseEnvValues' => false,
+            ]);
+
+            // Add it to our render variables
+            $renderVariables['contentHtml'] = Template::raw(StringHelper::cleanString($parsedContent));
+
+            // Parsed headers (subject, recipients, etc.) are on the message — `notification.*` stays raw config.
+            $renderVariables['email'] = $newEmail;
+
+            $event = new MailRenderEvent([
+                'email' => $newEmail,
+                'notification' => $notification,
+                'submission' => $submission,
+                'renderVariables' => $renderVariables,
+            ]);
+            $this->trigger(self::EVENT_MODIFY_RENDER_VARIABLES, $event);
+
+            // Update the render variables
+            $renderVariables = $event->renderVariables;
+
+            if ($templatePath) {
+                // We need to do a little more work here to deal with a template, if picked
+                $oldTemplatesPath = $view->getTemplatesPath();
+                $view->setTemplatesPath(Craft::$app->getPath()->getSiteTemplatesPath());
+                $body = $view->renderTemplate($templatePath, $renderVariables);
+                $view->setTemplatesPath($oldTemplatesPath);
+            } else {
+                $oldTemplateMode = $view->getTemplateMode();
+                $view->setTemplateMode($view::TEMPLATE_MODE_CP);
+
+                $templatePath = 'formie/_special/email-template';
+                $body = $view->renderTemplate($templatePath, $renderVariables);
+
+                $view->setTemplateMode($oldTemplateMode);
+            }
+
+            // Handle an empty string, something likely gone wrong.
+            if ($body === '') {
+                throw new Exception('Email body render returned empty. Please check your email content for invalid variables.');
+            }
+
+            $newEmail->setHtmlBody($body);
+
+            // Auto-generate plain text for ease
+            $plainTextBody = $this->_htmlToPlainText($body);
+
+            $newEmail->setTextBody($plainTextBody);
+        } catch (Throwable $e) {
+            Craft::$app->getErrorHandler()->logException($e);
+
+            $error = Craft::t('formie', 'Notification email template parse error for “{value}”. Template error: “{message}” {file}:{line}', [
+                'value' => $templatePath,
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            return ['error' => $error, 'email' => $newEmail, 'exception' => $e];
+        }
+
+        $event = new MailEvent([
+            'email' => $newEmail,
+            'notification' => $notification,
+            'submission' => $submission,
+        ]);
+        $this->trigger(self::EVENT_AFTER_RENDER_EMAIL, $event);
+
+        // Update the email from the event
+        $newEmail = $event->email;
+
+        return ['success' => true, 'email' => $newEmail];
+    }
+
+    public function sendEmail(Notification $notification, Submission $submission, mixed $queueJob = null, bool $createSentNotification = true): array
+    {
+        $submission->assertContentAvailable();
+
+        // Render the email
+        $emailRender = $this->renderEmail($notification, $submission);
+
+        $newEmail = $emailRender['email'] ?? '';
+
+        // Check if there were any errors. It's split this was so calling `render()` can return errors for previews
+        // But in our case, we want to log the errors and bail.
+        if (isset($emailRender['error']) && $emailRender['error']) {
+            $error = $emailRender['error'];
+
+            Formie::error($error);
+
+            // Output the full exception if available
+            if (isset($emailRender['exception']) && $emailRender['exception']) {
+                Formie::error($emailRender['exception']);
+
+                if ($queueJob instanceof DeliveryJobInterface) {
+                    Formie::$plugin->getDeliveryAttempts()->checkpoint($queueJob->getDeliveryAttemptUid(), 'email-render-exception', DeliveryDiagnostics::exception($emailRender['exception']));
+                }
+            }
+
+            // Save the sent notification, as failed
+            if ($createSentNotification) {
+                Formie::$plugin->getSentNotifications()->saveSentNotification($submission, $notification, $newEmail, false, $error);
+            }
+
+            return ['error' => $error];
+        }
+
+        try {
+            // Attach any file uploads
+            if ($notification->attachFiles) {
+                // Grab all the file upload fields, including in nested fields
+                if ($assets = $this->_getAssetsForSubmission($submission)) {
+                    $this->_attachAssetsToEmail($assets, $newEmail);
+                }
+            }
+
+            // Attach any static assets
+            if ($assets = $notification->getAssetAttachments()) {
+                $this->_attachAssetsToEmail($assets, $newEmail);
+            }
+
+            // Attach any PDF templates
+            if ($notification->attachPdf) {
+                $this->_attachPdfToEmail($notification, $newEmail, $submission);
+            }
+        } catch (Throwable $e) {
+            Craft::$app->getErrorHandler()->logException($e);
+
+            // Nothing has been sent, so this is a plain failure rather than an unknown delivery.
+            $error = Craft::t('formie', 'Notification email “{notification}” could not be sent for submission “{submission}”. Error: {error} {file}:{line}', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'notification' => $notification->name,
+                'submission' => $submission->id ?: 'new',
+            ]);
+
+            Formie::error($error);
+
+            if ($createSentNotification) {
+                Formie::$plugin->getSentNotifications()->saveSentNotification($submission, $notification, $newEmail, false, $error);
+            }
+
+            return ['error' => $error];
+        }
+
+
+        try {
+            $event = new MailEvent([
+                'email' => $newEmail,
+                'notification' => $notification,
+                'submission' => $submission,
+            ]);
+            $this->trigger(self::EVENT_BEFORE_SEND_MAIL, $event);
+
+            // Update the email from the event
+            $newEmail = $event->email;
+
+            if (!$event->isValid) {
+                $error = Craft::t('formie', 'Notification email “{notification}” for submission “{submission}” was cancelled by Formie.', [
+                    'notification' => $notification->name,
+                    'submission' => $submission->id ?: 'new',
+                ]);
+
+                Formie::error($error);
+                Formie::error('Email delivery failed. Inspect the notification delivery diagnostics.');
+
+                // Save the sent notification, as failed
+                if ($createSentNotification) {
+                    Formie::$plugin->getSentNotifications()->saveSentNotification($submission, $notification, $newEmail, false, $error);
+                }
+
+                return ['error' => $error];
+            }
+
+            if ($queueJob instanceof DeliveryJobInterface) {
+                Formie::$plugin->getDeliveryAttempts()->checkpoint($queueJob->getDeliveryAttemptUid(), 'email-prepared', [
+                    'notificationId' => $notification->id,
+                    'message' => $this->_serializeEmail($newEmail),
+                ]);
+            }
+
+            if (!Craft::$app->getMailer()->send($newEmail)) {
+                $mailerError = $this->_formatMailerError($newEmail);
+
+                if ($mailerError === '') {
+                    $mailerError = Craft::t('formie', 'No error message was returned by the mailer. Context: {context}. Verify mail transport settings are available when the queue runs via CLI/cron.', [
+                        'context' => $this->_getMailerFailureContext(),
+                    ]);
+                }
+
+                $error = Craft::t('formie', 'Notification email “{notification}” could not be sent for submission “{submission}”. The mailer service failed to send the notification: “{e}”.', [
+                    'e' => $mailerError,
+                    'notification' => $notification->name,
+                    'submission' => $submission->id ?: 'new',
+                ]);
+
+                Formie::error($error);
+                Formie::error('Email delivery failed. Inspect the notification delivery diagnostics.');
+                Formie::error('Mailer context: ' . $this->_getMailerFailureContext());
+
+                // Save the sent notification, as failed
+                if ($createSentNotification) {
+                    Formie::$plugin->getSentNotifications()->saveSentNotification($submission, $notification, $newEmail, false, $error);
+                }
+
+                return ['error' => $error];
+            }
+
+            // Save the sent notification, as successful
+            if ($createSentNotification) {
+                Formie::$plugin->getSentNotifications()->saveSentNotification($submission, $notification, $newEmail);
+            }
+        } catch (Throwable $e) {
+            Craft::$app->getErrorHandler()->logException($e);
+
+            if ($queueJob instanceof DeliveryJobInterface) {
+                Formie::$plugin->getDeliveryAttempts()->checkpoint($queueJob->getDeliveryAttemptUid(), 'email-exception', DeliveryDiagnostics::exception($e));
+            }
+
+            $error = Craft::t('formie', 'Notification email “{notification}” could not be sent for submission “{submission}”. Error: {error} {file}:{line}', [
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'notification' => $notification->name,
+                'submission' => $submission->id ?: 'new',
+            ]);
+
+            Formie::error($error);
+            Formie::error('Email delivery failed. Inspect the notification delivery diagnostics.');
+
+            // Save the sent notification, as failed
+            Formie::$plugin->getSentNotifications()->saveSentNotification($submission, $notification, $newEmail, false, $error);
+
+            return ['error' => $error];
+        }
+
+        // Raise an 'afterSendEmail' event
+        if ($this->hasEventHandlers(self::EVENT_AFTER_SEND_MAIL)) {
+            $this->trigger(self::EVENT_AFTER_SEND_MAIL, new MailEvent([
+                'email' => $newEmail,
+                'notification' => $notification,
+                'submission' => $submission,
+            ]));
+        }
+
+        // Delete any leftover attachments
+        foreach ($this->_tempAttachments as $path) {
+            if (file_exists($path)) {
+                unlink($path);
+            }
+        }
+
+        $this->_tempAttachments = [];
+
+        return ['success' => true];
+    }
+
+    public function sendFailAlertEmail(Notification $notification, Submission $submission, $emailResponse, ?string $deliveryKey = null): ?array
+    {
+        /* @var Settings $settings */
+        $settings = Formie::$plugin->getSettings();
+
+        // Check our settings are all in order first.
+        if (!$settings->sendEmailAlerts) {
+            $error = Craft::t('formie', 'Fail alert not configured to send.');
+
+            Formie::info($error);
+
+            return ['error' => $error];
+        }
+
+        if (!$settings->validate()) {
+            $error = Craft::t('formie', 'Fail alert settings are invalid: “{errors}”.', [
+                'errors' => Json::encode($settings->getErrors()),
+            ]);
+
+            Formie::error($error);
+
+            return ['error' => $error];
+        }
+
+        $form = $submission->getForm();
+
+        $renderVariables = compact('notification', 'submission', 'form', 'emailResponse');
+
+        // `json_encode` isn't allowed in Craft's Twig sandbox, so messages get the JSON ready-made.
+        $renderVariables['emailResponseJson'] = (string)json_encode($emailResponse, JSON_PARTIAL_OUTPUT_ON_ERROR);
+
+        $recipients = $settings->getFailAlertRecipients();
+
+        if (!$recipients) {
+            $error = Craft::t('formie', 'No fail alert recipients are configured.');
+
+            Formie::error($error);
+
+            return ['error' => $error];
+        }
+
+        foreach ($recipients as $recipient) {
+            try {
+                $mail = Craft::$app->getMailer()
+                    ->composeFromKey('formie_failed_notification', $renderVariables)
+                    ->setTo($recipient['email']);
+
+                Formie::$plugin->getDeliveryAttempts()->sendAlert($submission, 'notification-alert:' . $notification->uid, $deliveryKey ?? DeliveryAttempt::workflowIdentity() ?? 'legacy-alert', $recipient['email'], fn() => $mail->send());
+            } catch (Throwable $e) {
+                Craft::$app->getErrorHandler()->logException($e);
+
+                $error = Craft::t('formie', 'Failure alert email could not be sent for submission “{submission}”. Error: {error} {file}:{line}', [
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                    'submission' => $submission->id ?: 'new',
+                ]);
+
+                Formie::error($error);
+
+                return ['error' => $error];
+            }
+        }
+
+        return null;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _htmlToPlainText(string $html): string
+    {
+        $html = new Html2Text($html);
+
+        return $html->getText();
+    }
+
+    private function _parseNotificationTextSetting(?string $string, Submission $submission, Notification $notification): string
+    {
+        $string = (string)$string;
+        $string = preg_replace('/^\$([A-Z][A-Z0-9_]*)$/D', '{env:$1}', $string);
+
+        return References::parseContent($string, $submission, [
+            'outputContext' => ReferenceOutputContext::EmailHeader,
+            'notification' => $notification,
+            'parseEnvValues' => false,
+        ]);
+    }
+
+    private function _parseNotificationEmailSetting(?string $emails, Submission $submission, Notification $notification): string
+    {
+        $emails = $this->_parseAuthoredEmailEnvTokens((string)$emails);
+
+        return References::parseListContent($emails, $submission, [
+            'outputContext' => ReferenceOutputContext::EmailHeader,
+            'notification' => $notification,
+            'parseEnvValues' => false,
+        ]);
+    }
+
+    private function _parseAuthoredEmailEnvTokens(string $emails): string
+    {
+        $tokens = preg_split('/([\s,;]+)/', $emails, -1, PREG_SPLIT_DELIM_CAPTURE);
+
+        if (!is_array($tokens)) {
+            return $emails;
+        }
+
+        foreach ($tokens as $key => $token) {
+            if ($token === '' || preg_match('/^[\s,;]+$/', $token) || str_contains($token, '{')) {
+                continue;
+            }
+
+            $tokens[$key] = preg_replace('/^\$([A-Z][A-Z0-9_]*)$/D', '{env:$1}', $token);
+        }
+
+        return implode('', $tokens);
+    }
+
+    private function _getFilteredString(string $string, bool $parseEnv = true): string
+    {
+        $string = trim($parseEnv ? App::parseEnv(trim($string)) : trim($string));
+
+        // Strip out any emoji's
+        $string = trim(StringHelper::replaceMb4($string, ''));
+
+        // Ensure that we purify any strings, which also handles any special (allowed) characters
+        $string = HtmlPurifier::process($string);
+
+        // Some entities aren't decoded like `&amp;`, `&gt;` and `&lt;`
+        $string = html_entity_decode($string, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $string = strip_tags($string);
+        $string = preg_replace('/[\r\n\t]+/', ' ', $string) ?: '';
+        $string = preg_replace('/\s{2,}/', ' ', $string) ?: '';
+        $string = trim($string);
+
+        return $string;
+    }
+
+    private function _getParsedEmails(string $emails, bool $parseEnv = true): array
+    {
+        $emailsEnv = [];
+
+        // In case special characters exist in the string, that interfere with splitting (encoded apostrophe `&#039`)
+        // which only really occurs when the value is dynamic, and coming from a mapped field value, where values are encoded
+        $emails = HtmlPurifier::process($emails);
+
+        // Decode entities such as `&amp;` before splitting addresses into mail header values.
+        $emails = html_entity_decode($emails, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        // Split the emails
+        $emails = str_replace(';', ',', $emails);
+        $emails = preg_split('/[\s,]+/', $emails);
+
+        foreach (array_filter($emails) as $email) {
+            // Prevent non-utf characters sneaking in.
+            $email = StringHelper::convertToUtf8($email);
+
+            // Also check for control characters, which aren't included above
+            $email = preg_replace('/[^\PC\s]/u', '', $email);
+
+            // Strip out any emoji's
+            $email = trim(StringHelper::replaceMb4($email, ''));
+
+            // Handle .env variables only for values that have not already resolved user-controlled references.
+            $email = $parseEnv ? App::parseEnv(trim($email)) : trim($email);
+
+            // Lowercase emails, just in case
+            $email = strtolower(trim($email));
+
+            $emailsEnv[] = $email;
+        }
+
+        $emailsEnv = array_filter($emailsEnv);
+
+        return array_values($emailsEnv);
+    }
+
+    private function _getAssetsForSubmission(Submission $submission): array
+    {
+        $assets = [];
+
+        foreach ($submission->getFieldValuesForField(FileUpload::class) as $value) {
+            if ($value instanceof AssetQuery) {
+                $assets[] = $value->all();
+            }
+        }
+
+        return array_merge(...$assets);
+    }
+
+    private function _attachAssetsToEmail($assets, Message $message): void
+    {
+        foreach ($assets as $asset) {
+            $path = null;
+
+            if (!($asset instanceof EmailPreviewAsset)) {
+                try {
+                    $path = Assets::getFullAssetFilePath($asset);
+                } catch (Throwable $e) {
+                    Formie::warning('Not attaching “{filename}” because the asset file could not be read: {error}', [
+                        'filename' => $asset->filename,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    continue;
+                }
+
+                // If a non-local asset, store so we can delete later
+                if ($path && !($asset->getVolume()->getFs() instanceof LocalFsInterface)) {
+                    $this->_tempAttachments[] = $path;
+                }
+            }
+
+            // Check for asset size, 0kb files are technically invalid (or at least spammy)
+            if (!$asset->size) {
+                Formie::info('Not attaching “' . $asset->filename . '” due to invalid file size: ' . $asset->size . '.');
+
+                continue;
+            }
+
+            // Check if the asset is over the configured threshold (0 = unlimited).
+            $maxAttachmentSize = Formie::$plugin->getSettings()->getMaxEmailAttachmentSizeBytes();
+
+            if ($maxAttachmentSize !== null && $asset->size > $maxAttachmentSize) {
+                Formie::warning('Not attaching “{filename}” due to large file size: {size} bytes (limit: {limit} bytes).', [
+                    'filename' => $asset->filename,
+                    'size' => $asset->size,
+                    'limit' => $maxAttachmentSize,
+                ]);
+
+                continue;
+            }
+
+            if ($asset instanceof EmailPreviewAsset) {
+                $message->attachContent($asset->getPreviewContents(), [
+                    'fileName' => $asset->filename,
+                    'contentType' => $asset->getMimeType(),
+                ]);
+
+                continue;
+            }
+
+            if (!$path || !is_file($path)) {
+                Formie::warning('Not attaching “{filename}” because the asset file could not be read.', [
+                    'filename' => $asset->filename,
+                ]);
+
+                continue;
+            }
+
+            $message->attach($path, [
+                'fileName' => $asset->filename,
+                'contentType' => $asset->getMimeType(),
+            ]);
+        }
+    }
+
+    private function _formatMailerError(Message $message): string
+    {
+        $error = $message->error ?? null;
+
+        if ($error instanceof TransportExceptionInterface || $error instanceof Throwable) {
+            return $error->getMessage();
+        }
+
+        if (is_string($error)) {
+            return $error;
+        }
+
+        return '';
+    }
+
+    private function _getMailerFailureContext(): string
+    {
+        $mailer = Craft::$app->getMailer();
+        $context = [];
+
+        $context[] = Craft::$app->getRequest()->getIsConsoleRequest() ? 'CLI/queue request' : 'web request';
+
+        if ($mailer->useFileTransport) {
+            $context[] = 'file transport enabled';
+        }
+
+        if (empty($mailer->from)) {
+            $context[] = 'mailer from address not configured';
+        }
+
+        return implode('; ', $context);
+    }
+
+    private function _serializeEmail($email): array
+    {
+        return [
+            'charset' => $email->getCharset(),
+            'from' => $email->getFrom(),
+            'replyTo' => $email->getReplyTo(),
+            'to' => $email->getTo(),
+            'cc' => $email->getCc(),
+            'bcc' => $email->getBcc(),
+            'sender' => $email->getSender(),
+            'subject' => $email->getSubject(),
+            'body' => $email->getSymfonyEmail()->getHtmlBody(),
+            'textBody' => $email->getSymfonyEmail()->getTextBody(),
+            'headers' => $email->getSymfonyEmail()->getHeaders()->toString(),
+            'attachments' => array_map(static fn($part): array => ['name' => $part->getFilename(), 'mediaType' => $part->getMediaType() . '/' . $part->getMediaSubtype()], $email->getSymfonyEmail()->getAttachments()),
+        ];
+    }
+
+    private function _attachPdfToEmail(Notification $notification, Message $message, Submission $submission): void
+    {
+        // Render the PDF template
+        $template = $notification->getPdfTemplate();
+
+        $pdf = Formie::$plugin->getPdfTemplates()->renderPdf($template, $submission, $notification);
+
+        if (!$pdf) {
+            return;
+        }
+
+        // Save it in a temp location, so we can attach it
+        $pdfPath = Assets::tempFilePath('pdf');
+        file_put_contents($pdfPath, $pdf);
+
+        if (!$pdfPath) {
+            return;
+        }
+
+        // Reuse the rendered subject without evaluating submitted text again or changing the saved settings.
+        $filenameNotification = clone $notification;
+        $filenameNotification->subject = $message->getSubject();
+
+        $fileName = Formie::$plugin->getPdfTemplates()->resolveSubmissionPdfFilename($submission, $template, $filenameNotification);
+
+        $message->attach($pdfPath, ['fileName' => $fileName, 'contentType' => 'application/pdf']);
+
+        // Store for later
+        $this->_tempAttachments[] = $pdfPath;
+    }
+}

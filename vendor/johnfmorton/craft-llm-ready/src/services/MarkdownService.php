@@ -1,0 +1,1262 @@
+<?php
+
+declare(strict_types=1);
+
+namespace johnfmorton\llmready\services;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\elements\Entry;
+use craft\fields\PlainText;
+use craft\helpers\ElementHelper;
+use craft\models\Section;
+use craft\models\Site;
+use craft\web\View;
+use johnfmorton\llmready\events\DefineFrontMatterEvent;
+use johnfmorton\llmready\events\IncludeEntryEvent;
+use johnfmorton\llmready\helpers\FieldTypes;
+use johnfmorton\llmready\helpers\QueryIterator;
+use johnfmorton\llmready\LlmReady;
+use johnfmorton\llmready\models\Settings;
+use League\HTMLToMarkdown\HtmlConverter;
+use yii\base\Component;
+use yii\caching\TagDependency;
+use yii\helpers\Html;
+
+/**
+ * Handles Markdown conversion and rendering
+ */
+class MarkdownService extends Component
+{
+    /**
+     * @var array<string, array<string, mixed>>|null Per-section settings set by
+     * {@see useSectionSettings()}; null reads project config.
+     */
+    private ?array $_sectionSettings = null;
+
+    /**
+     * @event DefineFrontMatterEvent Raised while building an entry's YAML
+     * front matter, after the plugin has resolved its own values and before
+     * they are written out. Handlers may add, change or remove keys.
+     */
+    public const EVENT_DEFINE_FRONT_MATTER = 'defineFrontMatter';
+
+    /**
+     * @event IncludeEntryEvent Raised before an entry is served as Markdown,
+     * listed in `/llms.txt` or on a listing page, or advertised as a Markdown
+     * alternate. Handlers may set `$include` to false to exclude it.
+     */
+    public const EVENT_INCLUDE_ENTRY = 'includeEntry';
+
+    /** Tag on every cached entry's Markdown. */
+    public const CACHE_TAG = 'llmready:markdown';
+
+    private ?HtmlConverter $_converter = null;
+
+    /** @var string[] Tags whose text {@see gatherText()} skips. */
+    private array $_hiddenTextTags = [];
+
+    /**
+     * Whether an entry may be surfaced on a site: no
+     * {@see EVENT_INCLUDE_ENTRY} handler excludes it and no SEO plugin marks
+     * it `noindex`. Every place that serves, lists or advertises an entry's
+     * Markdown asks this, so the two can't disagree.
+     *
+     * Handlers run first: an entry they exclude skips the SEO lookup, which
+     * is the expensive part of building `/llms.txt` on a SEOmatic site. Their
+     * answer isn't memoized, so a long-running queue worker never holds a
+     * stale one.
+     */
+    public function isEntryIncluded(Entry $entry, Site $site): bool
+    {
+        if ($this->hasEventHandlers(self::EVENT_INCLUDE_ENTRY)) {
+            $event = new IncludeEntryEvent([
+                'entry' => $entry,
+                'site' => $site,
+            ]);
+            $this->trigger(self::EVENT_INCLUDE_ENTRY, $event);
+
+            if (!$event->include) {
+                return false;
+            }
+        }
+
+        return !LlmReady::getInstance()->seoService->isNoindex($entry);
+    }
+
+    /**
+     * Render Markdown for an entry
+     */
+    public function renderMarkdown(Entry $entry, Site $site): string
+    {
+        $settings = LlmReady::getInstance()->getSettings();
+        $cacheKey = $this->getCacheKey($entry, $site);
+
+        // Check cache
+        if ($settings->cacheTtl > 0) {
+            $cached = Craft::$app->getCache()->get($cacheKey);
+            if ($cached !== false) {
+                return $cached;
+            }
+        }
+
+        // Check for dedicated LLM template
+        $sectionConfig = $this->getSectionConfig($entry->sectionId, $site->id);
+        $llmTemplate = $sectionConfig['llmTemplate'] ?? null;
+
+        if ($llmTemplate) {
+            $markdown = $this->renderLlmTemplate($entry, $llmTemplate);
+        } else {
+            $markdown = $this->convertEntryHtmlToMarkdown($entry, $site);
+        }
+
+        // Prepend front matter
+        $frontMatter = $this->buildFrontMatter($entry, $site);
+        $result = $frontMatter . $markdown;
+
+        // Cache the result. Tagged by section, so a section setting that
+        // changes how its entries render (its label, its template) can drop
+        // them without waiting for each entry to be saved.
+        if ($settings->cacheTtl > 0) {
+            Craft::$app->getCache()->set($cacheKey, $result, $settings->cacheTtl, new TagDependency([
+                'tags' => [self::CACHE_TAG, $this->getSectionCacheTag($entry->sectionId)],
+            ]));
+        }
+
+        return $result;
+    }
+
+    /**
+     * Build a listing page as Markdown (list of entries in a section).
+     * Uncached; requests go through {@see IndexCacheService::get()}.
+     */
+    public function buildListingPage(Section $section, Site $site): string
+    {
+        // Hydrated in batches, since a limit of 0 lists every entry and a
+        // section can hold thousands.
+        $entries = QueryIterator::each(Entry::find()
+            ->section($section->handle)
+            ->site($site)
+            ->status('live')
+            ->orderBy('postDate desc')
+            ->limit(LlmReady::getInstance()->getSettings()->listingPageEntryLimit ?: null));
+
+        $siteName = $site->getName();
+        $lines = ["# {$this->getSectionLabel($section, $site)} — {$siteName}", ''];
+
+        foreach ($entries as $entry) {
+            if (!$this->isEntryIncluded($entry, $site)) {
+                continue;
+            }
+
+            $line = $this->formatEntryLink($entry);
+            if ($line !== null) {
+                $lines[] = $line;
+            }
+        }
+
+        return implode("\n", $lines) . "\n";
+    }
+
+    /**
+     * The URI a section's listing page answers to on a site — the part of its
+     * URI format before the first `{`, so `blog/{slug}` lists at `blog` —
+     * or null when the section has no URLs there or no such prefix.
+     */
+    public function getListingBaseUri(Section $section, Site $site): ?string
+    {
+        $siteSettings = $section->getSiteSettings()[$site->id] ?? null;
+        if ($siteSettings === null || !$siteSettings->hasUrls) {
+            return null;
+        }
+
+        $uriFormat = (string) $siteSettings->uriFormat;
+        $pos = strpos($uriFormat, '{');
+        if ($pos === false) {
+            return null;
+        }
+
+        $base = rtrim(substr($uriFormat, 0, $pos), '/');
+
+        return $base !== '' ? $base : null;
+    }
+
+    /**
+     * Render a dedicated LLM Twig template that outputs raw Markdown
+     */
+    private function renderLlmTemplate(Entry $entry, string $template): string
+    {
+        // Allowlist the template path to prevent directory traversal. Only
+        // letters, digits, underscores, hyphens, dots and forward slashes are
+        // permitted — which rejects backslash traversal, null bytes and stray
+        // percent-encoding — and `..` / leading `/` are rejected outright.
+        // Craft references templates without a file extension, so none is
+        // required here.
+        if (
+            !preg_match('#^[A-Za-z0-9_\-./]+$#', $template)
+            || str_contains($template, '..')
+            || str_starts_with($template, '/')
+        ) {
+            Craft::warning("LLM Ready: Rejected unsafe template path '{$template}'", __METHOD__);
+
+            return $this->buildBasicMarkdown($entry);
+        }
+
+        $view = Craft::$app->getView();
+
+        return $view->renderTemplate($template, [
+            'entry' => $entry,
+        ]);
+    }
+
+    /**
+     * Convert an entry's rendered HTML to Markdown
+     */
+    private function convertEntryHtmlToMarkdown(Entry $entry, Site $site): string
+    {
+        // Render the entry's normal template
+        $route = $entry->getRoute();
+        if ($route === null) {
+            return $this->buildBasicMarkdown($entry);
+        }
+
+        // Get the template path from the route
+        $template = is_array($route) ? $route[0] : $route;
+        if (is_array($route) && str_starts_with($template, 'templates/render')) {
+            $template = $route[1]['template'] ?? $template;
+        }
+
+        $view = Craft::$app->getView();
+
+        // Rendered as a page, not a fragment: a layout that calls head(),
+        // beginBody() or endBody() leaves Yii placeholders such as
+        // `<![CDATA[YII-BLOCK-BODY-BEGIN]]>` that only endPage() replaces, and
+        // endPage() also clears the JS and CSS the template registered, so it
+        // can't pile up across entries rendered in one process (a queue job,
+        // a console command). Site mode is explicit because a console or
+        // queue process starts in CP mode, where the site template isn't found.
+        try {
+            $html = $view->renderPageTemplate($template, [
+                'entry' => $entry,
+            ], View::TEMPLATE_MODE_SITE);
+        } catch (\Throwable $e) {
+            Craft::warning("LLM Ready: Failed to render template '{$template}' for entry {$entry->id}: {$e->getMessage()}", __METHOD__);
+
+            return $this->buildBasicMarkdown($entry);
+        }
+
+        // Extract main content using configured selectors
+        $contentHtml = $this->extractMainContent($html);
+
+        // Convert HTML to Markdown
+        return $this->htmlToMarkdown($contentHtml);
+    }
+
+    /**
+     * Build basic Markdown from entry fields when template rendering fails or is unavailable
+     */
+    private function buildBasicMarkdown(Entry $entry): string
+    {
+        $lines = ["# {$entry->title}", ''];
+
+        // Try to get content from common field handles
+        foreach (['body', 'content', 'text', 'description', 'summary'] as $handle) {
+            try {
+                $value = $entry->getFieldValue($handle);
+                if ($value && is_string($value)) {
+                    $lines[] = $this->htmlToMarkdown($value);
+                    break;
+                }
+            } catch (\Throwable) {
+                continue;
+            }
+        }
+
+        return implode("\n", $lines) . "\n";
+    }
+
+    /**
+     * Extract main content from full HTML using CSS selectors
+     */
+    private function extractMainContent(string $html): string
+    {
+        $settings = LlmReady::getInstance()->getSettings();
+        $selectors = array_map('trim', explode(',', $settings->contentSelector));
+
+        // A guard for placeholders the page render didn't replace, such as a
+        // beginBody() with no matching endBody(): DOMDocument reads them as
+        // text, and they would reach the Markdown escaped.
+        $html = (string) preg_replace('/<!\[CDATA\[YII-BLOCK-[A-Z-]+\]\]>/', '', $html);
+
+        $dom = new \DOMDocument();
+
+        // Suppress warnings from malformed HTML
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+
+        $this->stripExcludedNodes($xpath, $settings->excludeSelector);
+
+        if ($settings->flattenCardLinks) {
+            $this->flattenCardLinks($dom, $xpath);
+        }
+
+        foreach ($selectors as $selector) {
+            $xpathQuery = $this->cssSelectorToXPath($selector);
+            $nodes = $xpath->query($xpathQuery);
+
+            if ($nodes !== false && $nodes->length > 0) {
+                $content = '';
+                foreach ($nodes as $node) {
+                    $content .= $dom->saveHTML($node);
+                }
+
+                return $content;
+            }
+        }
+
+        // Fallback: try to find body content
+        $body = $xpath->query('//body');
+        if ($body !== false && $body->length > 0) {
+            return $dom->saveHTML($body->item(0));
+        }
+
+        // Last resort: return the full HTML
+        return $html;
+    }
+
+    /**
+     * Remove any nodes matching the configured exclude selectors from the document.
+     */
+    private function stripExcludedNodes(\DOMXPath $xpath, string $excludeSelector): void
+    {
+        $excludeSelector = trim($excludeSelector);
+        if ($excludeSelector === '') {
+            return;
+        }
+
+        foreach (array_map('trim', explode(',', $excludeSelector)) as $selector) {
+            if ($selector === '') {
+                continue;
+            }
+
+            $nodes = $xpath->query($this->cssSelectorToXPath($selector));
+            if ($nodes === false) {
+                continue;
+            }
+
+            // Collect first — removing during iteration mutates the live NodeList.
+            $toRemove = [];
+            foreach ($nodes as $node) {
+                $toRemove[] = $node;
+            }
+            foreach ($toRemove as $node) {
+                if ($node->parentNode !== null) {
+                    $node->parentNode->removeChild($node);
+                }
+            }
+        }
+    }
+
+    /** Elements whose presence inside a link makes it a card. */
+    private const CARD_BLOCK_TAGS = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'figure', 'picture', 'ul', 'ol', 'section', 'article'];
+
+    /** Media dropped from a card link, with any text inside them. */
+    private const CARD_MEDIA_TAGS = ['img', 'picture', 'figure', 'svg', 'video'];
+
+    /** Elements that don't break a line, so their text joins without a space. */
+    private const INLINE_TAGS = ['a', 'abbr', 'b', 'bdi', 'bdo', 'cite', 'code', 'data', 'del', 'dfn', 'em', 'i', 'ins', 'kbd', 'label', 'mark', 'q', 's', 'samp', 'small', 'span', 'strong', 'sub', 'sup', 'time', 'u', 'var'];
+
+    /**
+     * Rewrite every link that wraps a whole card — typically an image, a
+     * heading and a date on a listing page — as one line: the first heading
+     * as the link text, and the card's other text, such as the date, as plain
+     * text after the link. Converted as-is, such a link becomes a multi-line
+     * Markdown link with a heading and an image inside it, which most
+     * renderers show as broken text.
+     *
+     * Without a heading, the link's whole text becomes its text, and with an
+     * empty heading and no other text, its first image's alt. A link with no
+     * text outside its media is left alone, however the image is wrapped, as
+     * is any link holding only inline content, so an inline link or an
+     * image-only logo link converts as before. The replacement stays
+     * in the original's parent, so a card in a list item stays a list item.
+     */
+    private function flattenCardLinks(\DOMDocument $dom, \DOMXPath $xpath): void
+    {
+        $blockTest = implode(' or ', array_map(fn(string $tag) => "self::{$tag}", self::CARD_BLOCK_TAGS));
+        $links = $xpath->query("//a[@href][.//*[{$blockTest}]]");
+        if ($links === false || $links->length === 0) {
+            return;
+        }
+
+        // Collect first: replacing nodes mutates the live NodeList.
+        $cards = [];
+        foreach ($links as $link) {
+            $cards[] = $link;
+        }
+
+        $mediaTest = implode(' or ', array_map(fn(string $tag) => "self::{$tag}", self::CARD_MEDIA_TAGS));
+
+        // Text the converter would drop mustn't reach the link either.
+        $this->_hiddenTextTags = array_merge(
+            ['script', 'style', 'template', 'noscript'],
+            Settings::parseTagList((string) ($this->getConverterOptions()['remove_nodes'] ?? '')),
+        );
+
+        foreach ($cards as $link) {
+            /** @var \DOMElement $link */
+            if ($link->parentNode === null) {
+                continue;
+            }
+
+            // Worked out on a copy, so a card with nothing to use as link
+            // text can be left exactly as it was.
+            /** @var \DOMElement $card */
+            $card = $link->cloneNode(true);
+
+            $alt = '';
+            $images = $xpath->query('.//img[@alt]', $card);
+            if ($images !== false && $images->length > 0) {
+                /** @var \DOMElement $image */
+                $image = $images->item(0);
+                $alt = $this->collapseWhitespace($image->getAttribute('alt'));
+            }
+
+            $media = $xpath->query(".//*[{$mediaTest}]", $card);
+            foreach ($media !== false ? iterator_to_array($media) : [] as $node) {
+                $node->parentNode?->removeChild($node);
+            }
+
+            // Nothing but media — an image link, however the image is
+            // wrapped (`<picture>`, `<figure>`) — converts as an image link.
+            if ($this->nodeText($card) === '') {
+                continue;
+            }
+
+            $headings = $xpath->query('.//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6]', $card);
+            $heading = $headings !== false ? $headings->item(0) : null;
+
+            if ($heading !== null) {
+                $text = $this->nodeText($heading);
+                $heading->parentNode?->removeChild($heading);
+                $rest = $this->nodeText($card);
+            } else {
+                $text = $this->nodeText($card);
+                $rest = '';
+            }
+
+            if ($text === '') {
+                $text = $alt;
+            }
+            if ($text === '') {
+                continue;
+            }
+
+            $flat = $dom->createElement('a');
+            $flat->setAttribute('href', $link->getAttribute('href'));
+            $flat->appendChild($dom->createTextNode($text));
+
+            $parent = $link->parentNode;
+            $parent->insertBefore($flat, $link);
+            if ($rest !== '') {
+                $parent->insertBefore($dom->createTextNode(' ' . $rest), $link);
+            }
+            $parent->removeChild($link);
+        }
+    }
+
+    /**
+     * A node's text on one line, with a space wherever a block element or a
+     * `<br>` would have broken it, so a heading and a date don't run together.
+     */
+    private function nodeText(\DOMNode $node): string
+    {
+        return $this->collapseWhitespace($this->gatherText($node));
+    }
+
+    private function gatherText(\DOMNode $node): string
+    {
+        if ($node instanceof \DOMText) {
+            return $node->data;
+        }
+
+        if ($node instanceof \DOMElement && in_array(strtolower($node->tagName), $this->_hiddenTextTags, true)) {
+            return ' ';
+        }
+
+        $text = '';
+        foreach ($node->childNodes as $child) {
+            $text .= $this->gatherText($child);
+        }
+
+        if ($node instanceof \DOMElement && !in_array(strtolower($node->tagName), self::INLINE_TAGS, true)) {
+            return " {$text} ";
+        }
+
+        return $text;
+    }
+
+    private function collapseWhitespace(string $text): string
+    {
+        return trim((string) preg_replace('/[\s\x{00A0}]+/u', ' ', $text));
+    }
+
+    /**
+     * Convert a simple CSS selector to an XPath expression
+     * Supports: tag, .class, #id, [attr], [attr="val"], tag.class, tag#id.
+     * A tag may be a hyphenated custom element (`newsletter-signup`).
+     */
+    private function cssSelectorToXPath(string $selector): string
+    {
+        $selector = trim($selector);
+
+        // ID selector: #id or tag#id — IDs are restricted to word chars and hyphens
+        if (preg_match('/^([a-zA-Z](?:[\w-]*\w)?)?#([\w-]+)$/', $selector, $matches)) {
+            $tag = $matches[1] ?: '*';
+            $id = $this->xpathEscapeString($matches[2]);
+
+            return "//{$tag}[@id={$id}]";
+        }
+
+        // Class selector: .class or tag.class — classes are restricted to word chars and hyphens
+        if (preg_match('/^([a-zA-Z](?:[\w-]*\w)?)?\.([\w-]+)$/', $selector, $matches)) {
+            $tag = $matches[1] ?: '*';
+            $class = $this->xpathEscapeString(' ' . $matches[2] . ' ');
+
+            return "//{$tag}[contains(concat(' ', normalize-space(@class), ' '), {$class})]";
+        }
+
+        // Attribute presence selector: [data-nosnippet] — restrict attr name to safe characters
+        if (preg_match('/^\[([\w-]+)\]$/', $selector, $matches)) {
+            $attr = preg_replace('/[^\w-]/', '', $matches[1]);
+
+            return "//*[@{$attr}]";
+        }
+
+        // Attribute selector: [role="main"] — restrict attr values to safe characters
+        if (preg_match('/^\[([\w-]+)=["\']([^"\']+)["\']\]$/', $selector, $matches)) {
+            $attr = preg_replace('/[^\w-]/', '', $matches[1]);
+            $val = $this->xpathEscapeString($matches[2]);
+
+            return "//*[@{$attr}={$val}]";
+        }
+
+        // Tag selector: main, article, or a custom element such as newsletter-signup.
+        // Must start with a letter and end with a word character, so the XPath stays valid.
+        if (preg_match('/^[a-zA-Z](?:[\w-]*\w)?$/', $selector)) {
+            return "//{$selector}";
+        }
+
+        // Fallback: reject unknown selectors to prevent injection
+        Craft::warning("LLM Ready: Skipping unrecognized CSS selector '{$selector}'", __METHOD__);
+
+        return "//___llmready_no_match___";
+    }
+
+    /**
+     * Safely escape a string for use in an XPath expression
+     */
+    private function xpathEscapeString(string $value): string
+    {
+        if (!str_contains($value, "'")) {
+            return "'{$value}'";
+        }
+
+        if (!str_contains($value, '"')) {
+            return "\"{$value}\"";
+        }
+
+        // Value contains both quote types — use concat()
+        $parts = explode("'", $value);
+        $escaped = implode("', \"'\", '", $parts);
+
+        return "concat('{$escaped}')";
+    }
+
+    /**
+     * Convert HTML string to Markdown
+     */
+    private function htmlToMarkdown(string $html): string
+    {
+        if ($this->_converter === null) {
+            $this->_converter = new HtmlConverter($this->getConverterOptions());
+        }
+
+        $markdown = $this->decodeEntities($this->_converter->convert($html));
+
+        // Clean up excessive whitespace
+        $markdown = preg_replace("/\n{3,}/", "\n\n", $markdown);
+
+        return trim($markdown) . "\n";
+    }
+
+    /**
+     * Decode the HTML entities league/html-to-markdown leaves in its output.
+     *
+     * The converter escapes `&` and `<` in text so the Markdown can't be read
+     * as HTML, and how many times depends on how deeply the text is nested,
+     * so `Trains & Automobiles` came out as `Trains &amp; Automobiles` and an
+     * image's alt text inside a `<picture>` kept `&quot;`. A Markdown renderer
+     * decodes those, but an LLM reads the raw text.
+     *
+     * Only what can't create markup is decoded: `&amp;`, quotes, `&nbsp;` (as
+     * a space) and any other entity for a printable character. `&lt;` and
+     * `&gt;` stay encoded, so literal text such as `&lt;div&gt;` doesn't turn
+     * into a tag. It's one left-to-right pass, so `&amp;lt;` (the text `&lt;`)
+     * becomes `&lt;`, never `<`. Code spans and fenced code blocks are left
+     * alone: the converter has already decoded them, and an entity written
+     * there is meant literally.
+     */
+    private function decodeEntities(string $markdown): string
+    {
+        if (!str_contains($markdown, '&')) {
+            return $markdown;
+        }
+
+        $pattern = '/(?<code>^(?<fence>`{3,}|~{3,})[^\n]*\n.*?^\k<fence>[ \t]*$|(?<tick>`+)(?:(?!\n\n).)+?(?<!`)\k<tick>(?!`))'
+            . '|(?<entity>&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);)/msu';
+
+        return (string) preg_replace_callback($pattern, function(array $match): string {
+            $entity = $match['entity'] ?? '';
+            if ($entity === '') {
+                return $match[0];
+            }
+
+            $decoded = html_entity_decode($entity, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+            return match (true) {
+                $decoded === $entity, $decoded === '<', $decoded === '>' => $entity,
+                $decoded === "\u{00A0}" => ' ',
+                (bool) preg_match('/^\p{Cc}$/u', $decoded) => $entity,
+                default => $decoded,
+            };
+        }, $markdown);
+    }
+
+    /**
+     * Options handed to league/html-to-markdown: the plugin's defaults, the
+     * Excluded Elements setting as `remove_nodes`, and whatever
+     * `htmlConverterOptions` (config/llm-ready.php) sets merged on top, so a
+     * key there wins. A `remove_nodes` written there as an array or with
+     * commas is normalised the same way the setting is.
+     *
+     * @return array<string, mixed>
+     */
+    public function getConverterOptions(): array
+    {
+        $settings = LlmReady::getInstance()->getSettings();
+
+        $options = array_merge([
+            'strip_tags' => true,
+            'header_style' => 'atx',
+            'remove_nodes' => $settings->getExcludeElements(),
+        ], $settings->htmlConverterOptions);
+
+        $excludeElementsOption = $options['remove_nodes'];
+        if (is_array($excludeElementsOption)) {
+            $excludeElementsOption = implode(' ', array_map('strval', $excludeElementsOption));
+        }
+        if (is_string($excludeElementsOption)) {
+            $options['remove_nodes'] = implode(' ', Settings::parseTagList($excludeElementsOption));
+        }
+
+        return $options;
+    }
+
+    /**
+     * Build YAML front matter for an entry
+     */
+    public function buildFrontMatter(Entry $entry, Site $site): string
+    {
+        $settings = LlmReady::getInstance()->getSettings();
+        $section = $entry->getSection();
+
+        $frontMatter = [
+            'title' => $this->resolveTitle($entry, $settings->titleField),
+            'date' => $entry->postDate?->format('c'),
+            'author' => $this->resolveAuthor($entry, $settings->authorOverride),
+            'canonical_url' => $entry->getUrl(),
+            'section' => $section !== null ? $this->getSectionLabel($section, $site) : null,
+        ];
+
+        if ($this->hasEventHandlers(self::EVENT_DEFINE_FRONT_MATTER)) {
+            $event = new DefineFrontMatterEvent([
+                'entry' => $entry,
+                'site' => $site,
+                'frontMatter' => $frontMatter,
+            ]);
+            $this->trigger(self::EVENT_DEFINE_FRONT_MATTER, $event);
+            $frontMatter = $event->frontMatter;
+        }
+
+        return $this->serializeFrontMatter($frontMatter);
+    }
+
+    /**
+     * Resolve the front-matter title. Title Field may be a field path
+     * (`longTitle`, `seo.title`, `seomatic:title`) or a Craft object template
+     * (`{{ entry.longTitle ?: entry.title }}`). Falls back to the entry's
+     * native title when unset or when the configured value resolves empty, so
+     * every response has a title.
+     */
+    private function resolveTitle(Entry $entry, string $titleField): string
+    {
+        $title = null;
+
+        if ($titleField !== '') {
+            $title = $this->isObjectTemplate($titleField)
+                ? $this->renderObjectTemplate($entry, $titleField)
+                : $this->resolveExplicitField($entry, $titleField);
+        }
+
+        return $title ?? $entry->title ?? '';
+    }
+
+    /**
+     * Resolve the front-matter author. Author Override may be a fixed name
+     * written to every entry, or a Craft object template rendered per entry
+     * (`{% if entry.section.handle == 'blog' %}{{ entry.authors|map(a => a.fullName ?: a.username)|join(', ') }}{% endif %}`).
+     * A template that renders to nothing omits the `author:` line. No override
+     * falls through to the entry's own authors — all of them, comma-joined in
+     * the order they're set on the entry, so co-authors on a Craft 5
+     * multi-author entry aren't silently dropped.
+     */
+    private function resolveAuthor(Entry $entry, string $authorOverride): ?string
+    {
+        if ($authorOverride !== '') {
+            return $this->isObjectTemplate($authorOverride)
+                ? $this->renderObjectTemplate($entry, $authorOverride)
+                : $authorOverride;
+        }
+
+        $names = [];
+        foreach ($entry->getAuthors() as $author) {
+            $names[] = $author->fullName ?: $author->username;
+        }
+
+        return $names === [] ? null : implode(', ', $names);
+    }
+
+    /**
+     * Whether a setting value is a Craft object template rather than a plain
+     * string or field path. Mirrors the fast path in
+     * `View::renderObjectTemplate()`: Craft returns anything without a `{`
+     * untouched, so `{` is the unambiguous marker — no field path, `()` call
+     * or `seomatic:` key contains one.
+     */
+    private function isObjectTemplate(string $value): bool
+    {
+        return str_contains($value, '{');
+    }
+
+    /**
+     * Render a Craft object template against an entry — the same `{{ ... }}`
+     * syntax as an entry type's Title Format or a section's URI format. The
+     * entry is exposed as `entry` (and as Craft's usual `object`). The result
+     * is reduced to plain text like any other resolved field. A template that
+     * throws logs a warning and resolves to null, so a typo in a setting can't
+     * take down every Markdown response.
+     *
+     * Templates come from plugin settings, which need an admin (or the config
+     * file) to change — the same trust boundary as Craft's own object
+     * templates.
+     */
+    private function renderObjectTemplate(Entry $entry, string $template): ?string
+    {
+        try {
+            $rendered = Craft::$app->getView()->renderObjectTemplate($template, $entry, ['entry' => $entry]);
+        } catch (\Throwable $e) {
+            Craft::warning("LLM Ready: Object template '{$template}' failed for entry {$entry->id}: {$e->getMessage()}", __METHOD__);
+
+            return null;
+        }
+
+        return $this->normalizeText($rendered);
+    }
+
+    /**
+     * Write front matter keys out as a YAML document. A string becomes a
+     * scalar, a list of strings becomes a sequence, and null or empty values
+     * are omitted — that last rule is what lets an author template that
+     * renders to nothing drop the `author:` line.
+     *
+     * @param array<string, mixed> $frontMatter
+     */
+    private function serializeFrontMatter(array $frontMatter): string
+    {
+        $lines = ['---'];
+
+        foreach ($frontMatter as $key => $value) {
+            $key = (string) $key;
+            if (!preg_match('/^[A-Za-z_][A-Za-z0-9_-]*$/', $key)) {
+                Craft::warning("LLM Ready: Skipping front matter key '{$key}' — keys must match [A-Za-z_][A-Za-z0-9_-]*", __METHOD__);
+                continue;
+            }
+
+            if (is_array($value)) {
+                $items = [];
+                foreach ($value as $item) {
+                    if ((is_scalar($item) || $item instanceof \Stringable) && trim((string) $item) !== '') {
+                        $items[] = trim((string) $item);
+                    }
+                }
+                if ($items === []) {
+                    continue;
+                }
+                $lines[] = "{$key}:";
+                foreach ($items as $item) {
+                    $lines[] = '  - ' . $this->yamlEscape($item);
+                }
+                continue;
+            }
+
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                continue;
+            }
+            $value = trim((string) $value);
+            if ($value === '') {
+                continue;
+            }
+            $lines[] = "{$key}: " . $this->yamlEscape($value);
+        }
+
+        $lines[] = '---';
+        $lines[] = '';
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Escape a value for YAML output.
+     *
+     * ISO 8601 timestamps (the `date:` line) are left bare so YAML parsers keep
+     * them typed. Anything containing YAML-significant characters — or that
+     * starts with whitespace or `-`, or ends with whitespace — is double-quoted
+     * with backslashes, quotes and control characters escaped.
+     */
+    private function yamlEscape(string $value): string
+    {
+        if (preg_match('/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/', $value)) {
+            return $value;
+        }
+
+        if ($value === '' || preg_match('/[:#\[\]{}|>&*!,\'"%@`\\\\\x00-\x1f]|^[\s-]|\s$/', $value)) {
+            $escaped = strtr($value, [
+                '\\' => '\\\\',
+                '"' => '\\"',
+                "\n" => '\\n',
+                "\r" => '\\r',
+                "\t" => '\\t',
+            ]);
+            // Any remaining control character has no YAML escape worth keeping.
+            $escaped = (string) preg_replace('/[\x00-\x08\x0b\x0c\x0e-\x1f]/', '', $escaped);
+
+            return '"' . $escaped . '"';
+        }
+
+        return $value;
+    }
+
+    /**
+     * Reduce a resolved value to a single line of plain text: strip tags,
+     * decode entities, collapse whitespace. Returns null when nothing is left.
+     */
+    private function normalizeText(string $value): ?string
+    {
+        $text = strip_tags($value);
+        $text = Html::decode($text);
+        $text = (string) preg_replace('/\s+/', ' ', $text);
+        $text = trim($text);
+
+        return $text !== '' ? $text : null;
+    }
+
+    /**
+     * Get section setting from project config for a section/site combination
+     *
+     * The `label` key is missing from settings saved before 1.12.0.
+     *
+     * @return array{enabled: bool, llmTemplate: string|null, label?: string|null}|null
+     */
+    public function getSectionConfig(?int $sectionId, int $siteId): ?array
+    {
+        // Nested entries (Matrix, and any other field-owned entry) have no
+        // section, so there is no per-section config to look up.
+        if ($sectionId === null) {
+            return null;
+        }
+
+        $section = Craft::$app->getEntries()->getSectionById($sectionId);
+        $site = Craft::$app->getSites()->getSiteById($siteId);
+
+        if ($section === null || $site === null) {
+            return null;
+        }
+
+        if ($this->_sectionSettings !== null) {
+            return $this->_sectionSettings[$section->uid][$site->uid] ?? null;
+        }
+
+        $configPath = LlmReady::PROJECT_CONFIG_PATH . ".{$section->uid}.{$site->uid}";
+
+        return Craft::$app->getProjectConfig()->get($configPath);
+    }
+
+    /**
+     * The name a section goes by in `/llms.txt` and Markdown output: its
+     * Label setting for the site, or the section's own name when that is
+     * blank. Collapsed to one line, since it is used as a heading.
+     */
+    public function getSectionLabel(Section $section, Site $site): string
+    {
+        $label = $this->getSectionConfig($section->id, $site->id)['label'] ?? null;
+        $label = is_string($label) ? trim((string) preg_replace('/\s+/u', ' ', $label)) : '';
+
+        return $label !== '' ? $label : (string) $section->name;
+    }
+
+    /**
+     * Drop the cached Markdown of every entry in a section, or of every entry
+     * when given no section.
+     */
+    public function invalidateSectionCache(?int $sectionId = null): void
+    {
+        TagDependency::invalidate(
+            Craft::$app->getCache(),
+            $sectionId !== null ? $this->getSectionCacheTag($sectionId) : self::CACHE_TAG,
+        );
+    }
+
+    private function getSectionCacheTag(?int $sectionId): string
+    {
+        return self::CACHE_TAG . ':section:' . ($sectionId ?? 'none');
+    }
+
+    /**
+     * Read per-section settings from the given project config subtree rather
+     * than Craft's in-memory copy, which a long-running queue worker loaded
+     * once at boot. See {@see IndexCacheService::refreshPluginConfig()}.
+     *
+     * @param array<string, array<string, mixed>> $sectionSettings Keyed by section UID, then site UID
+     */
+    public function useSectionSettings(array $sectionSettings): void
+    {
+        $this->_sectionSettings = $sectionSettings;
+    }
+
+    /**
+     * Check if a section is enabled for LLM output
+     */
+    public function isSectionEnabled(?int $sectionId, int $siteId): bool
+    {
+        // A nested entry belongs to a field, not a section, so it can never be
+        // enabled — there is nothing to toggle for it in the settings UI. Bail
+        // before the default-on fallback below, which is about sections that
+        // simply have no saved config yet.
+        if ($sectionId === null) {
+            return false;
+        }
+
+        $config = $this->getSectionConfig($sectionId, $siteId);
+
+        // If no config exists, the section is enabled by default
+        if ($config === null) {
+            return true;
+        }
+
+        return (bool) $config['enabled'];
+    }
+
+    /**
+     * Get cache key for an entry
+     */
+    public function getCacheKey(Entry $entry, Site $site): string
+    {
+        $dateUpdated = $entry->dateUpdated ? $entry->dateUpdated->getTimestamp() : '0';
+
+        return "llmready:{$site->id}:{$entry->id}:{$dateUpdated}";
+    }
+
+    /**
+     * Format an entry as a Markdown list item link with optional description
+     */
+    public function formatEntryLink(Entry $entry): ?string
+    {
+        // getUrl() is null for entries with no URI (entries used as globals or
+        // structural data, nested entries without a URI format). rtrim() would
+        // throw a TypeError on null before the guard below ever ran.
+        $url = rtrim($entry->getUrl() ?? '', '/');
+        if (!$url || $entry->uri === '__home__') {
+            return null;
+        }
+
+        $description = $this->getEntryDescription($entry);
+        if ($description) {
+            return "- [{$entry->title}]({$url}.md): {$description}";
+        }
+
+        return "- [{$entry->title}]({$url}.md)";
+    }
+
+    /**
+     * Get a brief description for an entry, for use in llms.txt and listing pages
+     */
+    public function getEntryDescription(Entry $entry, int $maxLength = 160): ?string
+    {
+        $settings = LlmReady::getInstance()->getSettings();
+
+        // Explicit setting wins outright — if it resolves to nothing, return
+        // null rather than silently guessing from another field.
+        if ($settings->descriptionField !== '') {
+            $text = $this->resolveExplicitField($entry, $settings->descriptionField);
+
+            if ($text === null) {
+                return null;
+            }
+
+            $text = $this->truncateText($text, $maxLength);
+
+            return mb_strlen($text) >= 10 ? $text : null;
+        }
+
+        // Auto-extract fallback: find the first text field with usable content
+        $text = null;
+        $fieldLayout = $entry->getFieldLayout();
+        if ($fieldLayout !== null) {
+            foreach ($fieldLayout->getCustomFields() as $field) {
+                $fieldClass = get_class($field);
+                if (FieldTypes::is($field, PlainText::class)
+                    || $fieldClass === 'craft\\ckeditor\\Field'
+                    || $fieldClass === 'craft\\redactor\\Field'
+                ) {
+                    $candidate = $this->getFieldText($entry, $field->handle);
+                    if ($candidate !== null && mb_strlen($candidate) >= 20) {
+                        $text = $candidate;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ($text === null) {
+            return null;
+        }
+
+        $text = $this->truncateText($text, $maxLength);
+
+        return mb_strlen($text) >= 10 ? $text : null;
+    }
+
+    /**
+     * Route a Description Field / Title Field value to either a plugin-specific
+     * resolver (e.g. `seomatic:description`) or the generic field/dot-notation
+     * path. Returns the plain-text result, or null if nothing resolved.
+     */
+    private function resolveExplicitField(Entry $entry, string $handle): ?string
+    {
+        if (str_starts_with($handle, 'seomatic:')) {
+            return $this->getSeomaticValue($entry, substr($handle, 9));
+        }
+
+        return $this->getFieldText($entry, $handle);
+    }
+
+    /**
+     * Resolve a SEOmatic meta value for an entry using SEOmatic's full
+     * fallback chain (per-entry override → section bundle → global bundle,
+     * with Twig token parsing).
+     *
+     * Safe no-op when SEOmatic isn't installed or the entry has no URI.
+     * Catches all exceptions so a misbehaving SEOmatic build can't break
+     * `/llms.txt`.
+     */
+    private function getSeomaticValue(Entry $entry, string $userKey): ?string
+    {
+        $seomaticKey = match ($userKey) {
+            'description' => 'seoDescription',
+            'og-description' => 'ogDescription',
+            'twitter-description' => 'twitterDescription',
+            'title' => 'seoTitle',
+            'og-title' => 'ogTitle',
+            'twitter-title' => 'twitterTitle',
+            default => null,
+        };
+
+        if ($seomaticKey === null) {
+            Craft::warning(
+                "LLM Ready: Unknown SEOmatic key '{$userKey}'. Use one of: description, og-description, twitter-description, title, og-title, twitter-title.",
+                __METHOD__,
+            );
+            return null;
+        }
+
+        try {
+            $meta = LlmReady::getInstance()->seoService->previewSeomaticMeta($entry);
+            if ($meta === null) {
+                return null;
+            }
+
+            $value = $meta->parsedValue($seomaticKey);
+            if (!is_string($value) || $value === '') {
+                return null;
+            }
+
+            return $this->normalizeText($value);
+        } catch (\Throwable $e) {
+            Craft::warning("LLM Ready: SEOmatic resolution failed for entry {$entry->id}: {$e->getMessage()}", __METHOD__);
+            return null;
+        }
+    }
+
+    /**
+     * Get plain text from a field value, stripping HTML if needed.
+     *
+     * Supports dot notation for traversing nested fields and sub-objects
+     * (e.g. `seo.seoDescription` for a ContentBlock sub-field, or
+     * `seo.description` for an Ether SEO field). Segments ending in `()` are
+     * treated as method calls (e.g. `metaData.getMetaDescription()` to call
+     * the resolver on a SEO Fields field rather than read the raw property).
+     * Falls back to property access when getFieldValue() can't resolve a
+     * handle, which covers Generated Fields and any other public properties.
+     */
+    private function getFieldText(Entry $entry, string $path): ?string
+    {
+        $path = trim($path);
+        if ($path === '') {
+            return null;
+        }
+
+        $segments = array_map('trim', explode('.', $path));
+        $cursor = $entry;
+        $lastIndex = count($segments) - 1;
+
+        foreach ($segments as $i => $segment) {
+            if ($segment === '') {
+                return null;
+            }
+
+            $value = $this->resolveHandle($cursor, $segment);
+            if ($value === null) {
+                return null;
+            }
+
+            if ($i < $lastIndex) {
+                // Must descend into another object to keep traversing
+                if (!is_object($value)) {
+                    return null;
+                }
+                $cursor = $value;
+                continue;
+            }
+
+            // Final segment — coerce to string
+            if (is_object($value) && method_exists($value, '__toString')) {
+                $value = (string) $value;
+            }
+            if (!is_string($value)) {
+                return null;
+            }
+
+            return $this->normalizeText($value);
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve a single handle on an owner.
+     *
+     * A handle ending in `()` is treated as a no-argument method call —
+     * useful for plugins whose resolved description lives behind a getter
+     * that's shadowed by a same-named public property (e.g. SEO Fields'
+     * `getMetaDescription()` vs. raw `$metaDescription`).
+     *
+     * Otherwise: try getFieldValue() for elements (custom fields), then
+     * property access (Generated Fields, public properties, Yii __get magic).
+     */
+    private function resolveHandle(object $owner, string $handle): mixed
+    {
+        if (str_ends_with($handle, '()')) {
+            $method = substr($handle, 0, -2);
+            if (!preg_match('/^[a-zA-Z_]\w*$/', $method) || !method_exists($owner, $method)) {
+                return null;
+            }
+            try {
+                return $owner->$method();
+            } catch (\Throwable $e) {
+                Craft::warning(
+                    "LLM Ready: {$method}() on " . get_class($owner) . " threw: {$e->getMessage()}",
+                    __METHOD__,
+                );
+                return null;
+            }
+        }
+
+        if ($owner instanceof ElementInterface) {
+            try {
+                return $owner->getFieldValue($handle);
+            } catch (\Throwable) {
+                // Not a custom field — try property access below.
+            }
+        }
+
+        if (isset($owner->$handle)) {
+            return $owner->$handle;
+        }
+
+        return null;
+    }
+
+    /**
+     * Truncate text at a sentence or word boundary
+     */
+    private function truncateText(string $text, int $maxLength): string
+    {
+        if (mb_strlen($text) <= $maxLength) {
+            return $text;
+        }
+
+        // Try to end at a sentence boundary within the first $maxLength chars
+        $substring = mb_substr($text, 0, $maxLength);
+        $lastSentence = mb_strrpos($substring, '. ');
+        if ($lastSentence !== false && $lastSentence >= (int) ($maxLength * 0.6)) {
+            return mb_substr($text, 0, $lastSentence + 1);
+        }
+
+        // Otherwise truncate at the last word boundary
+        $lastSpace = mb_strrpos($substring, ' ');
+        if ($lastSpace !== false) {
+            return mb_substr($text, 0, $lastSpace) . '...';
+        }
+
+        return $substring . '...';
+    }
+
+    /**
+     * Invalidate cache for a specific entry across all sites
+     */
+    public function invalidateEntryCache(Entry $entry, bool $deleted = false): void
+    {
+        $sites = Craft::$app->getSites()->getAllSites();
+        $cache = Craft::$app->getCache();
+
+        foreach ($sites as $site) {
+            $cacheKey = $this->getCacheKey($entry, $site);
+            $cache->delete($cacheKey);
+        }
+
+        // /llms.txt and the entry's listing page are rebuilt in the
+        // background. Drafts and revisions appear in neither, and an
+        // autosaving draft would otherwise queue a rebuild every few seconds.
+        // An entry that is no longer live comes out of the stored copies
+        // now rather than at the rebuild.
+        if (!ElementHelper::isDraftOrRevision($entry)) {
+            $indexCacheService = LlmReady::getInstance()->indexCacheService;
+            $indexCacheService->removeEntry($entry, $deleted);
+            $indexCacheService->markStale($entry->sectionId);
+        }
+    }
+}

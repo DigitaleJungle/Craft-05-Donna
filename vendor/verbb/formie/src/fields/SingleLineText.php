@@ -1,0 +1,330 @@
+<?php
+namespace verbb\formie\fields;
+
+use verbb\formie\base\Field;
+use verbb\formie\base\PreviewableFieldInterface;
+use verbb\formie\base\SortableFieldInterface;
+use verbb\formie\elements\Submission;
+use verbb\formie\fields\coercion\StringValueCoercer;
+use verbb\formie\fields\conditions\TextFieldConditionRule;
+use verbb\formie\fields\definitions\FieldReferenceValue;
+use verbb\formie\fields\definitions\FieldValueType;
+use verbb\formie\fields\traits\AutocompleteFieldTrait;
+use verbb\formie\fields\traits\TextLimitFieldTrait;
+use verbb\formie\fields\traits\UniqueValueFieldTrait;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\Variables;
+use verbb\formie\models\SlotTag;
+use verbb\formie\references\ReferenceType;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\helpers\Json;
+
+class SingleLineText extends Field implements SortableFieldInterface, PreviewableFieldInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Single-line Text');
+    }
+
+    public static function getSvgIconPath(): string
+    {
+        return 'formie/_formfields/single-line-text/icon.svg';
+    }
+
+    public static function supportsGqlConfigProvider(): bool
+    {
+        return true;
+    }
+
+    public static function compatibleFieldTypes(): array
+    {
+        return [
+            Email::class,
+        ];
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_UNIQUE_QUERY = 'modifyUniqueQuery';
+
+
+    // Traits
+    // =========================================================================
+
+    use AutocompleteFieldTrait;
+    use TextLimitFieldTrait;
+    use UniqueValueFieldTrait;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function fieldKind(): string
+    {
+        return self::KIND_TEXT;
+    }
+
+    public function normalizeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        return (string)parent::normalizeValue(is_scalar($value) || $value === null ? $value : Json::encode($value), $element);
+    }
+
+    public function getElementConditionRuleType(): ?string
+    {
+        return TextFieldConditionRule::class;
+    }
+
+    public function getElementValidationRules(): array
+    {
+        $rules = parent::getElementValidationRules();
+
+        foreach ($this->getTextLimitElementValidationRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        foreach ($this->getUniqueValueElementValidationRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        return $rules;
+    }
+
+    public function defineFormBuilderPreviewSchema(): array
+    {
+        return [
+            SchemaHelper::previewInput(),
+        ];
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return array_merge(
+            parent::getSettingGqlTypes(),
+            $this->defineAutocompleteGqlType(),
+            $this->defineTextLimitGqlType(),
+            $this->defineUniqueValueGqlType(),
+        );
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::labelField(),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Placeholder'),
+                'instructions' => Craft::t('formie', 'The text that will be shown if the field doesn’t have a value.'),
+                'name' => 'placeholder',
+            ]),
+            SchemaHelper::variableTextField([
+                'label' => Craft::t('formie', 'Default Value'),
+                'instructions' => Craft::t('formie', 'Set a default value for the field when it doesn’t have a value.'),
+                'name' => 'defaultValue',
+                'variableConfig' => [
+                    'shapes' => ['inline'],
+                    'types' => [Variables::TYPE_TEXT],
+                    'groups' => [
+                        Variables::STATIC_FORM,
+                        Variables::STATIC_GENERAL,
+                        Variables::STATIC_SITE,
+                    ],
+                ],
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderSettingsSchema(): array
+    {
+        return [
+            SchemaHelper::prefillQueryParam(),
+            $this->defineAutocompleteSettingSchema(),
+            SchemaHelper::includeInEmailFieldSummariesField(),
+        ];
+    }
+
+    public function defineFormBuilderValidationSchema(): array
+    {
+        return [
+            SchemaHelper::requiredField(),
+            SchemaHelper::requiredValidationMessage(),
+            ...$this->defineTextLimitValidationSchema(),
+            SchemaHelper::matchField([
+                'includedTypes' => [self::class],
+            ]),
+            SchemaHelper::matchValidationMessage(),
+            ...$this->defineUniqueValueValidationSchema(),
+        ];
+    }
+
+    public function defineFormBuilderAppearanceSchema(): array
+    {
+        return [
+            SchemaHelper::visibility(),
+            SchemaHelper::labelPosition($this),
+            SchemaHelper::instructions(),
+            SchemaHelper::instructionsPosition($this),
+            SchemaHelper::errorMessagePosition($this),
+        ];
+    }
+
+    public function defineFormBuilderAdvancedSchema(): array
+    {
+        return [
+            SchemaHelper::handleField(),
+            SchemaHelper::cssClasses(),
+            SchemaHelper::containerAttributesField(),
+            SchemaHelper::inputAttributesField(),
+            SchemaHelper::enableContentEncryptionField(),
+        ];
+    }
+
+    public function defineFormBuilderConditionsSchema(): array
+    {
+        return [
+            SchemaHelper::enableConditionsField(),
+            SchemaHelper::conditionsField(),
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineValueType(): FieldValueType
+    {
+        return FieldValueType::string();
+    }
+
+    protected function supportedDefaults(): array
+    {
+        return ['autocomplete'];
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        foreach ($this->defineAutocompleteRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        foreach ($this->defineTextLimitRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        foreach ($this->defineUniqueValueRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        return $rules;
+    }
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        $form = $context->form;
+        $errors = $context->errors;
+
+        $id = $this->getHtmlId($form);
+        $dataId = $this->getHtmlDataId($form);
+
+        if ($key === 'fieldInput') {
+            $value = $context->get('value');
+            // Gateway SDKs own these inputs; raw card details must not enter FormData.
+            $omitName = $this->getParentField() instanceof Payment && ($this->getInputAttributes()['name'] ?? null) === false;
+
+            return SlotTag::make('input')
+                ->core($this->applyTextLimitInputAttributes([
+                    // Input attributes can set the type, such as a password on a Craft login form.
+                    'type' => ($this->getInputAttributes()['type'] ?? null) ?: 'text',
+                    'id' => $id,
+                    'name' => $omitName ? null : $this->getHtmlName(),
+                    'value' => $value ?? false,
+                    'placeholder' => $this->placeholder ?: null,
+                    'required' => $this->required ? true : null,
+                    'data-formie-input' => true,
+                    'data-formie-single-line-text-input' => true,
+                    'data-formie-input-id' => $dataId,
+                    'data-formie-input-type' => 'text',
+                    'data-formie-input-error-state' => $errors ? true : false,
+                    'autocomplete' => $this->getAutocompleteCoreAttribute(),
+                    'aria-describedby' => $this->hasInstructions() ? "{$id}-instructions" : null,
+                ]))
+                ->theme([
+                    'class' => [
+                        'formie-input',
+                        'formie-single-line-text-input',
+                        $errors ? 'formie-input-error' : false,
+                    ],
+                ])
+                ->instanceAttributes($this->getInputAttributes());
+        }
+
+        if ($textLimitTag = $this->defineTextLimitFieldSlotTag($key, $context)) {
+            return $textLimitTag;
+        }
+
+        return parent::defineSlotTag($key, $context);
+    }
+
+    protected function defineValueForCondition(mixed $value, Submission $submission): mixed
+    {
+        return StringValueCoercer::forCondition($value);
+    }
+
+    protected function defineSubmissionHtml(mixed $value, ?ElementInterface $element, bool $inline): string
+    {
+        return Craft::$app->getView()->renderTemplate('formie/_formfields/single-line-text/input', [
+            'name' => $this->handle,
+            'value' => $value,
+            'field' => $this,
+            'textLimitConfig' => $this->getTextLimitBrowserConfig(true),
+        ]);
+    }
+
+    protected function defineValueAsString(mixed $value, ElementInterface $element = null): string
+    {
+        return StringValueCoercer::asString($value);
+    }
+
+    protected function defineValueAsData(mixed $value, ElementInterface $element = null): mixed
+    {
+        return StringValueCoercer::asString($value);
+    }
+
+    protected function defineReferenceValues(): array
+    {
+        return [
+            FieldReferenceValue::primary(types: [ReferenceType::Text]),
+        ];
+    }
+
+    protected function supportsPlainTextHtmlSanitization(): bool
+    {
+        return true;
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        return array_merge(parent::defineClientRenderedInput(), $this->getTextLimitClientRenderedInput(), [
+            'inputType' => 'text',
+        ]);
+    }
+
+    protected function defineBrowserModules(): array
+    {
+        $modules = parent::defineBrowserModules();
+
+        foreach ($this->defineTextLimitBrowserModules() as $module) {
+            $modules[] = $module;
+        }
+
+        return $modules;
+    }
+}

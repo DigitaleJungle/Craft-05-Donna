@@ -1,0 +1,577 @@
+<?php
+namespace verbb\formie\integrations\payments;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Payment;
+use verbb\formie\elements\Submission;
+use verbb\formie\enums\PaymentResumeMode;
+use verbb\formie\events\ModifyPaymentPayloadEvent;
+use verbb\formie\fields;
+use verbb\formie\fields\Calculations;
+use verbb\formie\fields\Dropdown;
+use verbb\formie\fields\Hidden;
+use verbb\formie\fields\Number;
+use verbb\formie\fields\Radio;
+use verbb\formie\fields\SingleLineText;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\DeliveryAttempt;
+use verbb\formie\helpers\PaymentAttempt;
+use verbb\formie\helpers\References;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\BrowserModule;
+use verbb\formie\models\BrowserModuleContext;
+use verbb\formie\models\Payment as PaymentModel;
+use verbb\formie\models\PaymentAction;
+use verbb\formie\models\PaymentDecision;
+use verbb\formie\models\PaymentMoney;
+
+use Craft;
+use craft\helpers\App;
+use craft\web\Response;
+
+use yii\base\Event;
+
+use Exception;
+use Throwable;
+
+use GuzzleHttp\Client;
+use Money\Currencies\ISOCurrencies;
+use Money\Currency;
+
+class Paddle extends Payment
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Paddle';
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_PAYLOAD = 'modifyPayload';
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    public ?string $clientSideToken = null;
+    public bool|string $useSandbox = false;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Provide payment capabilities for your forms with {name}.', ['name' => static::displayName()]);
+    }
+
+    public function hasValidSettings(): bool
+    {
+        return App::parseEnv($this->apiKey) && App::parseEnv($this->clientSideToken);
+    }
+
+    public function getBrowserModule(BrowserModuleContext $context): ?BrowserModule
+    {
+        if (!$this->hasValidSettings()) {
+            return null;
+        }
+
+        $this->setField($context->field);
+        $useSandbox = App::parseBooleanEnv($this->useSandbox);
+
+        return new BrowserModule([
+            'moduleId' => 'formie:paddle',
+            'surfaces' => [BrowserModule::SURFACE_SERVER_RENDERED, BrowserModule::SURFACE_CLIENT_RENDERED],
+            'config' => [
+                'clientSideToken' => App::parseEnv($this->clientSideToken),
+                'environment' => $useSandbox ? 'sandbox' : 'production',
+                'requiredInputSuffixes' => [],
+                'waitForValueMs' => 2500,
+            ],
+        ]);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'event-types');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::comboboxField([
+                'label' => Craft::t('formie', 'Payment Currency'),
+                'instructions' => Craft::t('formie', 'Provide the currency to be used for the transaction.'),
+                'name' => 'currency',
+                'required' => true,
+                'placeholder' => Craft::t('formie', 'Select an option'),
+                'options' => static::getCurrencyOptions(),
+            ]),
+            SchemaHelper::fieldWrap([
+                'label' => Craft::t('formie', 'Payment Amount'),
+                'instructions' => Craft::t('formie', 'Provide an amount for the transaction. This can be either a fixed value, or derived from a field.'),
+                'required' => true,
+                'children' => [
+                    SchemaHelper::selectField([
+                        'name' => 'amountType',
+                        'required' => true,
+                        'options' => [
+                            ['label' => Craft::t('formie', 'Fixed Value'), 'value' => Payment::VALUE_TYPE_FIXED],
+                            ['label' => Craft::t('formie', 'Dynamic Value'), 'value' => Payment::VALUE_TYPE_DYNAMIC],
+                        ],
+                    ]),
+                    SchemaHelper::numberField([
+                        'name' => 'amountFixed',
+                        'required' => true,
+                        'size' => 6,
+                        'if' => 'amountType == "' . Payment::VALUE_TYPE_FIXED . '"',
+                    ]),
+                    SchemaHelper::fieldSelectField([
+                        'name' => 'amountVariable',
+                        'referenceContext' => 'client',
+                        'includeSelectors' => false,
+                        'topLevelOnly' => true,
+                        'required' => true,
+                        'fieldTypes' => [
+                            Calculations::class,
+                            Dropdown::class,
+                            Hidden::class,
+                            Number::class,
+                            Radio::class,
+                            SingleLineText::class,
+                        ],
+                        'if' => 'amountType == "' . Payment::VALUE_TYPE_DYNAMIC . '"',
+                    ]),
+                ],
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderSettingsSchema(): array
+    {
+        return [
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Product Description'),
+                'instructions' => Craft::t('formie', 'Enter a description for the product as shown in checkout.'),
+                'name' => 'orderDescription',
+            ]),
+            SchemaHelper::staticTableField([
+                'label' => Craft::t('formie', 'Billing Details'),
+                'instructions' => Craft::t('formie', 'Whether to send billing details alongside the payment.'),
+                'name' => 'billingDetails',
+                'columns' => [
+                    'heading' => [
+                        'type' => 'heading',
+                        'heading' => Craft::t('formie', 'Billing Info'),
+                    ],
+                    'value' => [
+                        'type' => 'fieldSelect',
+                        'label' => Craft::t('formie', 'Field'),
+                    ],
+                ],
+                'rows' => [
+                    'billingName' => [
+                        'heading' => Craft::t('formie', 'Billing Name'),
+                        'value' => '',
+                    ],
+                    'billingEmail' => [
+                        'heading' => Craft::t('formie', 'Billing Email'),
+                        'value' => '',
+                    ],
+                    'billingAddress' => [
+                        'heading' => Craft::t('formie', 'Billing Address'),
+                        'value' => '',
+                    ],
+                ],
+            ]),
+            SchemaHelper::tableField([
+                'label' => Craft::t('formie', 'Metadata'),
+                'instructions' => Craft::t('formie', 'Add any additional metadata to store against a transaction.'),
+                'name' => 'metadata',
+                'columns' => [
+                    [
+                        'name' => 'label',
+                        'type' => 'label',
+                        'label' => Craft::t('formie', 'Option'),
+                    ],
+                    [
+                        'name' => 'value',
+                        'type' => 'value',
+                        'label' => Craft::t('formie', 'Value'),
+                    ],
+                ],
+            ]),
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function refreshPaymentState(PaymentModel $payment): void
+    {
+        if ($payment->integrationId !== $this->id || !$payment->reference) {
+            throw new Exception('Invalid Paddle payment.');
+        }
+
+        $transaction = $this->request('GET', 'transactions/' . rawurlencode($payment->reference))['data'] ?? [];
+        $this->_verifyTransaction($payment, $transaction);
+        $payment->response = $transaction;
+        $payment->status = match ($transaction['status'] ?? null) {
+            'paid', 'completed' => PaymentModel::STATUS_SUCCEEDED,
+            'canceled' => PaymentModel::STATUS_CANCELLED,
+            'draft', 'ready', 'billed', 'past_due' => PaymentModel::STATUS_PENDING,
+            default => PaymentModel::STATUS_UNKNOWN,
+        };
+
+        if (!Formie::$plugin->getPayments()->savePayment($payment)) {
+            throw new Exception('Unable to save the verified Paddle payment.');
+        }
+    }
+
+    protected function executePayment(Submission $submission): PaymentDecision
+    {
+
+        return PaymentAttempt::run(
+            $this,
+            $submission,
+            $this->getPaymentAmount($submission),
+            $this->getFieldSetting('currency'),
+            [
+            'apiKey' => $this->apiKey,
+            'useSandbox' => $this->useSandbox,
+        ],
+            fn(PaymentModel $payment, PaymentAttempt $attempt) => $this->_processCheckout($submission, $payment, $attempt),
+            allowCreate: !$this->getPaymentFieldPayload($submission)->array('paddleCheckoutData'),
+        );
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey', 'clientSideToken'], 'required'];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        $useSandbox = App::parseBooleanEnv($this->useSandbox);
+        $baseUri = $useSandbox ? 'https://sandbox-api.paddle.com/' : 'https://api.paddle.com/';
+
+
+        return Craft::createGuzzleClient([
+            'base_uri' => $baseUri,
+            'headers' => [
+                'Authorization' => 'Bearer ' . App::parseEnv($this->apiKey),
+            ],
+        ]);
+    }
+
+    protected function definePaymentFieldSettingsDefaults(): array
+    {
+        $defaults = [
+            'amountType' => self::VALUE_TYPE_FIXED,
+        ];
+
+        return $defaults;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _processCheckout(Submission $submission, PaymentModel $payment, PaymentAttempt $attempt): PaymentDecision
+    {
+        $field = $this->getField();
+        $paymentPayload = $this->getPaymentFieldPayload($submission);
+
+        // Get the amount from the field, which handles dynamic fields
+        $amount = $payment->amount;
+        $currency = $this->getFieldSetting('currency');
+
+        // Check if we're initializing the payment
+        $paddleCheckoutData = $paymentPayload->array('paddleCheckoutData');
+        $hasCheckoutData = !empty($paddleCheckoutData);
+
+        $payments = Formie::$plugin->getPayments();
+
+        if ($hasCheckoutData) {
+            // Checkout events are an untrusted hint. Only the transaction created
+            // on our server for this submission may complete its payment.
+            $transactionId = $paddleCheckoutData['transaction_id'] ?? null;
+
+            if (!$payment || !$payment->reference || !is_string($transactionId) || $transactionId !== $payment->reference) {
+                throw new Exception('Paddle checkout does not match the saved payment.');
+            }
+
+            $this->refreshPayment($payment);
+
+            return match ($payment->status) {
+                PaymentModel::STATUS_SUCCEEDED => PaymentDecision::succeeded($this->handle, $payment->reference),
+                PaymentModel::STATUS_CANCELLED => PaymentDecision::cancelled(null, $this->handle, $payment->reference),
+                PaymentModel::STATUS_PENDING => PaymentDecision::pending(null, $this->handle, $payment->reference),
+                default => PaymentDecision::unknown(null, $this->handle, $payment->reference),
+            };
+        }
+
+        if ($payment?->status === PaymentModel::STATUS_SUCCEEDED) {
+            return PaymentDecision::succeeded($this->handle, $payment->reference);
+        }
+
+        // Save the local owner before creating a provider checkout. Repeated
+        // initialization reuses its transaction instead of adding new charges.
+        $payment->status = PaymentModel::STATUS_PENDING;
+
+        // Save the payment now, to pass on to Paddle
+        if (!$payments->savePayment($payment)) {
+            throw new Exception('Unable to save the pending Paddle payment.');
+        }
+
+        if ($payment->reference) {
+            $payload = $payment->response['checkout'] ?? ['transactionId' => $payment->reference];
+        } else {
+
+            $items = $this->_getOrCreateProducts($submission, $payment);
+
+            $payload = [
+                'items' => $items,
+                'customData' => [
+                    'formiePaymentUId' => $payment->id,
+                ],
+                'customer' => [],
+            ];
+
+            // Add in extra settings configured at the field level
+            $this->_setPayloadDetails($payload, $submission);
+
+            // Raise a `modifySinglePayload` event
+            $event = new ModifyPaymentPayloadEvent([
+                'integration' => $this,
+                'submission' => $submission,
+                'payload' => $payload,
+            ]);
+            $this->trigger(self::EVENT_MODIFY_PAYLOAD, $event);
+
+            $payload = $event->payload;
+            $transactionPayload = [
+                'items' => array_map(static fn(array $item): array => [
+                    'price_id' => $item['priceId'],
+                    'quantity' => $item['quantity'],
+                ], $payload['items']),
+                'currency_code' => $currency,
+                'collection_mode' => 'automatic',
+                'custom_data' => $payload['customData'],
+            ];
+            $transaction = $attempt->request(
+                $transactionPayload,
+                fn() => $this->request('POST', 'transactions', ['json' => $transactionPayload])['data'] ?? [],
+                static fn(array $transaction) => $transaction['id'] ?? null,
+            );
+            $reference = $transaction['id'] ?? null;
+
+            if (!is_string($reference) || !preg_match('/^txn_[a-z0-9]{26}$/', $reference)) {
+                throw new Exception('Paddle did not return a transaction reference.');
+            }
+
+            // Persist the provider reference before the browser can pay it.
+            // Custom data sent by Paddle.js is never used as authorization.
+            unset($payload['items'], $payload['customData']);
+            $payload['transactionId'] = $reference;
+            $payment->reference = $reference;
+            $payment->response = ['checkout' => $payload];
+
+            if (!$payments->savePayment($payment)) {
+                throw new Exception('Unable to save the Paddle checkout reference.');
+            }
+        }
+
+
+        return PaymentDecision::requiresAction(
+            $payment->reference,
+            PaymentAction::initialize(
+                provider: $this->handle,
+                event: 'formie:payment:paddle:initialize',
+                message: Craft::t('formie', 'Please wait while payment data is initialized.'),
+                payload: $payload,
+                resumeMode: PaymentResumeMode::RESUBMIT,
+            )
+        );
+    }
+
+    private function _verifyTransaction(PaymentModel $payment, array $transaction): void
+    {
+        $total = $transaction['details']['totals']['total'] ?? null;
+        $items = $transaction['items'] ?? [];
+        $price = $items[0]['price']['unit_price'] ?? [];
+        $expected = $this->_minorAmount($payment->amount, $payment->currency);
+
+        if (($transaction['id'] ?? null) !== $payment->reference
+            || ($transaction['currency_code'] ?? null) !== $payment->currency
+            || !is_array($items) || count($items) !== 1
+            || ($items[0]['quantity'] ?? null) !== 1
+            || ($price['currency_code'] ?? null) !== $payment->currency
+            || (string)($price['amount'] ?? '') !== $expected
+            || !is_string($total) || !ctype_digit($total)
+            // Paddle may add tax to the configured price; it may not collect less.
+            || bccomp((string)$total, (string)$expected, 0) < 0) {
+            throw new Exception('Paddle has not verified the expected payment.');
+        }
+    }
+
+    private function _minorAmount(string|int|float $amount, string $currency): string
+    {
+        $digits = (new ISOCurrencies())->subunitFor(new Currency($currency));
+
+        return PaymentMoney::fromDecimal((string)$amount, $currency)->minor;
+    }
+
+    private function _setPayloadDetails(array &$payload, Submission $submission): void
+    {
+        $field = $this->getField();
+
+        // Add a few other things about the customer from mapping (in field settings)
+        $billingName = $this->getPaymentBillingFieldKey('billingName');
+        $billingAddress = $this->getPaymentBillingFieldKey('billingAddress');
+        $billingEmail = $this->getPaymentBillingFieldKey('billingEmail');
+
+        if ($billingName && ($billingNameValue = $submission->getFieldValueAsString($billingName))) {
+            $payload['customer']['business']['name'] = $billingNameValue;
+        }
+
+        if ($billingAddress && ($address = $submission->getFieldValueAsData($billingAddress)) && is_array($address)) {
+            $payload['customer']['address']['firstLine'] = ArrayHelper::remove($address, 'address1');
+            $payload['customer']['address']['city'] = ArrayHelper::remove($address, 'city');
+            $payload['customer']['address']['postalCode'] = ArrayHelper::remove($address, 'zip');
+            $payload['customer']['address']['region'] = ArrayHelper::remove($address, 'state');
+            $payload['customer']['address']['countryCode'] = ArrayHelper::remove($address, 'country');
+        }
+
+        if ($billingEmail && ($billingEmailValue = $submission->getFieldValueAsString($billingEmail))) {
+            $payload['customer']['email'] = $billingEmailValue;
+        }
+
+        $metadata = $this->getFieldSetting('metadata', []);
+
+        // Always attach Formie identifiers so webhooks, support debugging, and
+        // payment replays can map Paddle activity back to the originating field.
+        $payload['customData']['submissionId'] = $submission->id;
+        $payload['customData']['fieldId'] = $field->id;
+        $payload['customData']['formHandle'] = $submission->getForm()->handle;
+
+        if ($metadata) {
+            foreach ($metadata as $option) {
+                $label = trim($option['label']);
+                $value = trim($option['value']);
+
+                if ($label && $value) {
+                    $payload['customData'][$label] = References::parseContent($value, $submission);
+                }
+            }
+        }
+
+    }
+
+    private function _getOrCreateProducts(Submission $submission, PaymentModel $payment): mixed
+    {
+        $field = $this->getField();
+        $orderDescription = $this->getFieldSetting('orderDescription', 'Formie: ' . $submission->getForm()->title);
+
+        // Get the amount from the field, which handles dynamic fields
+        $amount = $this->getPaymentAmount($submission);
+        $currency = $this->getFieldSetting('currency');
+
+        $payload = [
+            'amount' => $amount,
+            'currency' => $currency,
+        ];
+
+        // Create a unique ID for this form+field+payload. Only used internally, but prevents creating duplicate plans (which throws an error)
+        $payload['id'] = ArrayHelper::recursiveImplode(array_merge(['formie', $submission->getForm()->handle, $field->handle], $payload), '_');
+        $payload['id'] = str_replace([' ', ':'], ['_', ''], $payload['id']);
+
+        // Generate a nice name for the price description based on the payload. Added after the ID is generated based on the payload
+        $payload['nickname'] = implode(' ', [
+            $orderDescription,
+            $amount,
+            $currency,
+        ]);
+
+        // Create the product - no means to query by a custom ID via Paddle yet
+        $priceId = $this->_createProduct($payload, $payment);
+
+        return [
+            [
+                'priceId' => $priceId,
+                'quantity' => 1,
+            ]
+        ];
+    }
+
+    private function _createResourceOnce(PaymentModel $payment, string $resource, array $payload): array
+    {
+        $attempt = new DeliveryAttempt((int)$payment->submissionId, 'paddle.' . $this->id . '.' . $resource, (string)$payment->uid);
+
+        return $attempt->execute(
+            $payload,
+            fn() => $this->request('POST', $resource, ['json' => $payload]),
+            reference: static fn(array $response) => $response['data']['id'] ?? '',
+            reconcile: fn(string $id) => $this->request('GET', $resource . '/' . rawurlencode($id)),
+        );
+    }
+
+    private function _createProduct(array $payload, PaymentModel $payment)
+    {
+        $productResponse = $this->_createResourceOnce($payment, 'products', [
+                'name' => $payload['nickname'],
+                'type' => 'custom',
+                'tax_category' => 'standard',
+                'custom_data' => [
+                    'id' => $payload['id'],
+                ],
+        ]);
+
+        $product = $productResponse['data'] ?? null;
+
+        if (!$product || !isset($product['id'])) {
+            throw new Exception('Failed to create Paddle product.');
+        }
+
+        $priceResponse = $this->_createResourceOnce($payment, 'prices', [
+                'type' => 'custom',
+                'product_id' => $product['id'],
+                'description' => $payload['nickname'],
+                'unit_price' => [
+                    'amount' => $this->_minorAmount($payload['amount'], $payload['currency']),
+                    'currency_code' => $payload['currency'],
+                ],
+        ]);
+
+        $price = $priceResponse['data'] ?? null;
+
+        if (!$price || !isset($price['id'])) {
+            throw new Exception('Failed to create Paddle price.');
+        }
+
+        return $price['id'];
+    }
+}

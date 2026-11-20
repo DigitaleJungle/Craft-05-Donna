@@ -1,0 +1,185 @@
+{
+    "notifications":[
+        {
+            "attachFiles":true,
+            "content":"[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"A user submission has been made on the \\\"\"},{\"type\":\"variableTag\",\"attrs\":{\"label\":\"Form Name\",\"value\":\"{formName}\"}},{\"type\":\"text\",\"text\":\"\\\" form on \"},{\"type\":\"variableTag\",\"attrs\":{\"label\":\"Site Name\",\"value\":\"{siteName}\"}},{\"type\":\"text\",\"text\":\" at \"},{\"type\":\"variableTag\",\"attrs\":{\"label\":\"Timestamp (yyyy-mm-dd hh:mm:ss)\",\"value\":\"{timestamp}\"}}]},{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Their submission details are:\"}]},{\"type\":\"paragraph\",\"content\":[{\"type\":\"variableTag\",\"attrs\":{\"label\":\"All Form Fields\",\"value\":\"{allFields}\"}}]}]",
+            "enabled":true,
+            "name":"Admin Notification",
+            "replyTo":"{field:b2c3d4e5-f6a7-8901-b234-567890abcdef}",
+            "subject":"A new submission was made on \"{formName}\"",
+            "to":"{systemEmail}"
+        },
+        {
+            "attachFiles":true,
+            "content":"[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Thanks again for contacting us. Our team will get back to you as soon as we can.\"}]},{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"As a reminder, you submitted the following details at \"},{\"type\":\"variableTag\",\"attrs\":{\"label\":\"Timestamp (yyyy-mm-dd hh:mm:ss)\",\"value\":\"{timestamp}\"}}]},{\"type\":\"paragraph\",\"content\":[{\"type\":\"variableTag\",\"attrs\":{\"label\":\"All Form Fields\",\"value\":\"{allFields}\"}}]}]",
+            "enabled":true,
+            "name":"User Notification",
+            "replyTo":null,
+            "subject":"Thanks for contacting us!",
+            "to":"{field:b2c3d4e5-f6a7-8901-b234-567890abcdef}"
+        }
+    ],
+    "pages":[
+        {
+            "label":"Page 1",
+            "settings":{
+                "submitButtonLabel":"Contact us",
+                "backButtonLabel":"Back",
+                "showBackButton":false,
+                "saveButtonLabel":"Save",
+                "showSaveButton":false,
+                "saveButtonStyle":"link",
+                "buttonsPosition":"left"
+            },
+            "rows":[
+                {
+                    "fields":[
+                        {
+                            "type":"verbb\\formie\\fields\\Name",
+                            "reference":"f8a3c2d1-4e5b-6a7c-8d9e-0f1a2b3c4d5e",
+                            "settings":{
+                                "useMultipleFields":true,
+                                "instructions":"Please enter your full name.",
+                                "enabled":true,
+                                "required":false,
+                                "placeholder":"Your name",
+                                "labelPosition":"verbb\\formie\\positions\\Hidden",
+                                "instructionsPosition":"verbb\\formie\\positions\\AboveInput",
+                                "label":"Your Name",
+                                "handle":"yourName",
+                                "rows":[
+                                    {
+                                        "fields":[
+                                            {
+                                                "type":"verbb\\formie\\fields\\subfields\\NamePrefix",
+                                                "reference":"a1b2c3d4-e5f6-7890-a111-111111111111",
+                                                "settings":{
+                                                    "enabled":false,
+                                                    "required":false,
+                                                    "inputAttributes":[
+                                                        {
+                                                            "label":"autocomplete",
+                                                            "value":"honorific-prefix"
+                                                        }
+                                                    ],
+                                                    "options":[
+                                                        {
+                                                            "label":"Select an option",
+                                                            "value":"",
+                                                            "isDefault":true,
+                                                            "isOptgroup":false
+                                                        }
+                                                    ],
+                                                    "label":"Prefix",
+                                                    "handle":"prefix"
+                                                }
+                                            },
+                                            {
+                                                "type":"verbb\\formie\\fields\\subfields\\NameFirst",
+                                                "reference":"a1b2c3d4-e5f6-7890-a222-222222222222",
+                                                "settings":{
+                                                    "enabled":true,
+                                                    "required":true,
+                                                    "placeholder":"e.g. Peter",
+                                                    "inputAttributes":[
+                                                        {
+                                                            "label":"autocomplete",
+                                                            "value":"given-name"
+                                                        }
+                                                    ],
+                                                    "label":"First Name",
+                                                    "handle":"firstName"
+                                                }
+                                            },
+                                            {
+                                                "type":"verbb\\formie\\fields\\subfields\\NameMiddle",
+                                                "reference":"a1b2c3d4-e5f6-7890-a333-333333333333",
+                                                "settings":{
+                                                    "enabled":false,
+                                                    "required":false,
+                                                    "inputAttributes":[
+                                                        {
+                                                            "label":"autocomplete",
+                                                            "value":"additional-name"
+                                                        }
+                                                    ],
+                                                    "label":"Middle Name",
+                                                    "handle":"middleName"
+                                                }
+                                            },
+                                            {
+                                                "type":"verbb\\formie\\fields\\subfields\\NameLast",
+                                                "reference":"a1b2c3d4-e5f6-7890-a444-444444444444",
+                                                "settings":{
+                                                    "enabled":true,
+                                                    "required":true,
+                                                    "placeholder":"e.g. Sherman",
+                                                    "inputAttributes":[
+                                                        {
+                                                            "label":"autocomplete",
+                                                            "value":"family-name"
+                                                        }
+                                                    ],
+                                                    "label":"Last Name",
+                                                    "handle":"lastName"
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "fields":[
+                        {
+                            "type":"verbb\\formie\\fields\\Email",
+                            "reference":"b2c3d4e5-f6a7-8901-b234-567890abcdef",
+                            "settings":{
+                                "instructions":"Please enter your email so we can get in touch.",
+                                "enabled":true,
+                                "required":true,
+                                "placeholder":"e.g. psherman@wallaby.com",
+                                "label":"Email Address",
+                                "handle":"emailAddress"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "fields":[
+                        {
+                            "type":"verbb\\formie\\fields\\MultiLineText",
+                            "reference":"c3d4e5f6-a7b8-9012-c345-678901bcdefa",
+                            "settings":{
+                                "instructions":"Please enter your comments.",
+                                "enabled":true,
+                                "required":true,
+                                "placeholder":"e.g. The reason for my enquiry is...",
+                                "label":"Message",
+                                "handle":"message"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "settings":{
+        "defaultInstructionsPosition":"verbb\\formie\\positions\\AboveInput",
+        "defaultLabelPosition":"verbb\\formie\\positions\\AboveInput",
+        "errorMessage":"[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Couldn’t save submission due to errors.\"}]}]",
+        "errorMessagePosition":"top-form",
+        "loadingIndicator":"spinner",
+        "progressPosition":"end",
+        "progressValuePosition":"inside-center",
+        "submissionTitleFormat":"{timestamp}",
+        "completionBehavior":"message",
+        "successMessage":"[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Thank you for contacting us! Our team will get in touch shortly to follow up on your message.\"}]}]",
+        "successMessagePosition":"top-form",
+        "submitMethod":"ajax",
+        "validationOnFocus":"1",
+        "validationOnSubmit":"1"
+    }
+}

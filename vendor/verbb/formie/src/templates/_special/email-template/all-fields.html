@@ -1,0 +1,7 @@
+{% for field in fields %}
+    {% set value = submission.getFieldValue(field.valueKey()) %}
+
+    {% if field.includeInEmailFieldSummaries and not field.isConditionallyHidden(submission) %}
+        {{ formieInclude('field') }}
+    {% endif %}
+{% endfor %}

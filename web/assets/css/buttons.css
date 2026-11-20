@@ -1,0 +1,210 @@
+/*------------------------------------------*/
+/*  Background Colors
+/*------------------------------------------*/
+.bg-clr1,
+.hvr-bg-clr1:hover {
+    background-color: var(--clr1) !important;
+}
+.bg-clr2,
+.hvr-bg-clr2:hover {
+    background-color: var(--clr2);
+}
+.bg-white,
+.hvr-bg-white:hover {
+    background-color: var(--white);
+}
+.bg-light,
+.hvr-bg-light:hover {
+    background-color: var(--light);
+}
+.bg-dark,
+.hvr-bg-dark:hover {
+    background-color: var(--dark);
+}
+.bg-black,
+.hvr-bg-black:hover {
+    background-color: var(--black);
+}
+
+.no-border {
+    border: none!important;
+}
+
+.sticky {
+    background-color: unset;
+}
+.sticky-area-wrap {
+    transition: background-color 0.3s ease;
+}
+
+/*------------------------------------------*/
+/*  Text Colors
+/*------------------------------------------*/
+.txt-clr1,
+.hvr-txt-clr1:hover {
+    color: var(--clr1)!important;
+}
+.txt-clr2,
+.hvr-txt-clr2:hover {
+    color: var(--clr2)!important;
+}
+.txt-white,
+.hvr-txt-white:hover {
+    color: var(--white)!important;
+}
+.txt-light,
+.hvr-txt-light:hover {
+    color: var(--light)!important;
+}
+.txt-dark,
+.hvr-txt-dark:hover {
+    color: var(--dark)!important;
+}
+.txt-black,
+.hvr-txt-black:hover {
+    color: var(--black)!important;
+}
+
+/*------------------------------------------*/
+/*  Button Size
+/*------------------------------------------*/
+.btn.btn-sm {
+    font-size: 16px;
+    padding: 10px 14px;
+  }
+  
+  .btn.btn-md {
+    font-size: 18px;
+    padding: 12px 28px;
+  }
+  
+  .btn.btn-lg {
+    font-size: 20px;
+    padding: 14px 42px;
+  }
+
+/*------------------------------------------*/
+/*  Button Hover Effect
+/*------------------------------------------*/
+.btn {
+    transition: filter 0.3s ease, transform 0.3s ease !important;
+}
+.btn:hover {
+    filter: brightness(0.8);
+}
+
+/*------------------------------------------*/
+/*  Transparant Colors
+/*------------------------------------------*/
+.bg-trans-clr1,
+.hvr-bg-trans-clr1 {
+    background-color: var(--clr1-trans);
+}
+.bg-trans-clr2,
+.hvr-bg-trans-clr2 {
+    background-color: var(--clr2-trans);
+}
+.bg-trans-white,
+.hvr-bg-trans-white {
+    background-color: var(--white-trans);
+}
+.bg-trans-light,
+.hvr-bg-trans-light {
+    background-color: var(--light-trans);
+}
+.bg-trans-dark,
+.hvr-bg-trans-dark {
+    background-color: var(--dark-trans);
+}
+.bg-trans-black,
+.hvr-bg-trans-black {
+    background-color: var(--dark-black);
+}
+.border-clr1 {
+    border:2px solid var(--clr1)
+}
+.border-clr2 {
+    border:2px solid var(--clr2)
+}
+.border-white {
+    border:2px solid var(--white)
+}
+.border-light {
+    border:2px solid var(--light)
+}
+.border-dark {
+    border:2px solid var(--dark)
+}
+.border-black {
+    border:2px solid var(--black)
+}
+
+/*------------------------------------------*/
+/*  Sticky Nav Colors
+/*------------------------------------------*/
+.sticky .sticky-bg-clr1 {
+    background-color: var(--clr1);
+}
+.sticky .sticky-bg-clr2 {
+    background-color: var(--clr2);
+}
+.sticky .sticky-bg-white {
+    background-color: var(--white);
+}
+.sticky .sticky-bg-light {
+    background-color: var(--light);
+}
+.sticky .sticky-bg-dark {
+    background-color: var(--dark);
+}
+.sticky .sticky-bg-black {
+    background-color: var(--black);
+}
+.sticky .sticky-bg-trans-clr1 {
+    background-color: var(--clr1-trans);
+}
+.sticky .sticky-bg-trans-clr2 {
+    background-color: var(--clr2-trans);
+}
+.sticky .sticky-bg-trans-light {
+    background-color: var(--light-trans);
+}
+.sticky .sticky-bg-trans-dark {
+    background-color: var(--dark-trans);
+}
+
+/*------------------------------------------*/
+/*  Overlay Colors
+/*------------------------------------------*/
+.bfr-overlay::before {
+    content: '';
+    display: block;
+    width:100%;
+    height: 100%;
+    position: absolute;
+    top:0;
+    bottom:0;
+    right:0;
+    left:0;
+    background-color: #ffffff00;
+    transition: background-color 0.3s ease, transform 0.3s ease;
+}
+
+.bfr-overlay-trans-clr1::before {
+    background-color: var(--clr1-trans);
+}
+.bfr-overlay-trans-clr2::before {
+    background-color: var(--clr2-trans);
+}
+.bfr-overlay-trans-white::before {
+    background-color: var(--white-trans);
+}
+.bfr-overlay-trans-light::before {
+    background-color: var(--light-trans);
+}
+.bfr-overlay-trans-dark::before {
+    background-color: var(--dark-trans);
+}
+.bfr-overlay-trans-black::before {
+    background-color: var(--black-trans);
+}

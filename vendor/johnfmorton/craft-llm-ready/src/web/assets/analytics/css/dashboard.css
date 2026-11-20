@@ -1,0 +1,138 @@
+/* Boxed callout for the CloudFront User-Agent warning. Craft's own
+   blockquote.note styling is scoped to .readable, so the box is drawn here
+   from the CP's warning tokens; p.warning.with-icon supplies icon and colour. */
+.llm-ready-dashboard .cloudfront-notice {
+    margin-bottom: 24px;
+    padding: 12px 16px;
+    border: 1px solid var(--warning-border-color, #f5c542);
+    border-radius: 6px;
+    background: var(--warning-background, #fff8e1);
+}
+
+.llm-ready-dashboard .cloudfront-notice p {
+    margin: 0;
+}
+
+.llm-ready-dashboard .stats-row {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 24px;
+}
+
+.llm-ready-dashboard .stat-card {
+    flex: 1;
+    background: var(--ui-control-bg-color, #f3f7fc);
+    border-radius: 8px;
+    padding: 16px 20px;
+}
+
+.llm-ready-dashboard .stat-card h4 {
+    margin: 0 0 4px;
+    font-size: 13px;
+    color: var(--medium-text-color, #8f98a3);
+    font-weight: normal;
+}
+
+.llm-ready-dashboard .stat-card .stat-value {
+    font-size: 28px;
+    font-weight: 600;
+    color: var(--text-color, #3f4d5a);
+}
+
+.llm-ready-dashboard .chart-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.llm-ready-dashboard .chart-header h3 {
+    margin: 0;
+}
+
+.llm-ready-dashboard .active-filter {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--medium-text-color, #8f98a3);
+}
+
+.llm-ready-dashboard .active-filter strong {
+    color: var(--text-color, #3f4d5a);
+}
+
+.llm-ready-dashboard .chart-view-toggle {
+    display: inline-flex;
+    border: 1px solid var(--hairline-color, #e3e5e8);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.llm-ready-dashboard .chart-toggle-btn {
+    appearance: none;
+    border: none;
+    background: transparent;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--medium-text-color, #8f98a3);
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+    border-right: 1px solid var(--hairline-color, #e3e5e8);
+    line-height: 1.4;
+}
+
+.llm-ready-dashboard .chart-toggle-btn:last-child {
+    border-right: none;
+}
+
+.llm-ready-dashboard .chart-toggle-btn:hover {
+    background: var(--ui-control-bg-color, #f3f7fc);
+    color: var(--text-color, #3f4d5a);
+}
+
+.llm-ready-dashboard .chart-toggle-btn.active {
+    background: var(--ui-control-bg-color, #f3f7fc);
+    color: var(--text-color, #3f4d5a);
+    font-weight: 600;
+}
+
+.llm-ready-dashboard .chart-container {
+    position: relative;
+    height: 300px;
+    margin-bottom: 24px;
+}
+
+.llm-ready-dashboard .dashboard-controls {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 24px;
+    align-items: center;
+}
+
+.llm-ready-dashboard .dashboard-section {
+    margin-bottom: 32px;
+}
+
+.llm-ready-dashboard .dashboard-section h3 {
+    margin-bottom: 12px;
+}
+
+.llm-ready-dashboard .dashboard-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+}
+
+@media (max-width: 900px) {
+    .llm-ready-dashboard .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.llm-ready-dashboard .purge-section {
+    margin-top: 32px;
+    padding-top: 24px;
+    border-top: 1px solid var(--hairline-color, #e3e5e8);
+}

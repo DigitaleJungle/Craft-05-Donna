@@ -1,0 +1,290 @@
+<?php
+namespace verbb\formie\fields;
+
+use verbb\formie\Formie;
+use verbb\formie\base\ElementField;
+use verbb\formie\helpers\SchemaHelper;
+
+use Craft;
+use craft\helpers\UrlHelper;
+
+use craft\commerce\elements\Variant;
+use craft\commerce\fields\Variants as CommerceVariants;
+use craft\commerce\gql\arguments\elements\Variant as VariantArguments;
+use craft\commerce\gql\interfaces\elements\Variant as VariantInterface;
+use craft\commerce\models\ProductType;
+use craft\commerce\Plugin as Commerce;
+use GraphQL\Type\Definition\Type;
+
+// Prevent a fatal error if the Commerce class doesn't exist. This is because fields are used
+// at very low-level Craft calls, which can mess things up when encountered.
+if (!class_exists(CommerceVariants::class)) {
+    return;
+}
+
+class Variants extends ElementField
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Variants');
+    }
+
+    public static function getSvgIconPath(): string
+    {
+        return 'formie/_formfields/variants/icon.svg';
+    }
+
+    public static function elementType(): string
+    {
+        return Variant::class;
+    }
+
+    public static function getRequiredPlugins(): array
+    {
+        return [
+            ['handle' => 'commerce', 'version' => '4.0.0'],
+        ];
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public bool $allowMultipleSources = false;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct(array $config = [])
+    {
+        // Setuo defaults for some values which can't in in the property definition
+        $config['placeholder'] = $config['placeholder'] ?? Craft::t('formie', 'Select a variant');
+
+        parent::__construct($config);
+    }
+
+    public function init(): void
+    {
+        // Enforce any required plugin before creating the field, but not before Craft is ready
+        Craft::$app->onInit(function() {
+            Formie::$plugin->getFields()->checkRequiredPlugin($this);
+        });
+
+        parent::init();
+    }
+
+    public function getFieldTypeConfigData(): array
+    {
+        $options = $this->getSourceOptions();
+
+        return [
+            'warning' => count($options) === 1 ? Craft::t('formie', 'No product types available. View [product type settings]({link}).', ['link' => UrlHelper::cpUrl('commerce/settings/producttypes')]) : false,
+        ];
+    }
+
+    public function defineFormBuilderPreviewSchema(): array
+    {
+        return [
+            SchemaHelper::previewElementField(),
+        ];
+    }
+
+    public function getSourceOptions(): array
+    {
+        $options = parent::getSourceOptions();
+
+        return array_merge([['label' => Craft::t('formie', 'Select an option'), 'value' => '']], $options);
+    }
+
+    public function defineLabelSourceOptions(): array
+    {
+        $options = [
+            ['value' => 'title', 'label' => Craft::t('app', 'Title')],
+            ['value' => 'sku', 'label' => Craft::t('app', 'SKU')],
+            ['value' => 'price', 'label' => Craft::t('app', 'Price')],
+            ['value' => 'height', 'label' => Craft::t('app', 'Height')],
+            ['value' => 'length', 'label' => Craft::t('app', 'Length')],
+            ['value' => 'width', 'label' => Craft::t('app', 'Width')],
+            ['value' => 'weight', 'label' => Craft::t('app', 'Weight')],
+        ];
+
+        $extraOptions = [];
+
+        foreach ($this->availableSources() as $source) {
+            if (!isset($source['heading'])) {
+                $typeId = $source['criteria']['typeId'] ?? null;
+
+                if ($typeId && !is_array($typeId)) {
+                    $productType = Commerce::getInstance()->getProductTypes()->getProductTypeById($typeId);
+
+                    $fields = $this->getStringCustomFieldOptions($productType->getCustomFields());
+
+                    $extraOptions[] = $fields;
+                }
+            }
+        }
+
+        return array_merge($options, ...$extraOptions);
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return array_merge(parent::getSettingGqlTypes(), [
+            'defaultVariant' => [
+                'name' => 'defaultVariant',
+                'type' => VariantInterface::getType(),
+                'args' => VariantArguments::getArguments(),
+                'resolve' => function($class) {
+                    return $class->getDefaultValueQuery() ? $class->getDefaultValueQuery()->one() : null;
+                },
+            ],
+            'variants' => [
+                'name' => 'variants',
+                'type' => Type::listOf(VariantInterface::getType()),
+                'args' => VariantArguments::getArguments(),
+                'resolve' => function($class) {
+                    return $class->getElementsQuery()->all();
+                },
+            ],
+        ]);
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        $options = $this->getSourceOptions();
+
+        return [
+            SchemaHelper::labelField(),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Placeholder'),
+                'instructions' => Craft::t('formie', 'The option shown initially, when no option is selected.'),
+                'name' => 'placeholder',
+                'validation' => 'required',
+                'required' => true,
+                'if' => 'displayType == "dropdown"',
+            ]),
+            SchemaHelper::selectField([
+                'label' => Craft::t('formie', 'Source'),
+                'instructions' => Craft::t('formie', 'Which source do you want to select variants from?'),
+                'name' => 'source',
+                'options' => $options,
+                'validation' => 'required',
+                'required' => true,
+                'element-class' => count($options) === 1 ? 'hidden' : false,
+                'warning' => count($options) === 1 ? Craft::t('formie', 'No product types available. View [product type settings]({link}).', ['link' => UrlHelper::cpUrl('commerce/settings/producttypes')]) : false,
+            ]),
+            SchemaHelper::elementSelectField([
+                'label' => Craft::t('formie', 'Default Value'),
+                'instructions' => Craft::t('formie', 'Select a default variant to be selected.'),
+                'name' => 'defaultValue',
+                'selectionLabel' => Craft::t('formie', 'Choose'),
+                'config' => [
+                    'jsClass' => $this->cpInputJsClass,
+                    'elementType' => static::elementType(),
+                ],
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderSettingsSchema(): array
+    {
+        return [
+            SchemaHelper::prefillQueryParam(),
+            SchemaHelper::includeInEmailFieldSummariesField(),
+            SchemaHelper::emailFieldSummaryValue(),
+            SchemaHelper::numberField([
+                'label' => Craft::t('formie', 'Limit'),
+                'instructions' => Craft::t('formie', 'Limit the number of selectable variants.'),
+                'name' => 'limit',
+            ]),
+            SchemaHelper::numberField([
+                'label' => Craft::t('formie', 'Limit Options'),
+                'instructions' => Craft::t('formie', 'Limit the number of available variants.'),
+                'name' => 'optionLimit',
+            ]),
+            SchemaHelper::selectField([
+                'label' => Craft::t('formie', 'Label Source'),
+                'instructions' => Craft::t('formie', 'Select what to use as the label for each variant.'),
+                'name' => 'labelSource',
+                'options' => $this->getLabelSourceOptions(),
+            ]),
+            SchemaHelper::selectField([
+                'label' => Craft::t('formie', 'Options Order'),
+                'instructions' => Craft::t('formie', 'Select what order to show variants by.'),
+                'name' => 'orderBy',
+                'options' => $this->getOrderByOptions(),
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderValidationSchema(): array
+    {
+        return [
+            SchemaHelper::requiredField(),
+            SchemaHelper::requiredValidationMessage(),
+        ];
+    }
+
+    public function defineFormBuilderAppearanceSchema(): array
+    {
+        return [
+            SchemaHelper::visibility(),
+            SchemaHelper::selectField([
+                'label' => Craft::t('formie', 'Display Type'),
+                'instructions' => Craft::t('formie', 'Set different display layouts for this field.'),
+                'name' => 'displayType',
+                'options' => [
+                    ['label' => Craft::t('formie', 'Dropdown'), 'value' => 'dropdown'],
+                    ['label' => Craft::t('formie', 'Checkboxes'), 'value' => 'checkboxes'],
+                    ['label' => Craft::t('formie', 'Radio Buttons'), 'value' => 'radio'],
+                ],
+            ]),
+            ...$this->defineElementFieldMultiSelectAppearanceSchema(),
+            ...$this->defineElementFieldSearchableDropdownAppearanceSchema(),
+            SchemaHelper::labelPosition($this),
+            SchemaHelper::instructions(),
+            SchemaHelper::instructionsPosition($this),
+            SchemaHelper::errorMessagePosition($this),
+        ];
+    }
+
+    public function defineFormBuilderAdvancedSchema(): array
+    {
+        return [
+            SchemaHelper::handleField(),
+            SchemaHelper::cssClasses(),
+            SchemaHelper::containerAttributesField(),
+            SchemaHelper::inputAttributesField(),
+        ];
+    }
+
+    public function defineFormBuilderConditionsSchema(): array
+    {
+        return [
+            SchemaHelper::enableConditionsField(),
+            SchemaHelper::conditionsField(),
+        ];
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getProductType(): ?ProductType
+    {
+        if ($this->source === '*') {
+            return null;
+        }
+
+        if (!$this->_productType) {
+            [, $uid] = explode(':', $this->source);
+            return Commerce::getInstance()->getProductTypes()->getProductTypeByUid($uid);
+        }
+
+        return $this->_productType;
+    }
+}

@@ -1,0 +1,584 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\models\Token;
+use verbb\auth\providers\Zoho as ZohoProvider;
+
+class Zoho extends Crm implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return ZohoProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'Zoho';
+    }
+
+    protected static function defineOptionSources(): array
+    {
+        return [
+            [
+                'handle' => 'zoho-picklists',
+                'label' => Craft::t('formie', 'Picklists'),
+                'storage' => 'objects',
+                'objectKeys' => ['contact', 'deal', 'lead', 'account', 'quote'],
+                'objectLabels' => [
+                    'contact' => Craft::t('formie', 'Contact'),
+                    'deal' => Craft::t('formie', 'Deal'),
+                    'lead' => Craft::t('formie', 'Lead'),
+                    'account' => Craft::t('formie', 'Account'),
+                    'quote' => Craft::t('formie', 'Quote'),
+                ],
+                'collectionLabel' => Craft::t('formie', 'Module'),
+                'collectionInstructions' => Craft::t('formie', 'Choose the Zoho module that owns the field.'),
+                'collectionPlaceholder' => Craft::t('formie', 'Select a module'),
+                'remoteHandleLabel' => Craft::t('formie', 'Option Source'),
+                'remoteHandleInstructions' => Craft::t('formie', 'Choose which picklist field supplies the options.'),
+                'remoteHandlePlaceholder' => Craft::t('formie', 'Select a picklist'),
+                'collectionRequiredMessage' => Craft::t('formie', 'Select a Zoho module.'),
+                'remoteHandleRequiredMessage' => Craft::t('formie', 'Select a picklist field.'),
+                'emptyCollectionsWarning' => Craft::t('formie', 'No Zoho modules are available. Refresh the integration field mapping first.'),
+                'emptySourcesWarning' => Craft::t('formie', 'No picklist fields are available. Refresh the integration field mapping first.'),
+            ],
+        ];
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public bool|string $useDeveloper = false;
+    public ?string $dataCenter = 'US';
+
+    #[FormIntegrationSetting]
+    public bool $mapToContact = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToDeal = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToLead = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToAccount = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToQuote = false;
+
+    #[FormIntegrationSetting]
+    public ?array $contactFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $dealFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $leadFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $accountFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $quoteFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct($config = [])
+    {
+        unset($config['apiServer'], $config['apiLocation'], $config['apiDomain']);
+
+        parent::__construct($config);
+    }
+
+    public function getUseDeveloper(): string
+    {
+        return App::parseBooleanEnv($this->useDeveloper);
+    }
+
+    public function getDataCenter(): ?string
+    {
+        return App::parseEnv($this->dataCenter);
+    }
+
+    public function getBaseApiUrl(?Token $token): ?string
+    {
+        $url = parent::getBaseApiUrl($token);
+
+        return "$url/crm/v2/";
+    }
+
+    public function getOAuthProviderConfig(): array
+    {
+        $config = parent::getOAuthProviderConfig();
+        $config['baseApiUrl'] = fn(?Token $token) => $this->getBaseApiUrl($token);
+        $config['dc'] = $this->getDataCenter();
+        $config['useDeveloper'] = $this->getUseDeveloper();
+
+        return $config;
+    }
+
+    public function getAuthorizationUrlOptions(): array
+    {
+        $options = parent::getAuthorizationUrlOptions();
+        $options['access_type'] = 'offline';
+        $options['prompt'] = 'consent';
+
+        $options['scope'] = [
+            'ZohoCRM.modules.ALL',
+            'ZohoCRM.settings.ALL',
+        ];
+
+        return $options;
+    }
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function getFieldMappingValues(Submission $submission, ?array $fieldMapping, mixed $fieldSettings = null)
+    {
+        $fields = is_string($fieldSettings) ? $this->getConfigValue($fieldSettings) : $fieldSettings;
+        $fieldValues = parent::getFieldMappingValues($submission, $fieldMapping, $fields);
+
+        foreach ($fieldValues as $handle => $value) {
+            $integrationField = is_array($fields) ? ArrayHelper::firstWhere($fields, 'handle', $handle) : null;
+
+            if ($integrationField instanceof IntegrationField) {
+                $fieldValues[$handle] = $this->_getPickListPayloadValue($value, $integrationField);
+            }
+        }
+
+        return $fieldValues;
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToContact && $this->settingsContext->dataKey === 'contact') {
+                $settings['contact'] = $this->_getModuleFields('Contacts');
+            }
+
+            if ($this->mapToDeal && $this->settingsContext->dataKey === 'deal') {
+                $settings['deal'] = $this->_getModuleFields('Deals');
+            }
+
+            if ($this->mapToLead && $this->settingsContext->dataKey === 'lead') {
+                $settings['lead'] = $this->_getModuleFields('Leads');
+            }
+
+            if ($this->mapToAccount && $this->settingsContext->dataKey === 'account') {
+                $settings['account'] = $this->_getModuleFields('Accounts');
+            }
+
+            if ($this->mapToQuote && $this->settingsContext->dataKey === 'quote') {
+                $settings['quote'] = $this->_getModuleFields('Quotes');
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $contactValues = $this->getFieldMappingValues($submission, $this->contactFieldMapping, 'contact');
+            $dealValues = $this->getFieldMappingValues($submission, $this->dealFieldMapping, 'deal');
+            $leadValues = $this->getFieldMappingValues($submission, $this->leadFieldMapping, 'lead');
+            $accountValues = $this->getFieldMappingValues($submission, $this->accountFieldMapping, 'account');
+            $quoteValues = $this->getFieldMappingValues($submission, $this->quoteFieldMapping, 'quote');
+
+            $contactId = null;
+
+            if ($this->mapToContact) {
+                $contactPayload = [
+                    'data' => [$contactValues],
+                    'duplicate_check_fields' => ['Email'],
+                ];
+
+                $response = $this->deliverPayload($submission, 'Contacts/upsert', $contactPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $contactId = $response['data'][0]['details']['id'] ?? '';
+
+                if (!$contactId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “contactId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($contactPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->mapToAccount) {
+                $accountPayload = [
+                    'data' => [$accountValues],
+                    'duplicate_check_fields' => ['Account_Name'],
+                ];
+
+                $response = $this->deliverPayload($submission, 'Accounts/upsert', $accountPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $accountId = $response['data'][0]['details']['id'] ?? '';
+
+                if (!$accountId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “accountId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($accountPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->mapToQuote) {
+                $quotePayload = [
+                    'data' => [$quoteValues],
+                    'duplicate_check_fields' => ['Account_Name'],
+                ];
+
+                $response = $this->deliverPayload($submission, 'Quotes/upsert', $quotePayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $quoteId = $response['data'][0]['details']['id'] ?? '';
+
+                if (!$quoteId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “quoteId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($quotePayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->mapToDeal) {
+                $dealPayload = [
+                    'data' => [$dealValues],
+                ];
+
+                $response = $this->deliverPayload($submission, 'Deals', $dealPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $dealId = $response['data'][0]['details']['id'] ?? '';
+
+                if (!$dealId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “dealId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($dealPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+
+                // Connect Contact to Deal
+                if ($contactId) {
+                    $payload = [
+                        'data' => [
+                            ['Contact_Role' => '4201883000000006871'],
+                        ],
+                    ];
+
+                    $response = $this->deliverPayload($submission, "Contacts/{$contactId}/Deals/{$dealId}", $payload, 'PUT');
+
+                    if ($response === false) {
+                        return $this->resultForPayload(true);
+                    }
+                }
+            }
+
+            if ($this->mapToLead) {
+                $leadPayload = [
+                    'data' => [$leadValues],
+                ];
+
+                $response = $this->deliverPayload($submission, 'Leads', $leadPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $leadId = $response['data'][0]['details']['id'] ?? '';
+
+                if (!$leadId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “leadId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($leadPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $contact = $this->getConfigValue('contact');
+        $deal = $this->getConfigValue('deal');
+        $lead = $this->getConfigValue('lead');
+        $account = $this->getConfigValue('account');
+        $quote = $this->getConfigValue('quote');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['contactFieldMapping'], 'validateFieldMapping', 'params' => $contact, 'when' => function($model) {
+                return $model->enabled && $model->mapToContact;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['dealFieldMapping'], 'validateFieldMapping', 'params' => $deal, 'when' => function($model) {
+                return $model->enabled && $model->mapToDeal;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['leadFieldMapping'], 'validateFieldMapping', 'params' => $lead, 'when' => function($model) {
+                return $model->enabled && $model->mapToLead;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['accountFieldMapping'], 'validateFieldMapping', 'params' => $account, 'when' => function($model) {
+                return $model->enabled && $model->mapToAccount;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['quoteFieldMapping'], 'validateFieldMapping', 'params' => $quote, 'when' => function($model) {
+                return $model->enabled && $model->mapToQuote;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToContact',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Contact']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Contacts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'contactFieldMapping',
+            'if' => 'mapToContact',
+            'dataLabel' => 'Contact',
+            'dataKey' => 'contact',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToDeal',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Deal']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Deals']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'dealFieldMapping',
+            'if' => 'mapToDeal',
+            'dataLabel' => 'Deal',
+            'dataKey' => 'deal',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToLead',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Lead']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Leads']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'leadFieldMapping',
+            'if' => 'mapToLead',
+            'dataLabel' => 'Lead',
+            'dataKey' => 'lead',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToAccount',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Account']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Accounts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'accountFieldMapping',
+            'if' => 'mapToAccount',
+            'dataLabel' => 'Account',
+            'dataKey' => 'account',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToQuote',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Quote']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Quotes']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'quoteFieldMapping',
+            'if' => 'mapToQuote',
+            'dataLabel' => 'Quote',
+            'dataKey' => 'quote',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'jsonarray' => IntegrationField::TYPE_ARRAY,
+            'date' => IntegrationField::TYPE_DATE,
+            'datetime' => IntegrationField::TYPE_DATETIME,
+            'timestamp' => IntegrationField::TYPE_DATETIME,
+            'boolean' => IntegrationField::TYPE_BOOLEAN,
+            'integer' => IntegrationField::TYPE_NUMBER,
+            'number' => IntegrationField::TYPE_FLOAT,
+            'bigint' => IntegrationField::TYPE_NUMBER,
+            'currency' => IntegrationField::TYPE_FLOAT,
+            'double' => IntegrationField::TYPE_FLOAT,
+            'decimal' => IntegrationField::TYPE_FLOAT,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields, array $excludeNames = []): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $field) {
+            if ($field['read_only'] || $field['field_read_only']) {
+                continue;
+            }
+
+            $fieldType = $field['json_type'] ?? $field['data_type'] ?? '';
+
+            // Exclude any names
+            if (in_array($field['api_name'], $excludeNames)) {
+                continue;
+            }
+
+            $options = [];
+            $pickListValues = $field['pick_list_values'] ?? [];
+
+            foreach ($pickListValues as $pickListValue) {
+                $actualValue = $pickListValue['actual_value'] ?? $pickListValue['display_value'];
+
+                $options[] = [
+                    'label' => $pickListValue['display_value'],
+                    'value' => $pickListValue['id'] ?? $actualValue,
+                    'actualValue' => $actualValue,
+                ];
+            }
+
+            if ($options) {
+                $options = [
+                    'label' => $field['field_label'],
+                    'options' => $options,
+                ];
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => $field['api_name'],
+                'name' => $field['field_label'],
+                'type' => $this->_convertFieldType($fieldType),
+                'sourceType' => $fieldType,
+                'required' => $field['system_mandatory'] ?? false,
+                'options' => $options,
+            ]);
+        }
+
+        return $customFields;
+    }
+
+    private function _getPickListPayloadValue(mixed $value, IntegrationField $integrationField): mixed
+    {
+        if (is_array($value)) {
+            return array_map(fn($item) => $this->_getPickListPayloadValue($item, $integrationField), $value);
+        }
+
+        foreach ($integrationField->options['options'] ?? [] as $option) {
+            if ((string)($option['value'] ?? '') !== (string)$value) {
+                continue;
+            }
+
+            // Older cached field metadata has no actual value, but its label is still safer than sending the option ID.
+            return $option['actualValue'] ?? $option['label'] ?? $value;
+        }
+
+        return $value;
+    }
+
+    private function _getModuleFields($module): array
+    {
+        // Ignore any errors like 'the module name given seems to be invalid' - just means the module is hidden.
+        try {
+            $response = $this->request('GET', 'settings/fields', ['query' => ['module' => $module]]);
+            $fields = $response['fields'] ?? [];
+
+            return $this->_getCustomFields($fields);
+        } catch (Throwable $e) {
+            // Just log the error, and keep going with other modules
+            Integration::apiError($this, $e, false);
+        }
+
+        return [];
+    }
+}

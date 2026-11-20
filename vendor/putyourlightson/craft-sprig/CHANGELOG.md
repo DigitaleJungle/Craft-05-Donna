@@ -1,0 +1,150 @@
+# Release Notes for Sprig
+
+## 3.7.1 - 2025-09-14
+
+- Updated htmx to version 2.0.7 ([changelog](https://github.com/bigskysoftware/htmx/blob/master/CHANGELOG.md#207---2025-09-08)).
+- Improved the check for Twig globals.
+
+## 3.7.0 - 2025-08-09
+
+- Updated htmx to version 2.0.6 ([changelog](https://github.com/bigskysoftware/htmx/blob/master/CHANGELOG.md#206---2025-06-27)).
+- Variables named the same as Twig globals are now disallowed ([#422](https://github.com/putyourlightson/craft-sprig/issues/422)).
+
+## 3.6.1 - 2025-04-16
+
+- Access to the Sprig Playground is now blocked entirely when the config setting is disabled.
+
+## 3.6.0 - 2025-04-09
+
+- Updated htmx to version 2.0.4 ([changelog](https://github.com/bigskysoftware/htmx/blob/master/CHANGELOG.md#204---2024-12-13)).
+- The Sprig Playground component template is now rendered in a sandboxed context.
+- Fixed an information disclosure vulnerability.
+- Fixed an XSS vulnerability.
+
+## 3.5.2 - 2025-01-19
+
+### Fixed
+
+- Fixed a bug in which `s-action` attributes were being inherited by descendent elements ([#408](https://github.com/putyourlightson/craft-sprig/issues/408)).
+
+## 3.5.1 - 2024-10-23
+
+### Changed
+
+- Updated htmx to version 2.0.3 ([changelog](https://github.com/bigskysoftware/htmx/blob/master/CHANGELOG.md#203---2024-10-03)).
+- The fetch function is now called inside an event listener when calling `sprig.triggerRefreshOnLoad()`, making it more robust.
+- Reverted some variable method name changes to improve autocompletion in PhpStorm.
+
+## 3.5.0 - 2024-08-29
+
+### Added
+
+- Added the ability to assign an ID to a component by passing a string as the third argument to the `sprig()` function.
+
+### Changed
+
+- Updated htmx to version 2.0.2 ([changelog](https://github.com/bigskysoftware/htmx/blob/master/CHANGELOG.md#202---2024-08-12)).
+
+### Fixed
+
+- Fixed the positioning of the JavaScript output by the `sprig.triggerRefreshOnLoad` function.
+
+### Deprecated
+
+- Deprecated `sprig.getIsBoosted`, `sprig.getIsError`, `sprig.getIsHistoryRestoreRequest`, `sprig.getIsInclude`, `sprig.getIsRequest`, `sprig.getIsSuccess`. Use `sprig.isBoosted`, `sprig.isError`, `sprig.isHistoryRestoreRequest`, `sprig.isInclude`, `sprig.isRequest`, `sprig.isSuccess` instead.
+
+## 3.4.0 - 2024-08-20
+
+### Changed
+
+- The `sprig.registerJs(js)` function now executes the registered JavaScript after htmx settles, and is now the recommended way of outputting JavaScript in Sprig components.
+- Components no longer render markup added via `{% html %}`, `{% css %}` and `{% js %}` tags during Sprig requests.
+
+## 3.3.0 - 2024-08-08
+
+### Added
+
+- Added the component configurations to a `Sprig` variable in the browser console when `devMode` is enabled.
+- Added the ability to pass any value into `s-method`, including the `put`, `patch` and `delete` verbs.
+- Added the `sprig.registerJs(js)` function.
+
+### Changed
+
+- The `sprig.triggerRefresh(selector, variables)` function now prevents cyclical requests.
+
+## 3.2.1 - 2024-08-06
+
+### Changed
+
+- The `sprig.swapOob()` function now accepts a string, in addition to a template to be rendered, in the second argument.
+
+## 3.2.0 - 2024-08-01
+
+### Added
+
+- Added the `sprig.swapOob(selector, template, variables)` function that swaps a template out-of-band.
+- Added the `sprig.triggerRefresh(selector, variables)` function that triggers a refresh on a Sprig component.
+
+### Changed
+
+- Components now render markup added via `{% html %}`, `{% css %}` and `{% js %}` tags.
+- The `sprig.triggerRefreshOnLoad(selector)` function now appends output to the end of the body and should be called using `{% do sprig.triggerRefreshOnLoad(selector) %}`.
+
+## 3.1.0 - 2024-07-15
+
+> [!IMPORTANT]
+> This update introduces htmx 2. [Read about the changes →](https://putyourlightson.com/articles/sprig-htmx-2)
+
+### Added
+
+- Added the [s-inherit](https://putyourlightson.com/plugins/sprig#s-inherit) attribute that allows you to control and enable automatic attribute inheritance for child nodes, if it has been disabled by default.
+
+### Changed
+
+- Updated htmx to version 2.0.1 ([2.0.0 release notes](https://htmx.org/posts/2024-06-17-htmx-2-0-0-is-released/)).
+- The htmx file is now output even when Sprig components are used inside of `{% cache %}` tags ([#329](https://github.com/putyourlightson/craft-sprig/issues/329)).
+
+### Fixed
+
+- Fixed the check for whether `devMode` is enabled in the Sprig playground.
+
+### Removed
+
+- Removed the `s-sse` and `s-ws` attributes.
+
+## 3.0.2 - 2024-04-21
+
+### Changed
+
+- Made it possible to pass a fully namespaced component class into the `sprig()` function ([#14](https://github.com/putyourlightson/craft-sprig-core/issues/14)).
+- Updated htmx to version 1.9.12 ([changelog](https://github.com/bigskysoftware/htmx/blob/master/CHANGELOG.md#1912---2024-04-17)).
+
+### Fixed
+
+- Fixed a bug in which variables passed into a component were being converted to strings ([#369](https://github.com/putyourlightson/craft-sprig-core/issues/369)).
+
+## 3.0.1 - 2024-04-21
+
+### Fixed
+
+- Fixed a bug in which some `sprig` variables were incorrectly persisting across requests ([#363](https://github.com/putyourlightson/craft-sprig/issues/363)).
+
+## 3.0.0 - 2024-04-08
+
+> {warning} Template caches and static page caches should be cleared after performing this update.
+
+### Added
+
+- Added compatibility with Craft 5.
+
+### Changed
+
+- Changed how the component configuration is encoded.
+
+### Removed
+
+- Removed the `sprig.script` variable.
+- Removed the `s-on` attribute.
+- Removed the `success` variable. Use `sprig.isSuccess` or `sprig.isError` instead.
+- Removed the `flashes` variable. Use `sprig.message` instead.
+- Removed the `id` variable. Use `sprig.modelId` instead.

@@ -1,0 +1,23 @@
+{% extends 'verbb-base/_layouts/settings' %}
+
+{% set parentLayout = 'cp-nav/_layouts/cp' %}
+{% set title = 'Control Panel Nav' | t('cp-nav') %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% requireAdmin %}
+
+{% do view.registerAssetBundle('verbb\\base\\web\\assets\\cp\\CpAsset') -%}
+
+{% set crumbs = [
+    { label: 'Control Panel Nav' | t('cp-nav'), url: url('cp-nav') },
+    { label: 'Settings' | t('cp-nav'), url: url('cp-nav/settings') },
+] | merge(crumbs ?? []) %}
+
+{# The shared page tabs provide navigation; this single settings section needs no sidebar. #}
+{% block sidebar %}{% endblock %}
+
+{% block settingsMeta %}
+    {{ hiddenInput('pluginHandle', 'cp-nav') }}
+{% endblock %}

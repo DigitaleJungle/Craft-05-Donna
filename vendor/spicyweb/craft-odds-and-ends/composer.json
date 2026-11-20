@@ -1,0 +1,57 @@
+{
+    "name": "spicyweb/craft-odds-and-ends",
+    "description": "A collection of useful tools for Craft CMS websites",
+    "type": "craft-plugin",
+    "version": "5.1.0",
+    "keywords": [
+        "craft",
+        "cms",
+        "craftcms",
+        "craft-plugin"
+    ],
+    "support": {
+        "docs": "https://github.com/spicywebau/craft-odds-and-ends/blob/5.1.0/README.md",
+        "issues": "https://github.com/spicywebau/craft-odds-and-ends/issues"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Spicy Web",
+            "homepage": "https://spicyweb.com.au"
+        }
+    ],
+    "require": {
+        "craftcms/cms": "^5.8.0",
+        "php": "^8.2"
+    },
+    "autoload": {
+        "psr-4": {
+          "spicyweb\\oddsandends\\": "src/"
+        }
+    },
+    "extra": {
+        "name": "Odds & Ends",
+        "handle": "tools",
+        "schemaVersion": "4.3.1",
+        "hasCpSettings": false,
+        "hasCpSection": false,
+        "changelogUrl": "https://github.com/spicywebau/craft-odds-and-ends/blob/5.x/CHANGELOG.md",
+        "class": "spicyweb\\oddsandends\\Tools"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require-dev": {
+        "craftcms/ecs": "dev-main",
+        "craftcms/rector": "dev-main"
+    },
+    "config": {
+        "allow-plugins": {
+            "yiisoft/yii2-composer": true,
+            "craftcms/plugin-installer": true
+        }
+    },
+    "scripts": {
+        "check-cs": "ecs check --ansi",
+        "fix-cs": "ecs check --ansi --fix"
+    }
+}

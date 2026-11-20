@@ -1,0 +1,89 @@
+<?php
+namespace verbb\formie\compatibility\schema;
+
+use verbb\formie\Formie;
+
+use Craft;
+
+class SchemaCompatibility
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function normalizeLegacyNode(array $node): array
+    {
+        if (!Formie::$plugin->getCompatibility()->isCompatibilityModeEnabled()) {
+            return $node;
+        }
+
+        if (array_key_exists('$formkit', $node) && !array_key_exists('$field', $node)) {
+            $node['$field'] = $node['$formkit'];
+            unset($node['$formkit']);
+
+            self::_logLegacySchemaDeprecation(
+                'formkit',
+                'Schema `$formkit` nodes have been deprecated. Use `$field` instead.'
+            );
+        }
+
+        if (array_key_exists('help', $node) && !array_key_exists('instructions', $node)) {
+            $node['instructions'] = $node['help'];
+            unset($node['help']);
+
+            self::_logLegacySchemaDeprecation(
+                'help',
+                'Schema `help` has been deprecated. Use `instructions` instead.'
+            );
+        }
+
+        if (isset($node['if']) && is_string($node['if'])) {
+            $normalizedCondition = self::_normalizeLegacyCondition($node['if']);
+
+            if ($normalizedCondition !== $node['if']) {
+                $node['if'] = $normalizedCondition;
+
+                self::_logLegacySchemaDeprecation(
+                    'if',
+                    'Legacy schema `if` expressions using `$get(...).value` have been deprecated. Use direct field expressions instead.'
+                );
+            }
+        }
+
+        return $node;
+    }
+
+    private static function _normalizeLegacyCondition(string $condition): string
+    {
+        $normalized = preg_replace('/\$get\(([^)]+)\)\.value/', '$1', $condition) ?? $condition;
+
+        $normalized = preg_replace_callback('/([=!]=|[=!]==)\s*([A-Za-z_][A-Za-z0-9_]*)/', function(array $matches) {
+            $operator = $matches[1] ?? '';
+            $value = $matches[2] ?? '';
+
+            if (in_array(strtolower($value), ['true', 'false', 'null'], true)) {
+                return "{$operator} {$value}";
+            }
+
+            return sprintf('%s "%s"', $operator, $value);
+        }, $normalized) ?? $normalized;
+
+        return $normalized;
+    }
+
+    private static function _logLegacySchemaDeprecation(string $key, string $message): void
+    {
+        if (isset(self::$_legacyWarnings[$key])) {
+            return;
+        }
+
+        self::$_legacyWarnings[$key] = true;
+
+        Craft::$app->getDeprecator()->log(__METHOD__ . ':' . $key, $message);
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    private static array $_legacyWarnings = [];
+}

@@ -1,0 +1,1 @@
+export{t as configureFormieTiptap}from"../../assets/bridge-BjuWW81d.js";

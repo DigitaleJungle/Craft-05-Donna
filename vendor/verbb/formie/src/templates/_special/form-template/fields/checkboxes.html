@@ -1,0 +1,43 @@
+{% set toggleCheckbox %}
+    {% with { isCheckboxToggle: true } %}
+        {% fieldtag 'fieldOption' %}
+            {{ fieldtag('fieldInput') }}
+
+            {% fieldtag 'fieldOptionLabel' %}
+                {{- field.toggleCheckboxLabel | purify | md(inlineOnly=true) | raw -}}
+            {% endfieldtag %}
+        {% endfieldtag %}
+    {% endwith %}
+{% endset %}
+
+{{ hiddenInput(field.getHtmlName(), '') }}
+
+{# Allow passing in a set list of options #}
+{% set fieldOptions = fieldOptions ?? field.getFieldOptions() %}
+
+{% fieldtag 'fieldOptions' %}
+    {% if field.toggleCheckbox == 'top' and field.toggleCheckboxLabel %}
+        {{ toggleCheckbox }}
+    {% endif %}
+
+    {% for option in fieldOptions %}
+        {# Ensure we cast as strings to compare #}
+        {% set selected = option.value is defined and ('' ~ option.value) in value %}
+
+        {% fieldtag 'fieldOption' %}
+            {{ fieldtag('fieldInput', {
+                value: option.value ?? false,
+                checked: selected,
+                disabled: option.disabled ?? false,
+            }) }}
+
+            {% fieldtag 'fieldOptionLabel' %}
+                {{- option.label | purify | md(inlineOnly=true) | raw -}}
+            {% endfieldtag %}
+        {% endfieldtag %}
+    {% endfor %}
+
+    {% if field.toggleCheckbox == 'bottom' and field.toggleCheckboxLabel %}
+        {{ toggleCheckbox }}
+    {% endif %}
+{% endfieldtag %}

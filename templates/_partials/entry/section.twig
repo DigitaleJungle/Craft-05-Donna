@@ -1,0 +1,13 @@
+<section style="background-color:{{ entry.color }}">
+    {{ entry.title }}
+        {% for contentBlock in entry.contentBlocks %}
+            {% set rightWidth = contentBlock.width.right ?? 0 %}
+            {% set leftWidth = contentBlock.width.left ?? 12 %}
+            {% set colWidth = max(0, min(12, rightWidth - leftWidth)) %}
+            {% set colStart = max(0, min(12 - colStop, leftWidth - colStop)) %}
+            {% set colStop = colWidth + colStart + colStop %}
+                <div id="content-{{ contentBlock.id }}" class="col-md-{{ colWidth }} offset-md-{{ colStart }}">
+                    {{ contentBlock.render({ colWidth }) }}
+                </div>
+        {% endfor %}
+</section>

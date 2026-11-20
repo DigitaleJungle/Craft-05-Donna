@@ -1,0 +1,56 @@
+{% import "_includes/forms.twig" as forms %}
+
+<div id="{{ id }}" class="rynpsc-phonenumber {{ element.getErrors(field.handle) ? 'has-errors' : '' }}">
+    <div style="display: none;">
+        {{ forms.selectField({
+            id: id ~ "-region",
+            label: "Region"|t("phone-number"),
+            name: name ~ "[region]",
+            value: value.region ?? field.defaultRegion ?? null,
+            options: regions|map(region => {
+                value: region.countryCode,
+                label: region.countryName,
+            }),
+        }) }}
+    </div>
+
+    <button class="rynpsc-phonenumber-button" id="{{ id ~ '-button' }}" type="button" {{ static ? 'disabled' : '' }}>
+        <span class="icon icon-{{ value.region ?? field.defaultRegion ?? null }}" id="{{ id ~ '-af' }}"></span>
+        <span class="rynpsc-phonenumber-button-caret" aria-hidden="true">downangle</span>
+    </button>
+
+    <div class="rynpsc-phonenumber-dropdown" id="{{ id ~ '-dropdown' }}">
+        <div class="rynpsc-phonenumber-search">
+            <label for="{{ id ~ '-search' }}" class="rynpsc-phonenumber-assistive">Filter regions</label>
+
+            {{ forms.text({
+                id: id ~ "-search",
+                placeholder: "Filter regions"|t("phonenumber"),
+            }) }}
+        </div>
+
+        <ul class="rynpsc-phonenumber-regions" id="{{ id ~ '-regions' }}">
+            {% for region in regions %}
+                <li class="rynpsc-phonenumber-region" id="{{ id ~ '-' ~ region.countryCode }}" data-region="{{ region.countryCode }}" data-code="{{ region.callingCode }}">
+                    <span class="rynpsc-phonenumber-flag icon-{{ region.countryCode }}"></span>
+                    <span class="rynpsc-phonenumber-country">{{ region.countryName }}</span>
+                    <span class="rynpsc-phonenumber-code">+{{ region.callingCode }}</span>
+                </li>
+            {% endfor %}
+        </ul>
+
+        <div class="rynpsc-phonenumber-no-results" id="{{ id ~ '-no-results' }}">
+            <p>{{ "No results"|t('phone-number') }}</p>
+        </div>
+    </div>
+
+	{{ forms.text({
+		id: id ~ "-number",
+        type: "tel",
+		label: "Number"|t("phonenumber"),
+		name: name ~ "[number]",
+		value: value.number ?? null,
+		class: "rynpsc-phonenumber-number",
+        disabled: static,
+	}) }}
+</div>

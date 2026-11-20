@@ -1,0 +1,14 @@
+{{ hiddenInput(field.getHtmlName("#{index}[#{colId}]"), '') }}
+
+<div class="formie-field-option formie-checkbox-option" data-formie-field-option data-formie-checkbox-option>
+    {{ fieldtag('tableCheckboxInput', {
+        id: rowId,
+        value: '1',
+        checked: (row[colId] ?? false) ? true : false,
+        name: field.getHtmlName("#{index}[#{colId}]"),
+    }) }}
+
+    <label for="{{ rowId }}" class="formie-field-option-label formie-checkbox-option-label" data-formie-field-option-label data-formie-checkbox-option-label>
+        &nbsp;<span class="formie-sr-only" data-formie-sr-only>{{ col.heading }}</span>
+    </label>
+</div>

@@ -1,0 +1,29 @@
+{% set value = value ?? field.getElementValue(element) %}
+{% set errors = element ? element.submissionErrors.forValuePath(field.errorKey()) : [] %}
+
+{% set labelPosition = craft.formie.getLabelPosition(field, form) %}
+{% set subFieldLabelPosition = craft.formie.getLabelPosition(field, form, true) %}
+{% set instructionsPosition = craft.formie.getInstructionsPosition(field, form) %}
+{% set errorMessagePosition = craft.formie.getErrorMessagePosition(field, form) %}
+
+{% fieldtag 'field' %}
+    {% fieldtag 'fieldLayout' %}
+        {{ formieInclude('field/label', { position: 'above' }) }}
+        {{ formieInclude('field/label', { position: 'left' }) }}
+
+        {% fieldtag 'fieldContent' %}
+            {{ formieInclude('field/instructions', { position: 'above' }) }}
+            {{ formieInclude('field/errors', { position: 'above' }) }}
+
+            {% fieldtag 'fieldControl' %}
+                {{ field.renderInput(form, value) }}
+            {% endfieldtag %}
+
+            {{ formieInclude('field/instructions', { position: 'below' }) }}
+            {{ formieInclude('field/errors', { position: 'below' }) }}
+        {% endfieldtag %}
+
+        {{ formieInclude('field/label', { position: 'right' }) }}
+        {{ formieInclude('field/label', { position: 'below' }) }}
+    {% endfieldtag %}
+{% endfieldtag %}

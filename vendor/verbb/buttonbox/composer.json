@@ -1,0 +1,48 @@
+{
+    "name": "verbb/buttonbox",
+    "description": "Visual choice, position, width, rating and editor action fields for Craft CMS.",
+    "type": "craft-plugin",
+    "version": "5.1.0",
+    "keywords": [
+        "craft",
+        "cms",
+        "craftcms",
+        "craft-plugin",
+        "buttonbox"
+    ],
+    "support": {
+        "email": "support@verbb.io",
+        "issues": "https://github.com/verbb/buttonbox/issues?state=open",
+        "source": "https://github.com/verbb/buttonbox",
+        "docs": "https://github.com/verbb/buttonbox",
+        "rss": "https://github.com/verbb/buttonbox/commits/craft-5.atom"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Verbb",
+            "homepage": "https://verbb.io"
+        },
+        {
+            "name": "Supercool",
+            "homepage": "http://supercooldesign.co.uk"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "craftcms/cms": "^5.10.11",
+        "verbb/base": "^3.0.19"
+    },
+    "autoload": {
+        "psr-4": {
+            "verbb\\buttonbox\\": "src/"
+        }
+    },
+    "extra": {
+        "name": "Button Box",
+        "handle": "buttonbox",
+        "documentationUrl": "https://github.com/verbb/buttonbox",
+        "changelogUrl": "https://raw.githubusercontent.com/verbb/buttonbox/craft-5/CHANGELOG.md",
+        "class": "verbb\\buttonbox\\ButtonBox"
+    }
+}

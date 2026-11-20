@@ -1,0 +1,13 @@
+{% extends 'formie/_layouts/settings' %}
+{% set title = 'Import Completed' | t('formie') %}
+
+{% block content %}
+
+<h2>{{ 'Import Completed' | t('formie') }}</h2>
+
+<p>{{ 'Your form “{title}” has been imported. <a href="{cpEditUrl}">Edit Form</a>' | t('formie', {
+    title: (form.title | e),
+    cpEditUrl: (form.getCpEditUrl() | e('html_attr')),
+}) | raw }}</p>
+
+{% endblock %}

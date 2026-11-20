@@ -1,0 +1,13 @@
+{% switch asset.extension %}
+
+    {% case "json" %}
+        <video>
+            <img src="{{ embeddedAsset.image }}">
+        </video>
+
+    {% default %}
+    <video autoplay="" loop="" muted="">
+        <source src="{{ asset.getUrl }}" type="video/mp4">
+    </video>
+    
+{% endswitch %}

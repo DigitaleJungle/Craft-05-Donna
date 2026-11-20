@@ -1,0 +1,258 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Salesflare extends Crm
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Salesflare';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToContact = false;
+
+    #[FormIntegrationSetting]
+    public ?array $contactFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToContact && $this->settingsContext->dataKey === 'contact') {
+                $fields = $this->request('GET', 'customfields/contacts');
+
+                $settings['contact'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'owner',
+                        'name' => Craft::t('formie', 'Owner'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'firstname',
+                        'name' => Craft::t('formie', 'First Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'middle',
+                        'name' => Craft::t('formie', 'Middle Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'lastname',
+                        'name' => Craft::t('formie', 'Last Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'suffix',
+                        'name' => Craft::t('formie', 'Suffix'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'birth_date',
+                        'name' => Craft::t('formie', 'Date of Birth'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone_number',
+                        'name' => Craft::t('formie', 'Phone Number'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'mobile_phone_number',
+                        'name' => Craft::t('formie', 'Mobile Phone Number'),
+                    ]),
+                ], $this->_getCustomFields($fields));
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'contacts');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $contactValues = $this->getFieldMappingValues($submission, $this->contactFieldMapping, 'contact');
+
+            // Special processing on this due to nested content in payload
+            $contactPayload = $this->_prepContactPayload($contactValues);
+
+            $response = $this->deliverPayload($submission, 'contacts', $contactPayload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+
+            $contactId = $response['id'] ?? '';
+
+            if (!$contactId) {
+                Integration::error($this, Craft::t('formie', 'Missing return “contactId” {response}. Sent payload {payload}', [
+                    'response' => Json::encode($response),
+                    'payload' => Json::encode($contactPayload),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey'], 'required'];
+
+        $contact = $this->getConfigValue('contact');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['contactFieldMapping'], 'validateFieldMapping', 'params' => $contact, 'when' => function($model) {
+                return $model->enabled && $model->mapToContact;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        return Craft::createGuzzleClient([
+            'base_uri' => 'https://api.salesflare.com/',
+            'headers' => [
+                'Authorization' => 'Bearer ' . App::parseEnv($this->apiKey),
+                'Content-Type' => 'application/json',
+            ],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToContact',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Contact']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Contacts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'contactFieldMapping',
+            'if' => 'mapToContact',
+            'dataLabel' => 'Contact',
+            'dataKey' => 'contact',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'date' => IntegrationField::TYPE_DATE,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields, array $excludeNames = []): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $field) {
+            $customFields[] = new IntegrationField([
+                'handle' => 'custom:' . $field['id'],
+                'name' => $field['name'],
+                'type' => $this->_convertFieldType($field['type']['type']),
+                'sourceType' => $field['type']['type'],
+                'required' => $field['required'],
+            ]);
+        }
+
+        return $customFields;
+    }
+
+    private function _prepContactPayload($fields): array
+    {
+        $payload = $fields;
+
+        foreach ($payload as $key => $value) {
+            if (str_starts_with($key, 'custom:')) {
+                $field = ArrayHelper::remove($payload, $key);
+
+                $payload['custom'][str_replace('custom:', '', $key)] = $value;
+            }
+        }
+
+        return $payload;
+    }
+}

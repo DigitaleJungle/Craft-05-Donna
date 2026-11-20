@@ -1,0 +1,39 @@
+<?php
+namespace verbb\formie\compatibility\integrations;
+
+use verbb\formie\enums\IntegrationStatus;
+use verbb\formie\models\IntegrationResponse;
+use verbb\formie\models\IntegrationResult;
+
+final class IntegrationResultCompatibility
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function toLegacy(IntegrationResult $result, ?IntegrationResponse $response = null): bool|IntegrationResponse
+    {
+        // Formie 3 acknowledged cancelled or ineligible sends without treating them as failures.
+        $success = $result->isSuccessful() || $result->status === IntegrationStatus::Skipped;
+
+        return $response ? new IntegrationResponse($success, $response->message ?? []) : $success;
+    }
+
+    public static function normalize(mixed $value): IntegrationResult
+    {
+        if ($value instanceof IntegrationResult) {
+            return $value;
+        }
+
+        if ($value instanceof IntegrationResponse) {
+            $value = $value->success;
+        }
+
+        // Only documented stable returns have meaning. Objects, null and arbitrary
+        // response arrays cannot become success through PHP truthiness.
+        return match ($value) {
+            true => IntegrationResult::succeeded(),
+            false => IntegrationResult::failed('legacy_failure'),
+            default => IntegrationResult::failed('invalid_provider_result'),
+        };
+    }
+}

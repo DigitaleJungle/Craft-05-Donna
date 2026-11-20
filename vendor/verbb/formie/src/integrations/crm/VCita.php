@@ -1,0 +1,286 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class VCita extends Crm
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'vCita';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToClient = false;
+
+    #[FormIntegrationSetting]
+    public ?array $clientFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToClient && $this->settingsContext->dataKey === 'client') {
+                $response = $this->request('GET', 'fields');
+                $fields = $response['data'] ?? [];
+
+                $settings['client'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'first_name',
+                        'name' => Craft::t('formie', 'First Name'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'last_name',
+                        'name' => Craft::t('formie', 'Last Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone',
+                        'name' => Craft::t('formie', 'Phone Number'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'address',
+                        'name' => Craft::t('formie', 'Address'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'source_campaign',
+                        'name' => Craft::t('formie', 'Source Campaign'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'source_channel',
+                        'name' => Craft::t('formie', 'Source Channel'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'source_name',
+                        'name' => Craft::t('formie', 'Source Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'source_url',
+                        'name' => Craft::t('formie', 'Source URL'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'staff_id',
+                        'name' => Craft::t('formie', 'Staff ID'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'status',
+                        'name' => Craft::t('formie', 'Status'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'tags',
+                        'name' => Craft::t('formie', 'Tags'),
+                    ]),
+                ], $this->_getCustomFields($fields));
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'clients');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $clientValues = $this->getFieldMappingValues($submission, $this->clientFieldMapping, 'client');
+
+            // Special processing on this due to nested content in payload
+            $clientPayload = $clientValues;
+
+            // Can't handle update and create, so check first
+            $response = $this->request('GET', 'clients', [
+                'query' => [
+                    'search_by' => 'email',
+                    'search_term' => $clientPayload['email'] ?? '',
+                ],
+            ]);
+            $existingClient = $response['data']['clients'][0]['id'] ?? '';
+
+            if ($existingClient) {
+                $response = $this->deliverPayload($submission, "clients/{$existingClient}", $clientPayload, 'PUT');
+            } else {
+                $response = $this->deliverPayload($submission, 'clients', $clientPayload);
+            }
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+
+            $clientId = $response['data']['client']['id'] ?? '';
+
+            if (!$clientId) {
+                Integration::error($this, Craft::t('formie', 'Missing return “clientId” {response}. Sent payload {payload}', [
+                    'response' => Json::encode($response),
+                    'payload' => Json::encode($clientPayload),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey'], 'required'];
+
+        $client = $this->getConfigValue('client');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['clientFieldMapping'], 'validateFieldMapping', 'params' => $client, 'when' => function($model) {
+                return $model->enabled && $model->mapToClient;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        return Craft::createGuzzleClient([
+            'base_uri' => 'https://api.vcita.biz/platform/v1/',
+            'headers' => [
+                'Authorization' => 'Bearer ' . App::parseEnv($this->apiKey),
+                'Content-Type' => 'application/json',
+            ],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToClient',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Client']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Clients']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'clientFieldMapping',
+            'if' => 'mapToClient',
+            'dataLabel' => 'Client',
+            'dataKey' => 'client',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'datepicker' => IntegrationField::TYPE_DATE,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields, array $excludeNames = []): array
+    {
+        $customFields = [];
+
+        // Lots of fields aren't supported, but have to use their name. No clear definition on custom and core field.
+        $unsupportedFields = [
+            // types
+            'email',
+            'firstname',
+            'lastname',
+            'phone',
+            'address',
+
+            // labels
+            'Job title',
+            'Company name',
+            'Your website URL',
+            'Birthday',
+        ];
+
+        foreach ($fields as $key => $field) {
+            // Only allow supported types
+            if (in_array($field['type'], $unsupportedFields) || in_array($field['label'], $unsupportedFields)) {
+                continue;
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => $field['label'],
+                'name' => $field['label'],
+                'type' => $this->_convertFieldType($field['type']),
+                'sourceType' => $field['type'],
+                'required' => $field['required'],
+            ]);
+        }
+
+        return $customFields;
+    }
+}

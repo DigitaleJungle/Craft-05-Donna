@@ -1,0 +1,90 @@
+<?php
+namespace verbb\formie\integrations\captchas;
+
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Captcha;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+class Akismet extends Captcha
+{
+    // Properties
+    // =========================================================================
+
+    public ?string $handle = 'akismet';
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getName(): string
+    {
+        return 'Akismet';
+    }
+
+    public function getDescription(): string
+    {
+        return 'Akismet’s next generation machine learning filters out comment, form, and text spam with 99.99% accuracy, so you never have to worry about it again. Find out more via [Akismet](https://akismet.com/).';
+    }
+
+    public function getSettingsHtml(): ?string
+    {
+        $variables = $this->getSettingsHtmlVariables();
+
+        return Craft::$app->getView()->renderTemplate('formie/integrations/captchas/akismet/_plugin-settings', $variables);
+    }
+
+    public function validateSubmission(Submission $submission): bool
+    {
+        $apiKey = App::parseEnv($this->apiKey);
+        $siteUrl = Craft::$app->getSites()->getCurrentSite()->getBaseUrl();
+
+        $client = $this->getClient();
+
+        $data = [
+            'api_key' => $apiKey,
+            'blog' => $siteUrl,
+            'user_ip' => Craft::$app->getRequest()->getUserIP(),
+            'user_agent' => Craft::$app->getRequest()->getUserAgent(),
+            'referrer' => Craft::$app->getRequest()->getReferrer(),
+            'comment_type' => 'contact-form',
+            'comment_content' => ArrayHelper::recursiveImplode($submission->getValuesAsString(), ' '),
+        ];
+
+        try {
+            // Lack of JSON response
+            $response = $client->post('https://rest.akismet.com/1.1/comment-check', [
+                'form_params' => $data,
+                'headers' => [
+                    'User-Agent' => 'Formie | Akismet/1.0',
+                ],
+            ]);
+
+            $body = (string)$response->getBody();
+
+            if ($body === 'true') {
+                $this->spamReason = 'Akismet flagged this submission as spam.';
+
+                return false;
+            }
+        } catch (Throwable $e) {
+            return $this->handleValidationException($submission, $e);
+        }
+
+        return true;
+    }
+
+    public function hasValidSettings(): bool
+    {
+        return (bool)$this->apiKey;
+    }
+}

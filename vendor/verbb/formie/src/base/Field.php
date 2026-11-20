@@ -1,0 +1,1578 @@
+<?php
+namespace verbb\formie\base;
+
+use verbb\formie\Formie;
+use verbb\formie\compatibility\fields\FieldCompatibility;
+use verbb\formie\compatibility\fields\FieldConfigNormalizer;
+use verbb\formie\compatibility\fields\FieldRuntimeCompatibility;
+use verbb\formie\conditions\ConditionVisibility;
+use verbb\formie\content\ContentEncryption;
+use verbb\formie\content\FieldStorageCodec;
+use verbb\formie\content\SubmissionContentAccessor;
+use verbb\formie\deprecations\FieldDeprecations;
+use verbb\formie\elements\Form;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\FieldElementEvent;
+use verbb\formie\events\ModifyFieldUniqueQueryEvent;
+use verbb\formie\events\ModifyFieldValueEvent;
+use verbb\formie\fields;
+use verbb\formie\fields\coercion\EmptyValueCoercer;
+use verbb\formie\helpers\FieldBuilderPolicy;
+use verbb\formie\helpers\FileHelper;
+use verbb\formie\helpers\Html;
+use verbb\formie\helpers\References;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\helpers\Table;
+use verbb\formie\helpers\ValidationMessagesHelper;
+use verbb\formie\models\FieldLayout;
+use verbb\formie\models\FieldLayoutPage;
+use verbb\formie\models\FieldLayoutRow;
+use verbb\formie\models\FieldPath;
+use verbb\formie\models\LayoutSaveContext;
+use verbb\formie\models\Notification;
+use verbb\formie\models\RichText;
+use verbb\formie\models\Settings;
+use verbb\formie\query\FieldValueQueryHelper;
+use verbb\formie\references\FieldReferenceResolver;
+use verbb\formie\references\ReferenceContext;
+use verbb\formie\services\RuntimeConfiguration;
+use verbb\formie\validators\FieldReferenceUniqueValidator;
+use verbb\formie\validators\HandleValidator;
+use verbb\formie\validators\LayoutHandleUniqueValidator;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\base\SavableComponent;
+use craft\db\Query;
+use craft\elements\db\ElementQueryInterface;
+use craft\gql\types\QueryArgument;
+use craft\helpers\Db;
+use craft\helpers\ElementHelper;
+use craft\helpers\Json;
+use craft\helpers\Template;
+use craft\models\GqlSchema;
+use craft\web\View;
+
+use yii\db\ExpressionInterface;
+use yii\db\Schema;
+use yii\helpers\Markdown;
+
+use DateTime;
+use DateTimeInterface;
+
+use GraphQL\Type\Definition\Type;
+use Twig\Markup;
+
+abstract class Field extends SavableComponent implements FieldInterface, SearchableFieldInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    /** @deprecated Use ::class for identity or getShortClassName() for a short name. */
+    public static function className(): string
+    {
+        return FieldCompatibility::withLegacyCall(static::class, 'className', fn() => static::getShortClassName());
+    }
+
+    public static function getShortClassName(): string
+    {
+        if (FieldCompatibility::prefersLegacyMethod(static::class, 'className', 'getShortClassName')) {
+            return FieldCompatibility::withLegacyCall(static::class, 'className', fn() => static::className());
+        }
+
+        $classNameParts = explode('\\', static::class);
+
+        return array_pop($classNameParts);
+    }
+
+    public static function kebabClassName(): string
+    {
+        return StringHelper::toKebabCase(static::getShortClassName());
+    }
+
+    public static function lowerClassName(): string
+    {
+        return StringHelper::toLowerCase(static::getShortClassName());
+    }
+
+    public static function dbType(): array|string|null
+    {
+        return Schema::TYPE_TEXT;
+    }
+
+    public static function queryCondition(array $instances, mixed $value, array &$params): array|string|ExpressionInterface|false|null
+    {
+        return FieldValueQueryHelper::buildQueryCondition($instances, $value, $params);
+    }
+
+    public static function getReferenceBlockTemplatePath(): string
+    {
+        if (FieldCompatibility::prefersLegacyMethod(static::class, 'getEmailTemplatePath', 'getReferenceBlockTemplatePath')) {
+            return FieldCompatibility::withLegacyCall(static::class, 'getEmailTemplatePath', fn() => static::getEmailTemplatePath());
+        }
+
+        return static::DEFAULT_REFERENCE_BLOCK_TEMPLATE_PATH ?? 'fields/' . static::kebabClassName();
+    }
+
+    public static function defineFieldType(): array
+    {
+        $icon = static::getSvgIcon();
+
+        $isParentField = is_subclass_of(static::class, ParentFieldInterface::class);
+        $isFixedParentField = is_subclass_of(static::class, FixedParentFieldInterface::class);
+        $isChildField = is_subclass_of(static::class, ChildFieldInterface::class);
+        $isCosmetic = is_subclass_of(static::class, CosmeticFieldInterface::class);
+        $isBuilderField = is_subclass_of(static::class, BuilderFieldInterface::class);
+
+        return [
+            'icon' => $icon,
+            'type' => static::class,
+            'label' => static::displayName(),
+            'hasLabel' => !$isCosmetic,
+            'hasConditions' => false,
+            'isCosmetic' => $isCosmetic,
+            'isBuilderField' => $isBuilderField,
+            'isSynced' => false,
+            'isParentField' => $isParentField,
+            'isFixedParentField' => $isFixedParentField,
+            'isContainerParentField' => is_subclass_of(static::class, ContainerParentFieldInterface::class),
+            'isRepeatableParentField' => is_subclass_of(static::class, RepeatableParentFieldInterface::class),
+            'isChildField' => $isChildField,
+            'hasEditableFields' => !($isParentField && !$isFixedParentField),
+            'isPickable' => !$isChildField,
+            'isQuestionnaireField' => is_subclass_of(static::class, QuestionnaireFieldInterface::class),
+        ];
+    }
+
+    public static function getFieldTypeDefinition(): array
+    {
+        if (isset(self::$_fieldTypeDefinitionCache[static::class])) {
+            return self::$_fieldTypeDefinitionCache[static::class];
+        }
+
+        // Builder/type metadata is pure static configuration, so cache it once
+        // per concrete field class rather than re-deriving it during every
+        // builder boot or field registry lookup.
+        self::$_fieldTypeDefinitionCache[static::class] = static::defineFieldType();
+
+        return self::$_fieldTypeDefinitionCache[static::class];
+    }
+
+    public static function translatableProperties(): array
+    {
+        return [
+            'label',
+            'instructions',
+            'placeholder',
+            'defaultValue',
+            'validationMessages',
+        ];
+    }
+
+    public static function translatableRichTextProperties(): array
+    {
+        return ['instructions'];
+    }
+
+    public static function getSvgIcon(): string
+    {
+        $iconPath = static::getSvgIconPath();
+
+        if ($iconPath === '') {
+            return '';
+        }
+
+        if (array_key_exists(static::class, self::$_svgIconCache)) {
+            return self::$_svgIconCache[static::class];
+        }
+
+        // Fast-path static SVG templates, while allowing custom module template paths.
+        $svg = FileHelper::readTemplateContents($iconPath, View::TEMPLATE_MODE_CP, __METHOD__);
+
+        if ($svg !== null) {
+            self::$_svgIconCache[static::class] = $svg;
+
+            return self::$_svgIconCache[static::class];
+        }
+
+        self::$_svgIconCache[static::class] = Craft::$app->getView()->renderTemplate($iconPath);
+
+        return self::$_svgIconCache[static::class];
+    }
+
+    public static function getSvgIconPath(): string
+    {
+        return '';
+    }
+
+    public static function getInputTemplatePath(): string
+    {
+        if (FieldCompatibility::prefersLegacyMethod(static::class, 'getFrontEndInputTemplatePath', 'getInputTemplatePath')) {
+            return FieldCompatibility::withLegacyCall(static::class, 'getFrontEndInputTemplatePath', fn() => static::getFrontEndInputTemplatePath());
+        }
+
+        return static::DEFAULT_INPUT_TEMPLATE_PATH ?? 'fields/' . static::kebabClassName();
+    }
+
+    public static function getRequiredPlugins(): array
+    {
+        return [];
+    }
+
+    public static function compatibleFieldTypes(): array
+    {
+        return [];
+    }
+
+    public static function supportsGqlConfigProvider(): bool
+    {
+        return false;
+    }
+
+    public static function gqlIncludeInSchemaFromConfig(array $config, GqlSchema $schema): bool
+    {
+        return true;
+    }
+
+    public static function gqlContentTypeFromConfig(array $config): Type|array
+    {
+        return Type::string();
+    }
+
+    public static function gqlContentMutationArgumentTypeFromConfig(array $config): Type|array
+    {
+        return [
+            'name' => $config['handle'] ?? '',
+            'type' => Type::string(),
+            'description' => self::_gqlInstructionsDescription($config['instructions'] ?? null),
+        ];
+    }
+
+    public static function gqlContentQueryArgumentTypeFromConfig(array $config): Type|array
+    {
+        return [
+            'name' => $config['handle'] ?? '',
+            'type' => Type::listOf(QueryArgument::getType()),
+        ];
+    }
+
+    protected static function valueSql(array $instances, string $key = null): ?string
+    {
+        return FieldValueQueryHelper::resolveCoalescedValueSql($instances, $key);
+    }
+
+    protected static function valueColumnType(array $instances, string $key = null): ?string
+    {
+        return FieldValueQueryHelper::resolveCoalescedColumnType($instances, $key);
+    }
+
+    private static function _gqlInstructionsDescription(mixed $instructions): ?string
+    {
+        $richText = self::_instructionsFrom($instructions);
+
+        return $richText->isEmpty() ? null : $richText->toPlainText();
+    }
+
+    /**
+     * Normalizes legacy field instructions before rich-text conversion.
+     * Plain-text instructions were previously rendered with Twig's `| md` filter.
+     */
+    private static function _normalizeInstructionsValue(mixed $value): mixed
+    {
+        if ($value instanceof RichText) {
+            return $value;
+        }
+
+        if ($value === null || $value === '') {
+            return $value;
+        }
+
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $value = trim($value);
+
+        if ($value === '') {
+            return '';
+        }
+
+        if (Json::decodeIfJson($value) !== $value) {
+            return $value;
+        }
+
+        if (preg_match('/<\s*[a-z!\/][^>]*>/i', $value)) {
+            return $value;
+        }
+
+        return Markdown::process($value);
+    }
+
+    private static function _instructionsFrom(mixed $value): RichText
+    {
+        return RichText::from(self::_normalizeInstructionsValue($value));
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_BEFORE_ELEMENT_SAVE = 'beforeElementSave';
+    public const EVENT_AFTER_ELEMENT_SAVE = 'afterElementSave';
+    public const EVENT_AFTER_ELEMENT_PROPAGATE = 'afterElementPropagate';
+    public const EVENT_BEFORE_ELEMENT_DELETE = 'beforeElementDelete';
+    public const EVENT_AFTER_ELEMENT_DELETE = 'afterElementDelete';
+    public const EVENT_BEFORE_ELEMENT_RESTORE = 'beforeElementRestore';
+    public const EVENT_AFTER_ELEMENT_RESTORE = 'afterElementRestore';
+
+    public const EVENT_MODIFY_DEFAULT_VALUE = 'modifyDefaultValue';
+    public const EVENT_MODIFY_FIELD_CONFIG = 'modifyFieldConfig';
+    public const EVENT_MODIFY_SLOT_TAG = 'modifySlotTag';
+    public const EVENT_MODIFY_HTML_TAG = 'modifyHtmlTag';
+    public const EVENT_MODIFY_VALUE_AS_STRING = 'modifyValueAsString';
+    public const EVENT_MODIFY_VALUE_AS_DATA = 'modifyValueAsData';
+    public const EVENT_MODIFY_VALUE_FOR_EXPORT = 'modifyValueForExport';
+    public const EVENT_MODIFY_VALUE_FOR_REPORT = 'modifyValueForReport';
+    public const EVENT_MODIFY_VALUE_FOR_INTEGRATION = 'modifyValueForIntegration';
+    public const EVENT_MODIFY_VALUE_FOR_REFERENCE = 'modifyValueForReference';
+    public const EVENT_MODIFY_VALUE_FOR_REFERENCE_BLOCK = 'modifyValueForReferenceBlock';
+    public const EVENT_MODIFY_VALUE_FOR_SUMMARY = 'modifyValueForSummary';
+    public const EVENT_MODIFY_VALUE_FOR_EMAIL_PREVIEW = 'modifyValueForEmailPreview';
+    public const EVENT_MODIFY_UNIQUE_QUERY = 'modifyUniqueQuery';
+    public const EVENT_MODIFY_FIELD_SCHEMA = 'modifyFieldSchema';
+
+    public const TRANSLATION_METHOD_NONE = 'none';
+    public const TRANSLATION_METHOD_SITE = 'site';
+    public const TRANSLATION_METHOD_SITE_GROUP = 'siteGroup';
+    public const TRANSLATION_METHOD_LANGUAGE = 'language';
+    public const TRANSLATION_METHOD_CUSTOM = 'custom';
+
+    public const KIND_CUSTOM = 'custom';
+    public const KIND_TEXT = 'text';
+    public const KIND_TEXTAREA = 'textarea';
+    public const KIND_BOOLEAN = 'boolean';
+    public const KIND_PHONE = 'phone';
+    public const KIND_FILE = 'file';
+    public const KIND_HIDDEN = 'hidden';
+    public const KIND_DATE = 'date';
+    public const KIND_ADDRESS = 'address';
+    public const KIND_NAME = 'name';
+    public const KIND_PAYMENT = 'payment';
+    public const KIND_REPEATER = 'repeater';
+    public const KIND_TABLE = 'table';
+    public const KIND_SIGNATURE = 'signature';
+    public const KIND_SELECT = 'select';
+    public const KIND_RADIO_GROUP = 'radio-group';
+    public const KIND_CHECKBOX_GROUP = 'checkbox-group';
+
+    // Deprecated
+    public const EVENT_MODIFY_VALUE_AS_JSON = self::EVENT_MODIFY_VALUE_AS_DATA;
+    public const EVENT_MODIFY_VALUE_FOR_EMAIL = self::EVENT_MODIFY_VALUE_FOR_REFERENCE_BLOCK;
+
+    protected const DEFAULT_INPUT_TEMPLATE_PATH = null;
+    protected const DEFAULT_REFERENCE_BLOCK_TEMPLATE_PATH = null;
+
+
+    // Traits
+    // =========================================================================
+
+    use FieldDeprecations;
+    use FieldDefinitionTrait;
+    use FieldRuntimeCompatibility;
+    use FieldBrowserValidationTrait;
+    use FieldBrowserConditionTrait;
+    use FieldClientRenderedDefinitionTrait;
+    use FieldCpEditConfigTrait;
+    use FieldServerRenderTrait;
+    use FieldValueTrait;
+    use FieldFormBuilderTrait;
+    use FieldSubmissionTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    // Lets an upgrade carry over settings that were accepted when they were saved, such as fields encrypted before
+    // a dedicated key existed, or an upload location whose volume has since been deleted.
+    public static bool $relaxLegacyUpgradeValidation = false;
+
+    public ?int $layoutId = null;
+    public ?int $pageId = null;
+    public ?int $rowId = null;
+    public ?LayoutSaveContext $layoutSaveContext = null;
+    public ?int $definitionId = null;
+    public ?string $definitionUid = null;
+    public ?int $usageCount = null;
+    public ?string $label = null;
+    public ?string $handle = null;
+    public ?string $reference = null;
+    public ?int $sortOrder = null;
+    public ?DateTime $dateCreated = null;
+    public ?DateTime $dateUpdated = null;
+    public ?string $uid = null;
+    public bool $isSynced = false;
+    public RichText $instructions;
+    public bool $required = false;
+    public bool $enabled = true;
+    public ?string $matchField = null;
+    public ?string $placeholder = null;
+    public mixed $defaultValue = null;
+    public ?string $prefillQueryParam = null;
+    public ?string $errorMessage = null;
+    public array $validationMessages = [];
+    public ?string $labelPosition = null;
+    public ?string $instructionsPosition = null;
+    public ?string $errorMessagePosition = null;
+    public ?string $cssClasses = null;
+    public ?array $containerAttributes = null;
+    public ?array $inputAttributes = null;
+    public bool $includeInEmailFieldSummaries = true;
+    public ?string $emailFieldSummaryValue = null;
+    public bool $enableConditions = false;
+    public ?array $conditions = null;
+    public bool $enableContentEncryption = false;
+    public ?string $visibility = null;
+    public RichText $builderNote;
+    public bool $builderLocked = false;
+
+    private static array $_fieldTypeDefinitionCache = [];
+    private static array $_svgIconCache = [];
+    private static array $_previewTemplateCache = [];
+    private ?Form $_form = null;
+    private ?FieldLayout $_layout = null;
+    private ?FieldLayoutPage $_page = null;
+    private ?FieldLayoutRow $_row = null;
+    private ?FieldInterface $_parentField = null;
+    private string $_namespace = 'fields';
+    private ?FieldPath $_fieldPath = null;
+    private ?bool $_isFresh = null;
+    private array $_valueSql = [];
+    private array $_valueColumnType = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct(array $config = [])
+    {
+        $this->initializeLegacySettingAliases();
+
+        if (array_key_exists('prePopulate', $config)) {
+            $config['prefillQueryParam'] = $config['prefillQueryParam'] ?? $config['prePopulate'];
+            unset($config['prePopulate']);
+        }
+
+        // Config normalization
+        self::normalizeConfig($config);
+
+        Formie::$plugin?->getFormDefaults()?->applyToNewField($config, static::class, $this->getSupportedDefaults());
+        FieldBuilderPolicy::applyToFieldConfig($config, static::class);
+        $config['instructions'] = self::_instructionsFrom($config['instructions'] ?? null);
+        $config['builderNote'] = RichText::from($config['builderNote'] ?? null);
+
+        parent::__construct($config);
+    }
+
+    public function setAttributes($values, $safeOnly = true): void
+    {
+        if (is_array($values)) {
+            $values = FieldConfigNormalizer::normalizeSettingAliases($values, static::class);
+        }
+
+        if (is_array($values) && array_key_exists('instructions', $values)) {
+            $values['instructions'] = self::_instructionsFrom($values['instructions']);
+        }
+
+        if (is_array($values) && array_key_exists('builderNote', $values)) {
+            $values['builderNote'] = RichText::from($values['builderNote']);
+        }
+
+        parent::setAttributes($values, $safeOnly);
+    }
+
+    public function getSettings(): array
+    {
+        $settings = FieldConfigNormalizer::normalizeSettingAliases(parent::getSettings(), static::class);
+        $settings['instructions'] = $this->instructions->getSchema();
+        $settings['builderNote'] = $this->builderNote->getSchema();
+
+        return $settings;
+    }
+
+    public function hasInstructions(): bool
+    {
+        return !$this->instructions->isEmpty();
+    }
+
+    public function getInstructionsHtml(): Markup
+    {
+        if ($this->instructions->isEmpty()) {
+            return Template::raw('');
+        }
+
+        return Template::raw($this->instructions->toHtml(null, true));
+    }
+
+    public function settingsAttributes(): array
+    {
+        $names = parent::settingsAttributes();
+        $names[] = 'instructions';
+        $names[] = 'enabled';
+        $names[] = 'required';
+        $names[] = 'matchField';
+        $names[] = 'placeholder';
+        $names[] = 'defaultValue';
+        $names[] = 'prefillQueryParam';
+        $names[] = 'errorMessage';
+        $names[] = 'validationMessages';
+        $names[] = 'labelPosition';
+        $names[] = 'instructionsPosition';
+        $names[] = 'errorMessagePosition';
+        $names[] = 'cssClasses';
+        $names[] = 'containerAttributes';
+        $names[] = 'inputAttributes';
+        $names[] = 'includeInEmailFieldSummaries';
+        $names[] = 'emailFieldSummaryValue';
+        $names[] = 'enableConditions';
+        $names[] = 'conditions';
+        $names[] = 'enableContentEncryption';
+        $names[] = 'visibility';
+        $names[] = 'builderNote';
+        $names[] = 'builderLocked';
+
+        return $names;
+    }
+
+    public function getType(): string
+    {
+        return static::class;
+    }
+
+    public function themeConfigKey(): string
+    {
+        return StringHelper::toCamelCase(StringHelper::toKebabCase(static::getShortClassName()));
+    }
+
+    public function getDisplayType(): ?string
+    {
+        if (property_exists($this, 'displayType')) {
+            return $this->displayType;
+        }
+
+        return null;
+    }
+
+    public function hasLabel(): bool
+    {
+        return true;
+    }
+
+    public function usesQuestionLabel(): bool
+    {
+        return false;
+    }
+
+    public function getIsCosmetic(): bool
+    {
+        return false;
+    }
+
+    public function getIsBuilderField(): bool
+    {
+        return $this instanceof BuilderFieldInterface;
+    }
+
+    public function hasReferenceBlockLabel(): bool
+    {
+        return $this->callLegacyFieldMethod('hasEmailLabel', 'hasReferenceBlockLabel', [], fn() => true);
+    }
+
+    public function hasReferenceBlockPlaceholder(): bool
+    {
+        return $this->callLegacyFieldMethod('hasEmailPlaceholder', 'hasReferenceBlockPlaceholder', [], fn() => true);
+    }
+
+    public function getIsHidden(): bool
+    {
+        return $this->visibility === 'hidden';
+    }
+
+    public function getIsDisabled(): bool
+    {
+        return !$this->enabled || $this->visibility === 'disabled';
+    }
+
+    public function getIsRequired(): ?bool
+    {
+        return $this->required;
+    }
+
+    public function getIsNested(): bool
+    {
+        return (bool)$this->getParentField();
+    }
+
+    public function setIsFresh(?bool $isFresh = null): void
+    {
+        $this->_isFresh = $isFresh;
+    }
+
+    public function getForm(): ?Form
+    {
+        if ($this->_form || !$this->layoutId) {
+            return $this->_form;
+        }
+
+        if ($parentField = $this->getParentField()) {
+            return $this->_form = Formie::$plugin->getForms()->getFormByLayoutId($parentField->layoutId);
+        }
+
+        return $this->_form = Formie::$plugin->getForms()->getFormByLayoutId($this->layoutId);
+    }
+
+    public function getLayout(): ?FieldLayout
+    {
+        if ($this->_layout || !$this->layoutId) {
+            return $this->_layout;
+        }
+
+        return $this->_layout = Formie::$plugin->getFields()->getLayoutById($this->layoutId);
+    }
+
+    public function getPage(): ?FieldLayoutPage
+    {
+        if ($this->_page || !$this->pageId) {
+            return $this->_page;
+        }
+
+        return $this->_page = Formie::$plugin->getFields()->getPageById($this->pageId);
+    }
+
+    public function getRow(): ?FieldLayoutRow
+    {
+        if ($this->_row || !$this->rowId) {
+            return $this->_row;
+        }
+
+        return $this->_row = Formie::$plugin->getFields()->getRowById($this->rowId);
+    }
+
+    public function modifyAttributeLabels(array &$labels): void
+    {
+    }
+
+    public function mergePartialRequestValue(mixed $previous, mixed $incoming): mixed
+    {
+        return $incoming;
+    }
+
+    public function discardRequestValue(Submission $submission): void
+    {
+        if ($param = $this->requestParamName($submission)) {
+            $state = $submission->getContentState();
+
+            foreach (array_keys($state->uploadedDataFiles) as $key) {
+                if ($key === $param || str_starts_with($key, $param . '.')) {
+                    unset($state->uploadedDataFiles[$key]);
+                }
+            }
+        }
+    }
+
+    public function normalizeValueFromRequest(mixed $value, ?ElementInterface $element): mixed
+    {
+        return $this->normalizeValue($value, $element);
+    }
+
+    public function normalizeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        if ($this->valueType()->kind === 'string' && !is_string($value)) {
+            $value = is_scalar($value) || $value === null ? (string)$value : Json::encode(FieldStorageCodec::assertSafe($value));
+        }
+
+        if (is_string($value)) {
+            // Preserve plain-text field values and only normalize invalid control characters.
+            $value = StringHelper::normalizePlainText($value);
+            $value = $this->sanitizePlainTextValueIfConfigured($value);
+
+            if ($this->shouldTrimNormalizedPlainText()) {
+                $value = trim($value);
+            }
+        }
+
+        return $this->getIsCosmetic() ? null : ($value ?? '');
+    }
+
+    final public function serializeValueForDb(mixed $value, ?ElementInterface $element = null): mixed
+    {
+        if (FieldCompatibility::prefersLegacyMethod($this, 'serializeValue', 'defineValueForDb')) {
+            Craft::$app->getDeprecator()->log(static::class . '::serializeValue', 'Implement defineValueForDb() instead of overriding serializeValue().');
+        }
+
+        $stored = FieldCompatibility::prefersLegacyMethod($this, 'serializeValue', 'defineValueForDb')
+            ? $this->serializeValue($value, $element)
+            : $this->defineValueForDb($value, $element);
+
+        return FieldStorageCodec::encode($stored, (bool)$this->enableContentEncryption);
+    }
+
+    final public function normalizeFieldValue(mixed $value, ?ElementInterface $element = null): mixed
+    {
+        return $this->valueType()->assert($this->normalizeValue($value, $element), static::class . ' [' . $this->handle . ']');
+    }
+
+    public function decodeValueFromStorage(mixed $value): mixed
+    {
+        return FieldStorageCodec::decode($value);
+    }
+
+    final public function normalizeValueFromStorage(mixed $value, ?ElementInterface $element = null): mixed
+    {
+        return $this->normalizeFieldValue($this->decodeValueFromStorage($value), $element);
+    }
+
+    public function serializeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        Craft::$app->getDeprecator()->log(__METHOD__, 'Use serializeValueForDb(); custom fields should implement defineValueForDb().');
+
+        return $this->defineValueForDb($value, $element);
+    }
+
+    // The input that clears this field's answer, such as for a field hidden by conditions.
+    // Fields that apply defaults when a new submission has no value return an empty answer instead.
+    public function getClearedValue(): mixed
+    {
+        return null;
+    }
+
+    public function isValueEmpty(mixed $value, ?ElementInterface $element): bool
+    {
+        return EmptyValueCoercer::isEmpty($value);
+    }
+
+    public function getElementConditionRuleType(): array|string|null
+    {
+        return null;
+    }
+
+    public function getValueSql(?string $key = null): ?string
+    {
+        if (!$this->uid) {
+            return null;
+        }
+
+        $cacheKey = $key ?? '*';
+        $this->_valueSql[$cacheKey] ??= $this->_valueSql($key) ?? false;
+
+        return $this->_valueSql[$cacheKey] ?: null;
+    }
+
+    public function getValueColumnType(?string $key = null): ?string
+    {
+        if (!$this->uid) {
+            return null;
+        }
+
+        $cacheKey = $key ?? '*';
+        $this->_valueColumnType[$cacheKey] ??= $this->_valueColumnType($key) ?? false;
+
+        return $this->_valueColumnType[$cacheKey] ?: null;
+    }
+
+    public function getSortOption(): array
+    {
+        return [
+            'label' => $this->label,
+            'orderBy' => [$this->getValueSql(), 'elements.id'],
+            'attribute' => "field:{$this->uid}",
+        ];
+    }
+
+    public function runtimeOverridableSettings(): array
+    {
+        return ['label', 'instructions', 'required', 'visibility', 'defaultValue', 'prefillQueryParam',
+            'placeholder', 'cssClasses', 'containerAttributes', 'inputAttributes', 'options', 'optionsMode'];
+    }
+
+    public function setInstanceForm(Form $form): void
+    {
+        $this->_form = $form;
+    }
+
+    public function populateValue(mixed $value, ?Submission $submission): void
+    {
+        $form = $submission?->getForm() ?? $this->getForm();
+
+        if ($form) {
+            $form->replaceInstanceConfig($form->getInstanceConfig()->with('initial', [$this->uid => (new RuntimeConfiguration())->populationValue($this, $value, $submission)]));
+        }
+    }
+
+    public function getMatchField(): ?string
+    {
+        $entry = $this->getMatchFieldEntry();
+
+        if (!$entry) {
+            return null;
+        }
+
+        $path = [];
+        $ownPath = explode('.', $this->valueKey());
+
+        foreach ($entry['parts'] as $part) {
+            if (is_string($part)) {
+                $path[] = $part;
+
+                continue;
+            }
+
+            // A field in the same Repeater compares within its row. Anything else uses the first row, as the picker's token says.
+            $index = count($path);
+            $path[] = array_slice($ownPath, 0, $index) === $path && count($ownPath) > $index + 1 ? $ownPath[$index] : '0';
+        }
+
+        return implode('.', $path);
+    }
+
+    protected function getMatchFieldTarget(): ?FieldInterface
+    {
+        return $this->getMatchFieldEntry()['field'] ?? null;
+    }
+
+    protected function getMatchFieldBuilderValue(): ?string
+    {
+        $entry = $this->getMatchFieldEntry();
+
+        if (!$entry || !$entry['field']->reference) {
+            return null;
+        }
+
+        $expression = References::parseReferenceExpression(trim($this->matchField));
+
+        // Already what the picker offers, including its row scope.
+        if ($expression->isValid && $expression->identifier === (string)$entry['field']->reference) {
+            return null;
+        }
+
+        return References::field((string)$entry['field']->reference, null, array_filter($entry['parts'], 'is_array') ? ['scope' => 'first'] : []);
+    }
+
+    protected function getMatchFieldEntry(): ?array
+    {
+        if (!$this->matchField) {
+            return null;
+        }
+
+        $matchField = trim($this->matchField);
+
+        // Freeform migrations store `{handle}`, which isn't a reference expression.
+        if (preg_match('/^\{(\w+)\}$/D', $matchField, $match)) {
+            $identifier = $match[1];
+        } else {
+            $expression = References::parseReferenceExpression($matchField);
+
+            // Match-field values are canonical reference tokens: `{field:<reference>}`.
+            if (!$expression->isValid || $expression->target !== 'field' || $expression->identifier === '') {
+                return null;
+            }
+
+            $identifier = $expression->identifier;
+        }
+
+        return (new FieldReferenceResolver())->findField($identifier, new ReferenceContext(form: $this->getForm()));
+    }
+
+    public function getValidationMessage(string $key, array $params = []): string
+    {
+        return ValidationMessagesHelper::resolve($this, $key, $params);
+    }
+
+    public function getValidationMessageBrowserAttribute(string $key, array $params = []): ?string
+    {
+        if (ValidationMessagesHelper::override($this, $key) === null
+            && ValidationMessagesHelper::pluginDefault($key) === null) {
+            return null;
+        }
+
+        return $this->getValidationMessage($key, $params);
+    }
+
+    public function getElementValidationRules(): array
+    {
+        $rules = [];
+
+        if ($matchField = $this->getMatchField()) {
+            $rules[] = [$this->handle, 'validateMatchField', 'skipOnEmpty' => false];
+        }
+
+        return $rules;
+    }
+
+    public function validateMatchField(ElementInterface $element): void
+    {
+        $fieldHandle = $this->getMatchField();
+
+        if (!$fieldHandle) {
+            return;
+        }
+
+        // A Repeater with no rows has no value at all, which is the same as an empty field.
+        $sourceValue = $element->getFieldValue($fieldHandle) ?? '';
+        $value = $element->getFieldValue($this->valueKey()) ?? '';
+
+        if ($sourceValue !== $value) {
+            $element->addError($this->valueKey(), $this->getValidationMessage(ValidationMessagesHelper::KEY_MATCH, [
+                'value' => $this->getMatchFieldTarget()?->label ?? '',
+            ]));
+        }
+    }
+
+    public function validateUniqueValue(ElementInterface $element): void
+    {
+        $value = $element->getFieldValue($this->valueKey());
+        $value = trim($value);
+
+        $content = [$this->uid => $value];
+
+        // Follow the stored parent structure, matching any row of a repeater.
+        for ($parent = $this->getParentField(); $parent; $parent = $parent->getParentField()) {
+            if ($parent instanceof RepeatableParentFieldInterface) {
+                $content = [$content];
+            }
+
+            $content = [$parent->uid => $content];
+        }
+
+        // Use a DB lookup for performance
+        $contentQuery = Craft::$app->getDb()->getQueryBuilder()->jsonContains('s.content', $content);
+
+        $query = (new Query())
+            ->from(['s' => Table::FORMIE_SUBMISSIONS])
+            ->where(['isIncomplete' => false, 'e.dateDeleted' => null])
+            ->andWhere($contentQuery)
+            ->leftJoin(['e' => Table::ELEMENTS], '[[e.id]] = [[s.id]]');
+
+        // Exclude _this_ element, if there is one
+        if ($element->id) {
+            $query->andWhere(['!=', 's.id', $element->id]);
+        }
+
+        $event = new ModifyFieldUniqueQueryEvent([
+            'query' => $query,
+            'field' => $this,
+        ]);
+
+        // Fire a 'modifyFieldUniqueQuery' event
+        $this->trigger(self::EVENT_MODIFY_UNIQUE_QUERY, $event);
+
+        // Be sure to check only against completed submission content
+        $valueExists = $event->query->exists();
+
+        if ($valueExists) {
+            $element->addError($this->valueKey(), $this->getValidationMessage(ValidationMessagesHelper::KEY_UNIQUE));
+        }
+    }
+
+    public function getNamespace(): string
+    {
+        return $this->_namespace;
+    }
+
+    public function setNamespace(string|bool|null $value): void
+    {
+        $this->_namespace = (string)$value;
+        $this->_fieldPath = null;
+    }
+
+    public function getParentField(): ?FieldInterface
+    {
+        return $this->_parentField;
+    }
+
+    public function setParentField(FieldInterface $parent): void
+    {
+        $this->applyParentFieldContext($parent);
+    }
+
+    public function withParentField(FieldInterface $parent, string|int|null $namespace = null): static
+    {
+        $field = clone $this;
+        $field->applyParentFieldContext($parent, $namespace === null ? '' : (string)$namespace);
+
+        return $field;
+    }
+
+    public function getFieldPath(): FieldPath
+    {
+        return $this->_fieldPath ??= FieldPath::fromField($this);
+    }
+
+    public function valueKey(): string
+    {
+        return $this->getFieldPath()->valueKey();
+    }
+
+    public function errorKey(): string
+    {
+        return $this->getFieldPath()->errorKey();
+    }
+
+    public function handlePath(): array
+    {
+        return $this->getFieldPath()->handlePath();
+    }
+
+    public function namespacePath(): array
+    {
+        return $this->getFieldPath()->namespacePath();
+    }
+
+    public function getDefaultValue(): mixed
+    {
+        $defaultValue = $this->normalizeDefaultValue($this->defaultValue);
+
+        $event = new ModifyFieldValueEvent([
+            'value' => $defaultValue,
+            'field' => $this,
+        ]);
+
+        $this->trigger(static::EVENT_MODIFY_DEFAULT_VALUE, $event);
+
+        if (is_string($event->value)) {
+            $event->value = trim($event->value);
+        }
+
+        return $event->value;
+    }
+
+    /** @deprecated Use prefillQueryParam. */
+    public function getPrePopulate(): ?string
+    {
+        return $this->prefillQueryParam;
+    }
+
+    /** @deprecated Use prefillQueryParam. */
+    public function setPrePopulate(?string $value): void
+    {
+        $this->prefillQueryParam = $value;
+    }
+
+    public function getPrefillValue(?ElementInterface $element = null, ?bool &$found = null): mixed
+    {
+        $form = $element instanceof Form ? $element : ($element instanceof Submission ? $element->getForm() : $this->getForm());
+        $found = false;
+
+        if ($form) {
+            if (!$element instanceof Submission) {
+                (new RuntimeConfiguration())->establish($form);
+            }
+
+            $config = $form->getInstanceConfig();
+
+            foreach ([$config->forced, $config->initial] as $values) {
+                if (array_key_exists($this->uid, $values)) {
+                    $found = true;
+
+                    return $this->normalizeValue($values[$this->uid], $element);
+                }
+            }
+
+            if (array_key_exists($this->uid, $config->prefill)) {
+                $found = true;
+
+                return $this->normalizePrefillValue($this->setPrePopulatedValue($config->prefill[$this->uid]), $element);
+            }
+        }
+
+        return null;
+    }
+
+    public function getInitialValue(?ElementInterface $element = null): mixed
+    {
+        $prefillValue = $this->getPrefillValue($element, $found);
+
+        if ($found) {
+            return $prefillValue;
+        }
+
+        // Nested controls render independently, but populated values belong to
+        // their parent. Project the row-aware path before falling back to defaults.
+        if ($parent = $this->getParentField()) {
+            $path = substr($this->valueKey(), strlen($parent->valueKey()) + 1);
+            $value = (new SubmissionContentAccessor())->resolvePathValue($parent->getInitialValue($element), $path);
+
+            if ($value !== null) {
+                return $this->normalizeValue($value, $element);
+            }
+        }
+
+        return $this->getDefaultValue();
+    }
+
+    public function getIsSynced(): bool
+    {
+        return $this->isSynced || (($this->usageCount ?? 1) > 1);
+    }
+
+    public function getDefinitionSettings(): array
+    {
+        $settings = $this->getSettings();
+
+        foreach (array_keys($this->getInstanceSettings()) as $key) {
+            unset($settings[$key]);
+        }
+
+        return $settings;
+    }
+
+    public function getInstanceSettings(): array
+    {
+        return [
+            'required' => $this->required,
+        ];
+    }
+
+    public function applyInstanceSettings(array|string|null $settings): void
+    {
+        $settings = is_string($settings) ? Json::decodeIfJson($settings) : $settings;
+
+        if (!is_array($settings)) {
+            return;
+        }
+
+        if (array_key_exists('required', $settings)) {
+            $this->required = (bool)$settings['required'];
+        }
+    }
+
+    public function hasConditions(): bool
+    {
+        return ($this->enableConditions && $this->getConditions());
+    }
+
+    public function isConditionallyHidden(Submission $submission): bool
+    {
+        return ConditionVisibility::hidden($this, $submission);
+    }
+
+    public function getReferenceBlockHtml(Submission $submission, Notification $notification, mixed $value, array $renderOptions = []): string|null|bool
+    {
+        return $this->callLegacyFieldMethod('getEmailHtml', 'getReferenceBlockHtml', [$submission, $notification, $value, $renderOptions], fn() => $this->_renderReferenceBlockHtml($submission, $notification, $value, $renderOptions));
+    }
+
+    public function getReferenceBlockOptions(Submission $submission, Notification $notification, mixed $value, array $renderOptions = []): array
+    {
+        return $this->callLegacyFieldMethod('getEmailOptions', 'getReferenceBlockOptions', [$submission, $notification, $value, $renderOptions], fn() => $this->_buildReferenceBlockOptions($submission, $notification, $value, $renderOptions));
+    }
+
+    public function includeInGqlSchema(GqlSchema $schema): bool
+    {
+        return true;
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return [];
+    }
+
+    public function getGqlTypeName(): string
+    {
+        $classNameParts = explode('\\', static::class);
+        $end = array_pop($classNameParts);
+
+        return 'Field_' . $end;
+    }
+
+    public function getContentGqlType(): Type|array
+    {
+        return Type::string();
+    }
+
+    public function getContentGqlMutationArgumentType(): Type|array
+    {
+        return [
+            'name' => $this->handle,
+            'type' => Type::string(),
+            'description' => $this->instructions->isEmpty() ? null : $this->instructions->toPlainText(),
+        ];
+    }
+
+    public function getContentGqlQueryArgumentType(): Type|array
+    {
+        return [
+            'name' => $this->handle,
+            'type' => Type::listOf(QueryArgument::getType()),
+        ];
+    }
+
+    public function getExportLabel(?ElementInterface $element): string
+    {
+        // Check to see if there's another field with the same label
+        foreach ($element?->getFields() ?? [] as $field) {
+            if ($field->id === $this->id) {
+                continue;
+            }
+
+            if ($field->label === $this->label) {
+                return $this->label . ' (' . $this->handle . ')';
+            }
+        }
+
+        return (string)$this->label;
+    }
+
+    public function getSearchKeywords(mixed $value, ElementInterface $element): string
+    {
+        if ($this->enableContentEncryption) {
+            return '';
+        }
+
+        return $this->getValueAsString($value, $element);
+    }
+
+    public function isSearchableField(): bool
+    {
+        return !$this->getIsCosmetic();
+    }
+
+    public function getPreviewHtml(mixed $value, ElementInterface $element): string
+    {
+        return ElementHelper::attributeHtml($value);
+    }
+
+    public function afterCreateField(array $data): void
+    {
+    }
+
+    public function modifyElementIndexQuery(ElementQueryInterface $query): void
+    {
+    }
+
+    public function beforeElementSave(ElementInterface $element, bool $isNew): bool
+    {
+        // Fire a 'beforeElementSave' event
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_ELEMENT_SAVE)) {
+            $event = new FieldElementEvent([
+                'element' => $element,
+                'isNew' => $isNew,
+            ]);
+            $this->trigger(self::EVENT_BEFORE_ELEMENT_SAVE, $event);
+
+            return $event->isValid;
+        }
+
+        return true;
+    }
+
+    public function afterElementSave(ElementInterface $element, bool $isNew): void
+    {
+        // Fire an 'afterElementSave' event
+        if ($this->hasEventHandlers(self::EVENT_AFTER_ELEMENT_SAVE)) {
+            $this->trigger(self::EVENT_AFTER_ELEMENT_SAVE, new FieldElementEvent([
+                'element' => $element,
+                'isNew' => $isNew,
+            ]));
+        }
+    }
+
+    public function afterElementPropagate(ElementInterface $element, bool $isNew): void
+    {
+        // Fire an 'afterElementPropagate' event
+        if ($this->hasEventHandlers(self::EVENT_AFTER_ELEMENT_PROPAGATE)) {
+            $this->trigger(self::EVENT_AFTER_ELEMENT_PROPAGATE, new FieldElementEvent([
+                'element' => $element,
+                'isNew' => $isNew,
+            ]));
+        }
+    }
+
+    public function beforeElementDelete(ElementInterface $element): bool
+    {
+        // Fire a 'beforeElementDelete' event
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_ELEMENT_DELETE)) {
+            $event = new FieldElementEvent(['element' => $element]);
+            $this->trigger(self::EVENT_BEFORE_ELEMENT_DELETE, $event);
+
+            return $event->isValid;
+        }
+
+        return true;
+    }
+
+    public function afterElementDelete(ElementInterface $element): void
+    {
+        // Fire an 'afterElementDelete' event
+        if ($this->hasEventHandlers(self::EVENT_AFTER_ELEMENT_DELETE)) {
+            $this->trigger(self::EVENT_AFTER_ELEMENT_DELETE, new FieldElementEvent([
+                'element' => $element,
+            ]));
+        }
+    }
+
+    public function beforeElementDeleteForSite(ElementInterface $element): bool
+    {
+        return true;
+    }
+
+    public function afterElementDeleteForSite(ElementInterface $element): void
+    {
+    }
+
+    public function beforeElementRestore(ElementInterface $element): bool
+    {
+        // Fire a 'beforeElementRestore' event
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_ELEMENT_RESTORE)) {
+            $event = new FieldElementEvent(['element' => $element]);
+            $this->trigger(self::EVENT_BEFORE_ELEMENT_RESTORE, $event);
+
+            return $event->isValid;
+        }
+
+        return true;
+    }
+
+    public function afterElementRestore(ElementInterface $element): void
+    {
+        // Fire an 'afterElementRestore' event
+        if ($this->hasEventHandlers(self::EVENT_AFTER_ELEMENT_RESTORE)) {
+            $this->trigger(self::EVENT_AFTER_ELEMENT_RESTORE, new FieldElementEvent([
+                'element' => $element,
+            ]));
+        }
+    }
+
+    public function propagateValue(ElementInterface $from, ElementInterface $to): void
+    {
+        $to->setFieldValue($this->handle, $from->getFieldValue($this->handle));
+    }
+
+    public function copyValue(ElementInterface $from, ElementInterface $to): void
+    {
+        $value = $this->serializeValueForDb($from->getFieldValue($this->handle), $from);
+        $to->setFieldValue($this->handle, $this->normalizeValueFromStorage($value, $to));
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function normalizeDefaultValue(mixed $value): mixed
+    {
+        return $this->normalizeValue($value, null);
+    }
+
+    protected function defineValueForDb(mixed $value, ?ElementInterface $element): mixed
+    {
+        if ($value instanceof DateTimeInterface) {
+            return Db::prepareDateForDb($value);
+        }
+
+        return FieldStorageCodec::assertSafe($value);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['label', 'handle'], 'required'];
+        $rules[] = [['placeholder', 'errorMessage', 'cssClasses'], 'string', 'max' => 255];
+        $rules[] = [['validationMessages'], 'safe'];
+        $rules[] = [['handle'], HandleValidator::class, 'reservedWords' => Formie::$plugin->getFields()->getReservedHandles()];
+        $rules[] = [['handle'], 'string', 'max' => 64];
+        $rules[] = [['reference'], 'string', 'max' => 36];
+        $rules[] = [['enableContentEncryption'], function(string $attribute): void {
+            if (!$this->$attribute) {
+                return;
+            }
+
+            $wasEnabled = false;
+
+            if ($this->definitionId) {
+                $stored = (new Query())
+                    ->select('settings')
+                    ->from(Table::FORMIE_FIELDS)
+                    ->where(['id' => $this->definitionId])
+                    ->scalar();
+                $stored = is_string($stored) ? Json::decodeIfJson($stored) : $stored;
+                $wasEnabled = is_array($stored) && !empty($stored['enableContentEncryption']);
+            }
+
+            try {
+                $hasKey = ContentEncryption::currentKey() !== null;
+            } catch (\RuntimeException $exception) {
+                $this->addError($attribute, $exception->getMessage());
+
+                return;
+            }
+
+            if (!$hasKey && !$wasEnabled && !static::$relaxLegacyUpgradeValidation) {
+                $this->addError($attribute, Craft::t('formie', 'Set FORMIE_ENCRYPTION_KEY before enabling content encryption for a new field.'));
+            }
+        }];
+
+        $rules[] = [
+            ['handle'],
+            LayoutHandleUniqueValidator::class,
+        ];
+
+        $rules[] = [
+            ['reference'],
+            FieldReferenceUniqueValidator::class,
+            'skipOnEmpty' => true,
+            'message' => Craft::t('yii', '{attribute} "{value}" has already been taken.'),
+        ];
+
+        // Only validate the ID if it’s not a new field
+        if (!$this->getIsNew()) {
+            $rules[] = [['id'], 'number', 'integerOnly' => true];
+        }
+
+        $rules[] = [
+            ['labelPosition'],
+            'in',
+            'range' => Formie::$plugin->getFields()->getLabelPositions($this),
+            'skipOnEmpty' => true,
+        ];
+
+        $rules[] = [
+            ['instructionsPosition'],
+            'in',
+            'range' => Formie::$plugin->getFields()->getInstructionsPositions($this),
+            'skipOnEmpty' => true,
+        ];
+
+        $rules[] = [
+            ['errorMessagePosition'],
+            'in',
+            'range' => Formie::$plugin->getFields()->getErrorMessagePositions($this),
+            'skipOnEmpty' => true,
+        ];
+
+        return $rules;
+    }
+
+    protected function shouldTrimNormalizedPlainText(): bool
+    {
+        return match ($this->fieldKind()) {
+            self::KIND_TEXT,
+            self::KIND_TEXTAREA,
+            self::KIND_HIDDEN,
+            self::KIND_PHONE => true,
+            default => false,
+        };
+    }
+
+    protected function dbTypeForValueSql(): array|string|null
+    {
+        return static::dbType();
+    }
+
+    protected function isFresh(?ElementInterface $element = null): bool
+    {
+        if (isset($this->_isFresh)) {
+            return $this->_isFresh;
+        }
+
+        if ($element) {
+            return $element->getIsFresh();
+        }
+
+        return true;
+    }
+
+    protected function requestParamName(ElementInterface $element): ?string
+    {
+        $namespace = $element->getFieldParamNamespace();
+
+        return ($namespace ? $namespace . '.' : '') . $this->valueKey();
+    }
+
+    protected function setPrePopulatedValue(mixed $value): mixed
+    {
+        return $value;
+    }
+
+    protected function normalizePrefillValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        return $this->normalizeValueFromRequest($value, $element);
+    }
+
+    protected function supportsPlainTextHtmlSanitization(): bool
+    {
+        return false;
+    }
+
+    protected function sanitizePlainTextValueIfConfigured(string $value): string
+    {
+        if (!$this->supportsPlainTextHtmlSanitization()) {
+            return $value;
+        }
+
+        $policy = Formie::$plugin->getSettings()->plainTextHtmlSanitizationMode;
+
+        if ($policy !== Settings::PLAIN_TEXT_HTML_SANITIZATION_MODE_SANITIZE) {
+            return $value;
+        }
+
+        return StringHelper::sanitizePlainTextInput($value);
+    }
+
+    protected function renderPreviewText(string $text): string
+    {
+        return ElementHelper::attributeHtml($text);
+    }
+
+    protected function applyParentFieldContext(FieldInterface $value, string $namespace = ''): void
+    {
+        $this->_parentField = $value;
+
+        // Also, set the namespace (on the parent field), commonly just the field handle
+        // But allows it to be added to (think Repeater).
+        // Be sure to create a valid name attribute, from `fieldHandle` and `some[more][attrs]`
+        // to `fieldHandle[some][some][attrs]`. Also allow `0` as a namespace.
+        if ($namespace !== '') {
+            $this->setNamespace(Html::namespaceInputName($namespace, $value->handle));
+        } else {
+            $this->setNamespace($value->handle);
+        }
+
+        $this->_fieldPath = null;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _valueSql(?string $key): ?string
+    {
+        return FieldValueQueryHelper::buildValueSql(static::class, $this->uid, $this->dbTypeForValueSql(), $key);
+    }
+
+    private function _valueColumnType(?string $key): ?string
+    {
+        return FieldValueQueryHelper::resolveValueColumnType(static::class, $this->dbTypeForValueSql(), $key);
+    }
+
+    private function _renderReferenceBlockHtml(Submission $submission, Notification $notification, mixed $value, array $renderOptions = []): string|null|bool
+    {
+        // Reference-block rendering is the canonical rich/looped field output,
+        // even while notification templates still provide the first consumer.
+        $value = $this->getValueForReferenceBlock($value, $notification, $submission);
+        $inputOptions = $this->getReferenceBlockOptions($submission, $notification, $value, $renderOptions);
+        $html = $notification->renderTemplate(static::getReferenceBlockTemplatePath(), $inputOptions);
+
+        return Template::raw($html);
+    }
+
+    private function _buildReferenceBlockOptions(Submission $submission, Notification $notification, mixed $value, array $renderOptions = []): array
+    {
+        return [
+            'notification' => $notification,
+            'submission' => $submission,
+            'name' => $this->handle,
+            'value' => $value,
+            'field' => $this,
+            'renderOptions' => $renderOptions,
+        ];
+    }
+}

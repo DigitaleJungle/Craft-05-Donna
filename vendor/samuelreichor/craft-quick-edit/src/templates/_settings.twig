@@ -1,0 +1,49 @@
+{# @var plugin \samuelreichor\quickedit\QuickEdit #}
+{# @var settings \samuelreichor\quickedit\models\Settings #}
+
+{% import '_includes/forms.twig' as forms %}
+
+<div style="max-width: 700px">
+  {{ forms.lightswitchField({
+    label: 'Disable Quick Edit',
+    instructions: 'Whether the quick edit link should be disabled.',
+    id: 'is-global-disabled',
+    name: 'isGlobalDisabled',
+    on: settings.isGlobalDisabled,
+  }) }}
+
+  {{ forms.lightswitchField({
+    label: 'Auto-inject JavaScript and CSS',
+    instructions: 'Automatically inject the Quick Edit JavaScript and CSS into every page. Disable this for Content Security Policy (CSP) compatibility and use template tags instead: <code>{{ craft.quickEdit.render() }}</code>',
+    id: 'auto-inject',
+    name: 'autoInject',
+    on: settings.autoInject,
+  }) }}
+
+  {{ forms.textField({
+    label: 'Change Link Text',
+    instructions: 'To render a link text instead of the icon, type some text in.',
+    id: 'link-text',
+    name: 'linkText',
+    placeholder: 'Leave blank to render the icon.',
+    value: settings.linkText,
+  }) }}
+
+  {{ forms.lightswitchField({
+    label: 'Open Edit Link in new Window',
+    instructions: 'Enable this option to open the edit link to the entry in a new window.',
+    id: 'target-blank',
+    name: 'targetBlank',
+    on: settings.targetBlank,
+  }) }}
+
+  {% if renderPreviewModeSetting %}
+    {{ forms.lightswitchField({
+      label: 'Enable Standalone Preview Mode',
+      instructions: 'Enable this option to open the edit link in the standalone preview mode.',
+      id: 'is-standalone-preview',
+      name: 'isStandalonePreview',
+      on: settings.isStandalonePreview,
+    }) }}
+  {% endif %}
+</div>

@@ -1,0 +1,62 @@
+fieldLayouts:
+  3cae8995-7d17-45fd-a260-2d0d8961acd0:
+    cardThumbAlignment: end
+    tabs:
+      -
+        elementCondition: null
+        elements:
+          -
+            dateAdded: '2026-04-06T21:58:19+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: b02dc466-76dc-48ac-9fa2-f1a0f2d94371 # Grote Titel
+            handle: constructionTitle
+            instructions: null
+            label: 'Under Construction Title'
+            required: false
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: 994c38f1-8b84-46bc-bed8-709bad5da2fd
+            userCondition: null
+            warning: null
+            width: 100
+          -
+            dateAdded: '2026-04-06T22:02:25+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: 0d1afeea-2a98-4702-acb3-f63560fb7eab # Korte Rijke Tekst zonder H1
+            handle: constructionText
+            instructions: null
+            label: 'Under Construction text'
+            required: false
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: 05370ae1-e55f-475f-9de2-776d0ff67a9b
+            userCondition: null
+            warning: null
+            width: 100
+          -
+            dateAdded: '2026-04-06T22:03:35+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: 14888277-4e7f-426c-bec3-4c0ce3d5a25c # Formulier
+            handle: null
+            instructions: null
+            label: null
+            required: false
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: dbec8197-f71c-44be-bcd2-289c7b584c36
+            userCondition: null
+            warning: null
+            width: 100
+        name: "Algemene Pagina's"
+        uid: be5013a6-07f1-4f1e-a534-44841166c870
+        userCondition: null
+    thumbFieldKey: null
+handle: siteConfig
+name: 'Algemene Configuratie'
+sortOrder: 3

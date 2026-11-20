@@ -1,0 +1,125 @@
+{% extends 'formie/_layouts/settings' %}
+{% set title = 'Support' | t('formie') %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% set selectedTab = 'support' %}
+{% set title = 'Support' | t('formie') %}
+
+{# Action parameters must remain outside the shared settings namespace. #}
+{% block blockContent %}
+
+<div class="formie-help">
+    <h2>{{ 'Send a message to {name} support' | t('formie', { name: craft.formie.getPluginName() }) }}</h2>
+
+    <p>{{ 'Having issues using {name}? Enter your details below, so we can assist.' | t('formie', { name: craft.formie.getPluginName() }) }}</p>
+
+    <p>{{ 'Send this request from the environment where the issue occurs. This report describes only this installation; a request sent from your local site cannot show your production settings.' | t('formie') }}</p>
+
+    <p>{{ 'Your request includes your contact details, message, attachments, and the following information to help diagnose the issue:' | t('formie') }}</p>
+
+    <ul class="formie-info">
+        <li>{{ 'Your Craft version' | t('formie') }}</li>
+        <li>{{ 'Your {name} version and license' | t('formie', { name: craft.formie.getPluginName() }) }}</li>
+        <li>{{ 'Your {name} log file(s), unless you exclude them below' | t('formie', { name: craft.formie.getPluginName() }) }}</li>
+        <li>{{ 'Your `composer.json` and `composer.lock` files' | t('formie') }}</li>
+        <li>{{ 'Your form (selected below) settings, fields, and notifications' | t('formie') }}</li>
+        <li>{{ 'Your custom form, email, and PDF templates (if using any)' | t('formie') }}</li>
+        <li>{{ 'Installation diagnostics: environment name, hostname, collection time, PHP version, development mode, and whether admin changes are allowed' | t('formie') }}</li>
+        <li>{{ 'Your administrator status and relevant Formie permissions' | t('formie') }}</li>
+        <li>{{ 'CAPTCHA providers and integrations used by your form: whether they are available and enabled, where their settings are stored, and whether their credentials are configured and can be read' | t('formie') }}</li>
+    </ul>
+
+    <p>{{ 'The diagnostics file contains no credential values or environment-variable names. Logs, templates, form content, and files you attach may contain sensitive information; check them before sending and do not attach your .env file or credentials.' | t('formie') }}</p>
+
+    <div class="formie-help-form">
+        <form method="post" accept-charset="UTF-8" enctype="multipart/form-data">
+            {{ actionInput('formie/support/send-support-request') }}
+            {{ csrfInput() }}
+
+            {% if error is defined %}
+                <p class="error">
+                    {{ error }}
+                </p>
+            {% endif %}
+
+            {{ forms.textField({
+                label: 'Your Email' | t('formie'),
+                instructions: 'Enter your email so we can get in touch.' | t('formie'),
+                name: 'fromEmail',
+                required: true,
+                value: support.fromEmail ?? currentUser.email,
+                errors: support.getErrors('fromEmail') ?? '',
+            }) }}
+
+            {% set formOptions = [{ label: 'Select an option' | t('formie'), value: '' }] %}
+
+            {% for form in craft.formie.forms.orderBy('title').all() %}
+                {% set formOptions = formOptions | merge([{ label: form.title ~ ' (' ~ form.handle ~ ')', value: form.id }]) %}
+            {% endfor %}
+
+            {{ forms.selectField({
+                label: 'Your Form' | t('formie'),
+                instructions: 'Choose the form you‘re having issues with.' | t('formie'),
+                id: 'formId',
+                name: 'formId',
+                required: true,
+                options: formOptions,
+                value: support.formId ?? '',
+                errors: support.getErrors('formId') ?? '',
+            }) }}
+
+            {{ forms.textareaField({
+                label: 'Message' | t('formie'),
+                instructions: 'Please describe the issue you‘re having in as much detail as possible.' | t('formie'),
+                placeholder: 'Describe the issue you‘re having.' | t('formie'),
+                name: 'message',
+                rows: 6,
+                required: true,
+                value: support.message ?? '',
+                errors: support.getErrors('message') ?? '',
+            }) }}
+
+            {{ forms.fileField({
+                label: 'Attachments' | t('formie'),
+                instructions: 'Add any attachments such as screenshots that would be helpful for support.' | t('formie'),
+                name: 'attachments[]',
+                value: support.attachments ?? '',
+                errors: support.getErrors('attachments') ?? '',
+                inputAttributes: {
+                    multiple: true,
+                },
+            }) }}
+
+            {{ forms.checkboxField({
+                label: 'Include {name} log files' | t('formie', { name: craft.formie.getPluginName() }),
+                instructions: 'Logs help us see what happened, but can include what visitors entered into your forms.' | t('formie'),
+                name: 'includeLogs',
+                checked: support.includeLogs ?? true,
+            }) }}
+
+            <div class="buttons last">
+                <input type="submit" class="btn submit" value="{{ 'Send Support Request' | t('formie') }}">
+                <div class="spinner hidden"></div>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}
+
+{% css %}
+
+ul.formie-info {
+    list-style: initial;
+    margin-left: 20px;
+    margin-top: -6px;
+    margin-bottom: 30px;
+}
+
+ul.formie-info li {
+    color: #8693a1;
+}
+
+{% endcss %}

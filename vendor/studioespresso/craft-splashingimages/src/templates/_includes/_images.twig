@@ -1,0 +1,29 @@
+<div id="splashing-container" class="splashing-container are-images-unloaded" style="margin-top: 5px;">
+    <div class="splashing-image-sizer"></div>
+    {% for image in data.images %}
+        <div class="splashing-image-grid">
+            <div class="splashing-image js-splashing-image" data-id="{{ image.id }}">
+                <img src="{{ image.small }}">
+            </div>
+            <div class="splashing-attribute" style="display: none;">
+                <a href="{{ image.attr.link }}">{{ image.attr.name }}</a>
+            </div>
+        </div>
+    {% endfor %}
+</div>
+{% if data.next_page is defined %}
+    <div class="pagination">
+        <a href="{{ url(data.next_page) }}" class="js-pagination__next" >{{ 'Next'|t }}</a>
+    </div>
+    <div class="page-load-status" style="display: none;">
+        <div class="infinite-scroll-request">
+            <div class="loader">
+                <svg class="circular" viewBox="25 25 50 50">
+                    <circle class="path" cx="50" cy="50" r="20" fill="none" stroke-width="2" stroke-miterlimit="10"/>
+                </svg>
+            </div>
+        </div>
+        <p class="infinite-scroll-last">End of content</p>
+        <p class="infinite-scroll-error">No more pages to load</p>
+    </div>
+{% endif %}

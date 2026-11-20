@@ -1,0 +1,51 @@
+{
+  "name": "putyourlightson/craft-sprig",
+  "description": "A reactive Twig component framework for Craft.",
+  "version": "3.7.1",
+  "type": "craft-plugin",
+  "license": "mit",
+  "require": {
+    "php": "^8.2",
+    "craftcms/cms": "^5.0",
+    "nystudio107/craft-code-editor": "^1.0",
+    "nystudio107/craft-twig-sandbox": "^5.0.2",
+    "putyourlightson/craft-sprig-core": "^3.7.1"
+  },
+  "require-dev": {
+    "craftcms/ecs": "dev-main",
+    "craftcms/phpstan": "dev-main"
+  },
+  "autoload": {
+    "psr-4": {
+      "putyourlightson\\sprig\\plugin\\": "src/"
+    }
+  },
+  "scripts": {
+    "phpstan": "phpstan --ansi --memory-limit=1G",
+    "check-cs": "ecs check --ansi",
+    "fix-cs": "ecs check --fix --ansi"
+  },
+  "config": {
+    "allow-plugins": {
+      "craftcms/plugin-installer": true,
+      "pestphp/pest-plugin": true,
+      "yiisoft/yii2-composer": true
+    },
+    "optimize-autoloader": true,
+    "sort-packages": true
+  },
+  "support": {
+    "docs": "https://putyourlightson.com/plugins/sprig",
+    "source": "https://github.com/putyourlightson/craft-sprig",
+    "issues": "https://github.com/putyourlightson/craft-sprig/issues"
+  },
+  "extra": {
+    "name": "Sprig",
+    "handle": "sprig",
+    "developer": "PutYourLightsOn",
+    "developerUrl": "https://putyourlightson.com/",
+    "documentationUrl": "https://putyourlightson.com/plugins/sprig",
+    "changelogUrl": "https://raw.githubusercontent.com/putyourlightson/craft-sprig/develop/CHANGELOG.md",
+    "class": "putyourlightson\\sprig\\plugin\\Sprig"
+  }
+}

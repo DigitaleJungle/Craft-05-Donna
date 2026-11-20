@@ -1,0 +1,205 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+
+use Throwable;
+
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\providers\SuiteCrm as SuiteCrmProvider;
+
+class SuiteCrm extends Crm implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return SuiteCrmProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'SuiteCRM';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $apiDomain = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToContact = false;
+
+    #[FormIntegrationSetting]
+    public ?array $contactFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getApiDomain(): string
+    {
+        return App::parseEnv($this->apiDomain);
+    }
+
+    public function getOAuthProviderConfig(): array
+    {
+        $config = parent::getOAuthProviderConfig();
+        $config['apiDomain'] = $this->getApiDomain();
+
+        return $config;
+    }
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            // Full refreshes have no data key, but still need the schema used to resolve Contact mappings.
+            if ($this->mapToContact && (!$this->settingsContext->dataKey || $this->settingsContext->dataKey === 'contact')) {
+                $response = $this->request('GET', 'meta/fields/Contacts');
+                $fields = $response['data']['attributes'] ?? [];
+
+                $settings['contact'] = $this->_getCustomFields($fields);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $contactValues = $this->getFieldMappingValues($submission, $this->contactFieldMapping, 'contact');
+
+            if ($this->mapToContact) {
+                $contactPayload = [
+                    'data' => [
+                        'type' => 'Contacts',
+                        'attributes' => $contactValues,
+                    ],
+                ];
+
+                $response = $this->deliverPayload($submission, 'module', $contactPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $contactId = $response['data']['id'] ?? '';
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $contact = $this->getConfigValue('contact');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['contactFieldMapping'], 'validateFieldMapping', 'params' => $contact, 'when' => function($model) {
+                return $model->enabled && $model->mapToContact;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToContact',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Contact']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Contacts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'contactFieldMapping',
+            'if' => 'mapToContact',
+            'dataLabel' => 'Contact',
+            'dataKey' => 'contact',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'bool' => IntegrationField::TYPE_BOOLEAN,
+            'int' => IntegrationField::TYPE_NUMBER,
+            'double' => IntegrationField::TYPE_FLOAT,
+            'date' => IntegrationField::TYPE_DATE,
+            'datetime' => IntegrationField::TYPE_DATETIME,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields): array
+    {
+        $customFields = [];
+
+        // V8 metadata keys are the field handles, including custom fields.
+        foreach ($fields as $handle => $field) {
+            $type = $field['type'] ?? 'string';
+            $readOnly = $field['read_only'] ?? false;
+
+            if (!$handle || $readOnly) {
+                continue;
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => $handle,
+                'name' => ucwords(str_replace('_', ' ', $handle)),
+                'type' => $this->_convertFieldType($type),
+                'sourceType' => $type,
+            ]);
+        }
+
+        return $customFields;
+    }
+}

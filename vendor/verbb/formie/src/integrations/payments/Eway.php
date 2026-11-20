@@ -1,0 +1,528 @@
+<?php
+namespace verbb\formie\integrations\payments;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\FieldInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Payment;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\ModifyPaymentPayloadEvent;
+use verbb\formie\events\ModifySubFieldsEvent;
+use verbb\formie\fields;
+use verbb\formie\fields\Calculations;
+use verbb\formie\fields\Dropdown;
+use verbb\formie\fields\Hidden;
+use verbb\formie\fields\Number;
+use verbb\formie\fields\Radio;
+use verbb\formie\fields\SingleLineText;
+use verbb\formie\helpers\PaymentAttempt;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\Table;
+use verbb\formie\models\BrowserModule;
+use verbb\formie\models\BrowserModuleContext;
+use verbb\formie\models\Payment as PaymentModel;
+use verbb\formie\models\PaymentDecision;
+use verbb\formie\models\PaymentMoney;
+
+use Craft;
+use craft\db\Query;
+use craft\helpers\App;
+use craft\helpers\Component;
+use craft\web\Response;
+
+use yii\base\Event;
+
+use Exception;
+use Throwable;
+
+use GuzzleHttp\Client;
+use Money\Currencies\ISOCurrencies;
+use Money\Currency;
+
+class Eway extends Payment
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Eway';
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_PAYLOAD = 'modifyPayload';
+    public const EVENT_MODIFY_PAYMENT_SUBFIELDS = 'modifyPaymentSubfields';
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    #[Sensitive]
+    public ?string $apiPassword =  null;
+
+    public ?string $clientSideEncryptionKey =  null;
+    public bool|string $useSandbox = false;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Provide payment capabilities for your forms with {name}.', ['name' => static::displayName()]);
+    }
+
+    public function hasValidSettings(): bool
+    {
+        return App::parseEnv($this->apiKey) && App::parseEnv($this->apiPassword) && App::parseEnv($this->clientSideEncryptionKey);
+    }
+
+    public function getBrowserModule(BrowserModuleContext $context): ?BrowserModule
+    {
+        if (!$this->hasValidSettings()) {
+            return null;
+        }
+
+        $this->setField($context->field);
+
+        return new BrowserModule([
+            'moduleId' => 'formie:eway',
+            'surfaces' => [BrowserModule::SURFACE_SERVER_RENDERED, BrowserModule::SURFACE_CLIENT_RENDERED],
+            'config' => [
+                'cseKey' => App::parseEnv($this->clientSideEncryptionKey),
+                'requiredInputSuffixes' => ['ewayTokenData'],
+                'waitForValueMs' => 2500,
+            ],
+        ]);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('POST', 'AccessCodes');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::comboboxField([
+                'label' => Craft::t('formie', 'Payment Currency'),
+                'instructions' => Craft::t('formie', 'Provide the currency to be used for the transaction.'),
+                'name' => 'currency',
+                'required' => true,
+                'placeholder' => Craft::t('formie', 'Select an option'),
+                'options' => static::getCurrencyOptions(),
+            ]),
+            SchemaHelper::fieldWrap([
+                'label' => Craft::t('formie', 'Payment Amount'),
+                'instructions' => Craft::t('formie', 'Provide an amount for the transaction. This can be either a fixed value, or derived from a field.'),
+                'required' => true,
+                'children' => [
+                    SchemaHelper::selectField([
+                        'name' => 'amountType',
+                        'required' => true,
+                        'options' => [
+                            ['label' => Craft::t('formie', 'Fixed Value'), 'value' => Payment::VALUE_TYPE_FIXED],
+                            ['label' => Craft::t('formie', 'Dynamic Value'), 'value' => Payment::VALUE_TYPE_DYNAMIC],
+                        ],
+                    ]),
+                    SchemaHelper::numberField([
+                        'name' => 'amountFixed',
+                        'required' => true,
+                        'size' => 6,
+                        'if' => 'amountType == "' . Payment::VALUE_TYPE_FIXED . '"',
+                    ]),
+                    SchemaHelper::fieldSelectField([
+                        'name' => 'amountVariable',
+                        'referenceContext' => 'client',
+                        'includeSelectors' => false,
+                        'topLevelOnly' => true,
+                        'required' => true,
+                        'fieldTypes' => [
+                            Calculations::class,
+                            Dropdown::class,
+                            Hidden::class,
+                            Number::class,
+                            Radio::class,
+                            SingleLineText::class,
+                        ],
+                        'if' => 'amountType == "' . Payment::VALUE_TYPE_DYNAMIC . '"',
+                    ]),
+                ],
+            ]),
+        ];
+    }
+
+    public function getPaymentSubFields($field): array
+    {
+        $subFields = [];
+
+        $rowConfigs = [
+            [
+                [
+                    'type' => SingleLineText::class,
+                    'label' => Craft::t('formie', 'Cardholder Name'),
+                    'handle' => 'cardName',
+                    'required' => true,
+                    'inputAttributes' => [
+                        [
+                            'label' => 'data-eway-card',
+                            'value' => 'cardholder-name',
+                        ],
+                        [
+                            'label' => 'name',
+                            'value' => false,
+                        ],
+                        [
+                            'label' => 'autocomplete',
+                            'value' => 'cc-name',
+                        ],
+                    ],
+                ],
+            ],
+            [
+                [
+                    'type' => SingleLineText::class,
+                    'label' => Craft::t('formie', 'Card Number'),
+                    'handle' => 'cardNumber',
+                    'required' => true,
+                    'placeholder' => '•••• •••• •••• ••••',
+                    'inputAttributes' => [
+                        [
+                            'label' => 'data-eway-card',
+                            'value' => 'card-number',
+                        ],
+                        [
+                            'label' => 'name',
+                            'value' => false,
+                        ],
+                        [
+                            'label' => 'autocomplete',
+                            'value' => 'cc-number',
+                        ],
+                    ],
+                ],
+                [
+                    'type' => SingleLineText::class,
+                    'label' => Craft::t('formie', 'Expiry'),
+                    'handle' => 'cardExpiry',
+                    'required' => true,
+                    'placeholder' => 'MMYY',
+                    'inputAttributes' => [
+                        [
+                            'label' => 'data-eway-card',
+                            'value' => 'expiry-date',
+                        ],
+                        [
+                            'label' => 'name',
+                            'value' => false,
+                        ],
+                        [
+                            'label' => 'autocomplete',
+                            'value' => 'cc-exp',
+                        ],
+                    ],
+                ],
+                [
+                    'type' => SingleLineText::class,
+                    'label' => Craft::t('formie', 'CVC'),
+                    'handle' => 'cardCvc',
+                    'required' => true,
+                    'placeholder' => '•••',
+                    'inputAttributes' => [
+                        [
+                            'label' => 'data-eway-card',
+                            'value' => 'security-code',
+                        ],
+                        [
+                            'label' => 'name',
+                            'value' => false,
+                        ],
+                        [
+                            'label' => 'autocomplete',
+                            'value' => 'cc-csc',
+                        ],
+                    ],
+                ],
+            ],
+        ];
+
+        foreach ($rowConfigs as $key => $rowConfig) {
+            foreach ($rowConfig as $config) {
+                $subField = Component::createComponent($config, FieldInterface::class);
+
+                // Ensure we set the parent field instance to handle the nested nature of subfields
+                $subFields[$key][] = $subField->withParentField($field);
+            }
+        }
+
+        $event = new ModifySubFieldsEvent([
+            'fields' => $subFields,
+        ]);
+
+        Event::trigger(static::class, self::EVENT_MODIFY_PAYMENT_SUBFIELDS, $event);
+
+        return $event->fields;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function refreshPaymentState(PaymentModel $payment): void
+    {
+        $mutex = Craft::$app->getMutex();
+        $lock = PaymentAttempt::lockName((int)$payment->submissionId, (int)$payment->integrationId, (int)$payment->fieldId);
+
+        if (!$mutex->acquire($lock, 10)) {
+            throw new Exception('This payment is already being processed.');
+        }
+
+        try {
+            $row = Craft::$app->getDb()->useMaster(fn() => (new Query())->from(Table::FORMIE_PAYMENTS)->where(['id' => $payment->id, 'integrationId' => $this->id])->one());
+
+            if (!$row) {
+                throw new Exception('Eway payment not found.');
+            }
+
+            $current = new PaymentModel($row);
+
+            if ($current->status === PaymentModel::STATUS_SUCCEEDED) {
+                $payment->status = $current->status;
+                return;
+            }
+
+            PaymentAttempt::verifyAccount($this, $current, ['apiKey' => $this->apiKey, 'apiPassword' => $this->apiPassword, 'useSandbox' => $this->useSandbox]);
+            $merchantReference = (new PaymentAttempt($current))->merchantReference();
+            $uri = $current->reference ? 'Transaction/' . rawurlencode($current->reference) : 'Transaction/InvoiceRef/' . rawurlencode($merchantReference);
+            $response = $this->request('GET', $uri);
+            $transactions = $response['Transactions'] ?? [];
+            $transaction = count($transactions) === 1 ? reset($transactions) : [];
+            $currency = new Currency((string)$current->currency);
+            $currencyCode = str_pad((string)(new ISOCurrencies())->numericCodeFor($currency), 3, '0', STR_PAD_LEFT);
+
+            if (!empty($response['Errors']) || !$transaction || empty($transaction['TransactionID'])
+                || ($transaction['InvoiceReference'] ?? null) !== $merchantReference
+                || ($current->reference && (string)$transaction['TransactionID'] !== $current->reference)
+                || str_pad((string)($transaction['CurrencyCode'] ?? ''), 3, '0', STR_PAD_LEFT) !== $currencyCode
+                || (string)($transaction['TotalAmount'] ?? '') !== (string)$this->_minorAmount($current->amount, (string)$current->currency)
+                || (int)($transaction['TransactionType'] ?? 0) !== 1) {
+                throw new Exception('The Eway transaction owner, amount or currency could not be verified.');
+            }
+
+            if (($transaction['TransactionStatus'] ?? null) !== true || ($transaction['TransactionCaptured'] ?? null) !== true) {
+                throw new Exception('Eway has not confirmed a captured payment.');
+            }
+
+            $current->reference = (string)$transaction['TransactionID'];
+            $current->response = $transaction;
+            $current->status = PaymentModel::STATUS_SUCCEEDED;
+            $current->message = null;
+
+            if (!Formie::$plugin->getPayments()->savePayment($current)) {
+                throw new Exception('Unable to save the verified Eway payment.');
+            }
+
+            $payment->reference = $current->reference;
+            $payment->response = $current->response;
+            $payment->status = $current->status;
+        } finally {
+            $mutex->release($lock);
+        }
+    }
+
+    protected function executePayment(Submission $submission): PaymentDecision
+    {
+
+        $currency = $this->getFieldSetting('currency');
+
+        return PaymentAttempt::run($this, $submission, $this->getPaymentAmount($submission), $currency, [
+            'apiKey' => $this->apiKey,
+            'apiPassword' => $this->apiPassword,
+            'useSandbox' => $this->useSandbox,
+        ], fn(PaymentModel $payment, PaymentAttempt $attempt) => $this->_processPayment($submission, $payment, $attempt));
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey', 'apiPassword', 'clientSideEncryptionKey'], 'required'];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        $useSandbox = App::parseBooleanEnv($this->useSandbox);
+        $baseUri = $useSandbox ? 'https://api.sandbox.ewaypayments.com/' : 'https://api.ewaypayments.com/';
+
+        return Craft::createGuzzleClient([
+            'base_uri' => $baseUri,
+            'auth' => [App::parseEnv($this->apiKey), App::parseEnv($this->apiPassword)],
+        ]);
+    }
+
+    protected function definePaymentFieldSettingsDefaults(): array
+    {
+        $defaults = [
+            'amountType' => self::VALUE_TYPE_FIXED,
+        ];
+
+        return $defaults;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _processPayment(Submission $submission, PaymentModel $payment, PaymentAttempt $attempt): PaymentDecision
+    {
+        $result = false;
+
+        // Get the amount from the field, which handles dynamic fields
+        $amount = $payment->amount;
+        $currency = $this->getFieldSetting('currency');
+
+        // Capture the authorized payment
+        $field = $this->getField();
+        $paymentPayload = $this->getPaymentFieldPayload($submission);
+        $cardData = $paymentPayload->array('ewayTokenData');
+
+        if ((!$cardData || !is_array($cardData)) && !$attempt->hasReceipt()) {
+            throw new Exception('Invalid card details payload.');
+        }
+
+        $cardNumber = trim((string)($cardData['cardNumber'] ?? ''));
+        $securityCode = trim((string)($cardData['securityCode'] ?? ''));
+        [$expiryMonth, $expiryYear] = $this->_normalizeExpiry((string)($cardData['expiryDate'] ?? ''));
+
+        if (($cardNumber === '' || $securityCode === '' || $expiryMonth === '' || $expiryYear === '') && !$attempt->hasReceipt()) {
+            throw new Exception('Invalid card details. Please verify card number, expiry, and CVC.');
+        }
+
+        $payload = [
+            'Customer' => [
+                'CardDetails' => [
+                    'Name' => $cardData['cardholderName'] ?? '',
+                    'Number' => $cardNumber,
+                    'ExpiryMonth' => $expiryMonth,
+                    'ExpiryYear' => $expiryYear,
+                    'CVN' => $securityCode,
+                ],
+            ],
+            'Payment' => [
+                'TotalAmount' => $this->_minorAmount($amount, $currency),
+                'CurrencyCode' => strtoupper($currency),
+                'InvoiceReference' => $attempt->merchantReference(),
+            ],
+            'Method' => 'ProcessPayment',
+            'TransactionType' => 'Purchase',
+        ];
+
+        // Raise a `modifySinglePayload` event
+        $event = new ModifyPaymentPayloadEvent([
+            'integration' => $this,
+            'submission' => $submission,
+            'payload' => $payload,
+        ]);
+        $this->trigger(self::EVENT_MODIFY_PAYLOAD, $event);
+
+        $response = $attempt->request($event->payload, fn() => $this->request('POST', 'Transaction', ['json' => $event->payload]), static fn(array $response) => $response['TransactionID'] ?? null);
+
+        $transactionStatus = $response['TransactionStatus'] ?? false;
+
+        if ($transactionStatus === false && in_array((string)($response['ResponseCode'] ?? ''), ['05', '14', '51', '54', '57', '62', '65', '75', 'N7'], true)) {
+            $attempt->reject($this->_extractGatewayErrorMessage($response));
+        }
+
+        if ($transactionStatus !== true || empty($response['TransactionID'])) {
+            throw new Exception('Eway has not confirmed the payment.');
+        }
+
+        $payment->status = PaymentModel::STATUS_SUCCEEDED;
+        $payment->reference = $response['TransactionID'] ?? '';
+        $payment->response = $response;
+
+        $attempt->save();
+
+        $result = true;
+
+
+        return $result ? PaymentDecision::succeeded($this->handle) : PaymentDecision::failed(null, $this->handle);
+    }
+
+    private function _minorAmount(string|int|float $amount, string $currency): int
+    {
+        return PaymentMoney::fromDecimal((string)$amount, $currency)->integer();
+    }
+
+    private function _normalizeExpiry(string $expiryDate): array
+    {
+        $digits = preg_replace('/\D+/', '', $expiryDate) ?? '';
+
+        if (strlen($digits) < 4) {
+            return ['', ''];
+        }
+
+        $digits = substr($digits, 0, 4);
+
+        return [substr($digits, 0, 2), substr($digits, 2, 2)];
+    }
+
+    private function _extractGatewayErrorCode(?array $response): ?string
+    {
+        if (!$response) {
+            return null;
+        }
+
+        $errors = trim((string)($response['Errors'] ?? ''));
+
+        if ($errors === '') {
+            return null;
+        }
+
+        $first = trim(explode(',', $errors)[0] ?? '');
+
+        return $first !== '' ? $first : null;
+    }
+
+    private function _extractGatewayErrorMessage(?array $response): string
+    {
+        if (!$response) {
+            return 'Unknown error';
+        }
+
+        $responseMessage = trim((string)($response['ResponseMessage'] ?? ''));
+
+        if ($responseMessage !== '') {
+            return $responseMessage;
+        }
+
+        $errorCode = $this->_extractGatewayErrorCode($response);
+
+        if (!$errorCode) {
+            return 'Unknown error';
+        }
+
+        $map = [
+            'V6110' => 'Invalid card number (V6110).',
+        ];
+
+        return $map[$errorCode] ?? ("Gateway error ({$errorCode}).");
+    }
+}

@@ -1,0 +1,84 @@
+fieldLayouts:
+  58d4f699-c951-41b8-9c9e-8fc918340ab5:
+    cardThumbAlignment: end
+    tabs:
+      -
+        elementCondition: null
+        elements:
+          -
+            dateAdded: '2026-04-06T21:22:36+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: b02dc466-76dc-48ac-9fa2-f1a0f2d94371 # Grote Titel
+            handle: companyName
+            instructions: null
+            label: Bedrijfsnaam
+            required: false
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: 35b1d113-f016-422e-8807-b091b62b5226
+            userCondition: null
+            warning: null
+            width: 75
+          -
+            dateAdded: '2026-04-06T21:22:36+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: 14cf6089-a079-4523-bba2-29e524a8370a # Afbeelding
+            handle: logo
+            instructions: null
+            label: Logo
+            required: false
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: 5be2883d-772f-4b63-bc2b-ad4b31ae4f6b
+            userCondition: null
+            warning: null
+            width: 25
+          -
+            dateAdded: '2026-04-06T21:57:14+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: c9669560-d701-485b-be4d-53b5a3af6709 # Platte Tekst
+            handle: vat
+            instructions: null
+            label: 'BTW nummer'
+            required: true
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: 5f59eb5a-e2fc-4680-bb96-9c39b7c42c4b
+            userCondition: null
+            warning: null
+            width: 100
+          -
+            dateAdded: '2026-04-06T21:57:14+00:00'
+            elementCondition: null
+            type: craft\fieldlayoutelements\LineBreak
+            uid: 38259b29-786d-4d51-8db4-71e6e3c54c66
+            userCondition: null
+          -
+            dateAdded: '2026-06-16T07:00:54+00:00'
+            editCondition: null
+            elementCondition: null
+            elementEditCondition: null
+            fieldUid: 7ffdfd36-7734-4748-b81e-237d6f77de6f # Sociale Kanalen
+            handle: null
+            instructions: null
+            label: null
+            required: false
+            tip: null
+            type: craft\fieldlayoutelements\CustomField
+            uid: cedc2dbc-9810-43d2-bc05-b4e8ce0e83d0
+            userCondition: null
+            warning: null
+            width: 100
+        name: Content
+        uid: 13439f42-2645-42d4-8aad-c0c8fca37016
+        userCondition: null
+    thumbFieldKey: null
+handle: company
+name: 'Bedrijf & Juridisch'
+sortOrder: 1

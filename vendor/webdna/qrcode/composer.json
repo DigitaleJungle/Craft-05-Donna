@@ -1,0 +1,48 @@
+{
+	"name": "webdna/qrcode",
+	"description": "Generate a QR code",
+	"type": "craft-plugin",
+	"keywords": [
+		"craft",
+		"cms",
+		"craftcms",
+		"craft-plugin",
+		"qrcode"
+	],
+	"support": {
+		"docs": "https://github.com/webdna/craft-qrcode/blob/master/README.md",
+		"issues": "https://github.com/webdna/craft-qrcode/issues"
+	},
+	"license": "MIT",
+	"authors": [
+		{
+			"name": "webdna",
+			"homepage": "https://webdna.co.uk"
+		}
+	],
+	"require": {
+		"craftcms/cms": "^5.0",
+		"endroid/qr-code": "^5.0|^6.0",
+		"php": "^8.0.2|^9.0"
+	},
+	"autoload": {
+		"psr-4": {
+			"webdna\\qrcode\\": "src/"
+		}
+	},
+	"extra": {
+		"name": "QRCode",
+		"handle": "qrcode",
+		"hasCpSettings": false,
+		"hasCpSection": false,
+		"changelogUrl": "https://raw.githubusercontent.com/webdna/craft-qrcode/master/CHANGELOG.md",
+		"class": "webdna\\qrcode\\QRCode"
+	},
+	"config": {
+		"allow-plugins": {
+			"yiisoft/yii2-composer": true,
+			"craftcms/plugin-installer": true,
+			"endroid/installer": true
+		}
+	}
+}

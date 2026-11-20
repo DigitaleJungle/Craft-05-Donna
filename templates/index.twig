@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="{{ currentSite.language }}">
+	<head>
+		<meta charset="utf-8"/>
+		<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no"/>
+		<meta name="description" content=""/>
+		<meta name="author" content=""/>
+		{% hook "seo" %}
+		{% for image in company.logo %}
+			<link rel="icon" type="image/png" sizes="16x16" href="{{ image.url }}">
+		{% endfor %}
+		<script src="https://use.fontawesome.com/releases/v6.1.0/js/all.js" crossorigin="anonymous"></script>
+		<!-- Google fonts-->
+		<link rel="preconnect" href="https://fonts.gstatic.com"/>
+		{% if getenv('UMAMI_SITE_ID') %}
+            <script async src="https://analytics.digitalejungle.be/script.js" data-website-id="{{ getenv('UMAMI_SITE_ID') }}"></script>
+        {% endif %}
+		<link href="https://fonts.googleapis.com/css2?family=Tinos:ital,wght@0,400;0,700;1,400;1,700&amp;display=swap" rel="stylesheet"/>
+		<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,700;1,400;1,500;1,700&amp;display=swap" rel="stylesheet"/>
+		<link href="../fallback assets/index-style.css" rel="stylesheet"/>
+		<link href="../assets/css/buttons.css" rel="stylesheet"/>
+		{#}Set colors{#}
+		<style>
+			:root{
+				--clr1: {{ getenv('COLOR1') }};
+				--clr1-trans: {{ getenv('COLOR1') }}{{  getenv('TRANS') }};
+				--clr2: {{ getenv('COLOR2') }};
+				--clr2-trans: {{ getenv('COLOR2') }}{{  getenv('TRANS') }};
+				--white: {{ getenv('COLOR_WHITE') }};
+				--white-trans: {{ getenv('COLOR_WHITE') }}{{  getenv('TRANS') }};
+				--light: {{ getenv('COLOR_LIGHT') }};
+				--light-trans: {{ getenv('COLOR_LIGHT') }}{{  getenv('TRANS') }};
+				--dark: {{ getenv('COLOR_DARK') }};
+				--dark-trans: {{ getenv('COLOR_DARK') }}{{  getenv('TRANS') }};
+				--black: {{ getenv('COLOR_BLACK') }};
+				--black-trans: {{ getenv('COLOR_BLACK') }}{{  getenv('TRANS') }};
+			}
+		</style>
+	</head>
+	<body>
+		<!-- Background Video-->
+		<video class="bg-video" playsinline="playsinline" autoplay="autoplay" muted="muted" loop="loop"><source src="../fallback assets/DigitaleJungleBG.mp4" type="video/mp4"/></video>
+		<!-- Masthead-->
+		<div class="masthead">
+			<div class="masthead-content text-white">
+				<div class="container-fluid px-4 px-lg-0">
+
+					<h1 class="fst-italic lh-1 mb-4">{{ siteConfig.constructionTitle ?? currentSite.group.name }}</h1>
+					{{ siteConfig.constructionText ?? '<p class="mb-5">We werken momenteel aan de website, neem binnenkort nog eens een kijkje.</p>' }}
+					{{ craft.formie.renderForm(siteConfig.form.one()) }}
+
+				</div>
+			</div>
+			<div class="disclaimer">
+				<a class="" href="https://digitalejungle.be">Mogelijk gemaakt door Digitale Jungle<a></div>
+				</div>
+				<div class="social-icons">
+					<div class="d-flex flex-row flex-lg-column justify-content-center align-items-center h-100 mt-3 mt-lg-0">
+						{% for social in company.socialMedia %}
+							{% tag 'a' with {
+								href: social.ctaLink.value,
+								target: social.ctaLink.target,
+								rel: social.ctaLink.target == '_blank' ? 'noopener noreferrer' : null,
+								text: social.ctaLink.label,
+								class: "btn btn-dark m-3"
+							} %}
+							{% for logo in social.image.all() %}
+								{{ svg(logo)|attr({class: 'social-icon'}) }}
+							{% endfor %}
+							{% endtag %}
+						{% endfor %}
+					</div>
+				</div>
+				<!-- Bootstrap core JS-->
+				<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+				<!-- Core theme JS-->
+			</body>
+		</html>
+	</body>
+</html>

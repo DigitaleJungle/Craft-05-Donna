@@ -1,0 +1,677 @@
+<?php
+namespace verbb\cpnav\nav\builder;
+
+use verbb\cpnav\CpNav;
+use verbb\cpnav\helpers\ManualUrl;
+use verbb\cpnav\models\Layout;
+use verbb\cpnav\models\LayoutNavItem;
+use verbb\cpnav\nav\customization\CustomizationNode;
+use verbb\cpnav\nav\resolve\ResolvedNavNode;
+use verbb\cpnav\nav\sources\NavNode;
+use verbb\cpnav\nav\sources\NodeKey;
+
+use craft\base\Component;
+use craft\helpers\StringHelper;
+
+/**
+ * Customization-backed builder operations for the CP Nav settings UI.
+ */
+class NavBuilderService extends Component
+{
+    // Public Methods
+    // =========================================================================
+
+    public function getLayoutNavItemsForLayout(int $layoutId): array
+    {
+        $layout = CpNav::$plugin->getLayouts()->getLayoutById($layoutId);
+
+        if (!$layout) {
+            return [];
+        }
+
+        return $this->_buildLayoutNavItems($layout);
+    }
+
+    public function getLayoutNavItemByBuilderId(int $layoutId, int $builderId): ?LayoutNavItem
+    {
+        $match = null;
+
+        foreach ($this->getLayoutNavItemsForLayout($layoutId) as $navigation) {
+            if ($navigation->id === $builderId) {
+                // Numeric IDs are only a legacy projection; refuse an ambiguous lookup.
+                if ($match !== null) {
+                    return null;
+                }
+                $match = $navigation;
+            }
+        }
+
+        return $match;
+    }
+
+    public function getLayoutNavItemByKey(int $layoutId, string $nodeKey): ?LayoutNavItem
+    {
+        foreach ($this->getLayoutNavItemsForLayout($layoutId) as $navigation) {
+            if ($navigation->nodeKey === $nodeKey) {
+                return $navigation;
+            }
+
+            foreach ($navigation->getChildren() as $child) {
+                if ($child->nodeKey === $nodeKey) {
+                    return $child;
+                }
+            }
+        }
+
+        $layout = CpNav::$plugin->getLayouts()->getLayoutById($layoutId);
+
+        if (!$layout) {
+            return null;
+        }
+
+        $registryNode = $this->_registryNodeForKey($nodeKey);
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        $customization = $overlay[$nodeKey] ?? null;
+
+        if (!$registryNode || !$customization) {
+            return null;
+        }
+
+        $resolved = new ResolvedNavNode(
+            key: $nodeKey,
+            label: $customization->label ?? $registryNode->defaultLabel,
+            url: $customization->url ?? $registryNode->defaultUrl,
+            sort: $customization->sort,
+            parentKey: $customization->resolvedParent($registryNode->parentKey),
+            source: $registryNode->source,
+            enabled: $customization->enabled,
+            icon: $customization->icon ?? $registryNode->icon,
+            customIcon: $customization->customIcon,
+            newWindow: $customization->newWindow || $registryNode->defaultExternal,
+        );
+
+        return $this->_layoutNavItemFromResolved($layout, $resolved, $registryNode);
+    }
+
+    public function toggleEnabled(int $layoutId, int $builderId, bool $enabled): bool
+    {
+        $navigation = $this->getLayoutNavItemByBuilderId($layoutId, $builderId);
+
+        if (!$navigation || !$navigation->nodeKey) {
+            return false;
+        }
+
+        $layout = $navigation->getLayout();
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        $node = $overlay[$navigation->nodeKey] ?? $this->_defaultCustomizationNode($navigation->nodeKey, $navigation);
+
+        CpNav::$plugin->getNavCustomization()->saveNode(
+            $layout->uid,
+            new CustomizationNode(
+                key: $node->key,
+                enabled: $enabled,
+                sort: $node->sort,
+                parent: $node->parent,
+                label: $node->label,
+                type: $node->type,
+                url: $node->url,
+                icon: $node->icon,
+                customIcon: $node->customIcon,
+                newWindow: $node->newWindow,
+            ),
+        );
+
+        return true;
+    }
+
+    public function reorder(int $layoutId, array $items): bool
+    {
+        $layout = CpNav::$plugin->getLayouts()->getLayoutById($layoutId);
+
+        if (!$layout) {
+            return false;
+        }
+
+        // One layout tree + one overlay load for the whole mutation.
+        $nodesByKey = [];
+
+        foreach ($this->getLayoutNavItemsForLayout($layoutId) as $navigation) {
+            if ($navigation->nodeKey) {
+                $nodesByKey[$navigation->nodeKey] = $navigation;
+            }
+
+            foreach ($navigation->getChildren() as $child) {
+                if ($child->nodeKey) {
+                    $nodesByKey[$child->nodeKey] = $child;
+                }
+            }
+        }
+
+        $validationIndex = [];
+
+        foreach ($nodesByKey as $key => $navigation) {
+            $validationIndex[$key] = [
+                'key' => $key,
+                'parentKey' => $navigation->getParent()?->nodeKey,
+            ];
+        }
+
+        if (NavTreeReparent::validateReorderItems($items, $validationIndex) !== []) {
+            return false;
+        }
+
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        $updated = $overlay;
+
+        foreach ($items as $sort => $item) {
+            $key = (string)($item['key'] ?? '');
+            $navigation = $nodesByKey[$key] ?? null;
+
+            if (!$navigation || !$navigation->nodeKey) {
+                continue;
+            }
+
+            $parentKey = CustomizationNode::PARENT_ROOT;
+            $rawParent = $item['parentKey'] ?? null;
+
+            if ($rawParent !== null && $rawParent !== '') {
+                $parent = $nodesByKey[(string)$rawParent] ?? null;
+
+                // Depth was checked against the resulting tree, including parents promoted in this batch.
+                if (!$parent || !$parent->nodeKey) {
+                    return false;
+                }
+
+                $parentKey = $parent->nodeKey;
+            }
+
+            $existing = $updated[$navigation->nodeKey] ?? $this->_defaultCustomizationNode($navigation->nodeKey, $navigation);
+
+            $updated[$navigation->nodeKey] = new CustomizationNode(
+                key: $existing->key,
+                enabled: $existing->enabled,
+                sort: ((int)$sort + 1) * 10,
+                parent: $parentKey,
+                label: $existing->label,
+                type: $existing->type,
+                url: $existing->url,
+                icon: $existing->icon,
+                customIcon: $existing->customIcon,
+                newWindow: $existing->newWindow,
+            );
+        }
+
+        CpNav::$plugin->getNavCustomization()->setCustomizationNodes($layout->uid, $updated);
+
+        return true;
+    }
+
+    /**
+     * Indent a node under the previous root sibling.
+     */
+    public function indentNode(int $layoutId, string $nodeKey): bool
+    {
+        $nodes = $this->_flatBuilderNodes($layoutId);
+        $next = NavTreeReparent::indent($nodes, $nodeKey);
+
+        if ($next === null) {
+            return false;
+        }
+
+        return $this->reorder($layoutId, NavTreeReparent::toReorderPayload($next));
+    }
+
+    /**
+     * Outdent a nested node to top level, after its former parent block.
+     */
+    public function outdentNode(int $layoutId, string $nodeKey): bool
+    {
+        $nodes = $this->_flatBuilderNodes($layoutId);
+        $next = NavTreeReparent::outdent($nodes, $nodeKey);
+
+        if ($next === null) {
+            return false;
+        }
+
+        return $this->reorder($layoutId, NavTreeReparent::toReorderPayload($next));
+    }
+
+    /**
+     * Set an explicit parent key (null = root). Enforces max depth 2.
+     */
+    public function reparentNode(int $layoutId, string $nodeKey, ?string $parentKey): bool
+    {
+        $nodes = $this->_flatBuilderNodes($layoutId);
+        $index = null;
+
+        foreach ($nodes as $i => $node) {
+            if (($node['key'] ?? null) === $nodeKey) {
+                $index = $i;
+            }
+        }
+
+        if ($index === null) {
+            return false;
+        }
+
+        // Dividers are top-level section breaks only.
+        if ($parentKey !== null && NodeKey::isDivider($nodeKey)) {
+            return false;
+        }
+
+        if ($parentKey !== null && NodeKey::isDivider($parentKey)) {
+            return false;
+        }
+
+        if ($parentKey === $nodeKey) {
+            return false;
+        }
+
+        if ($parentKey !== null) {
+            $parentIndex = null;
+
+            foreach ($nodes as $i => $node) {
+                if (($node['key'] ?? null) === $parentKey) {
+                    $parentIndex = $i;
+                    break;
+                }
+            }
+
+            if ($parentIndex === null || !empty($nodes[$parentIndex]['parentKey'])) {
+                return false;
+            }
+
+            // Moving a node that has children under another parent would create depth 3.
+            foreach ($nodes as $node) {
+                if (($node['parentKey'] ?? null) === $nodeKey) {
+                    return false;
+                }
+            }
+        }
+
+        $nodes[$index]['parentKey'] = $parentKey;
+        $nodes[$index]['level'] = $parentKey ? 2 : 1;
+
+        if (array_key_exists('parentId', $nodes[$index])) {
+            $nodes[$index]['parentId'] = null;
+
+            if ($parentKey !== null) {
+                foreach ($nodes as $node) {
+                    if (($node['key'] ?? null) === $parentKey) {
+                        $nodes[$index]['parentId'] = (int)($node['builderId'] ?? 0);
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $this->reorder($layoutId, NavTreeReparent::toReorderPayload(array_values($nodes)));
+    }
+
+    public function saveLayoutNavItem(LayoutNavItem $navigation): bool
+    {
+        if (!$navigation->validate()) {
+            return false;
+        }
+
+        $layout = $navigation->getLayout();
+        $key = $navigation->nodeKey;
+
+        if (!$key) {
+            return false;
+        }
+
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        $existing = $overlay[$key] ?? $this->_defaultCustomizationNode($key, $navigation);
+        $registryNode = $this->_registryNodeForKey($key);
+        $isCustomizationOnly = NodeKey::isCustomizationOnly($key);
+        $label = $navigation->currLabel;
+
+        // Manual/divider always store their label; canonical only stores an override delta.
+        if ($isCustomizationOnly) {
+            $label = $navigation->currLabel;
+        } elseif ($registryNode && $label === $registryNode->defaultLabel) {
+            $label = null;
+        }
+
+        // Manual/divider persist full URL; canonical stays sparse (D23 — no URL override from UI).
+        $url = $isCustomizationOnly
+            ? $navigation->url
+            : $existing->url;
+
+        if ($navigation->isManual() && !ManualUrl::isAllowed($url)) {
+            return false;
+        }
+
+        if (!$isCustomizationOnly && $registryNode && $url !== null && $url === $registryNode->defaultUrl) {
+            $url = null;
+        }
+
+        $type = $isCustomizationOnly
+            ? ($navigation->type ?? $existing->type)
+            : $existing->type;
+
+        CpNav::$plugin->getNavCustomization()->saveNode(
+            $layout->uid,
+            new CustomizationNode(
+                key: $key,
+                enabled: (bool)$navigation->enabled,
+                sort: $existing->sort,
+                parent: $existing->parent,
+                label: $label,
+                type: $type,
+                url: $url,
+                icon: $isCustomizationOnly ? ($navigation->icon ?: null) : $existing->icon,
+                customIcon: $navigation->customIcon ?: null,
+                newWindow: $isCustomizationOnly ? (bool)$navigation->newWindow : $existing->newWindow,
+            ),
+        );
+
+        return true;
+    }
+
+    public function createLayoutNavItem(LayoutNavItem $navigation): bool
+    {
+        if (!$navigation->validate()) {
+            return false;
+        }
+
+        $layout = $navigation->getLayout();
+        $type = $navigation->type ?? LayoutNavItem::TYPE_MANUAL;
+
+        // Provider types are discovered, never created through the manual-item API.
+        if (!in_array($type, [LayoutNavItem::TYPE_MANUAL, LayoutNavItem::TYPE_DIVIDER], true)) {
+            return false;
+        }
+
+        if ($type === LayoutNavItem::TYPE_MANUAL) {
+            $url = (string)($navigation->url ?? '');
+
+            if ($url === '' || !ManualUrl::isAllowed($url)) {
+                return false;
+            }
+        }
+
+        $uuid = StringHelper::UUID();
+        $key = $type === LayoutNavItem::TYPE_DIVIDER
+            ? NodeKey::divider($uuid)
+            : NodeKey::manual($uuid);
+
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        // Append after the *resolved* top-level order — not overlay-only maxSort.
+        // Overlay is often empty/sparse; registry defaults use defaultOrder*10 (Dashboard=10),
+        // so overlay maxSort=0 → sort=10 put new manuals in the second slot (tie with Dashboard).
+        $maxSort = $this->_maxTopLevelResolvedSort($layout, $overlay);
+
+        CpNav::$plugin->getNavCustomization()->saveNode(
+            $layout->uid,
+            new CustomizationNode(
+                key: $key,
+                enabled: true,
+                sort: $maxSort + 10,
+                parent: CustomizationNode::PARENT_ROOT,
+                label: $navigation->currLabel,
+                type: $type,
+                url: $navigation->url,
+                icon: $navigation->icon,
+                customIcon: $navigation->customIcon,
+                newWindow: (bool)$navigation->newWindow,
+            ),
+        );
+
+        $navigation->nodeKey = $key;
+        $navigation->id = $this->_builderIdForKey($key);
+        $navigation->uid = $uuid;
+
+        return true;
+    }
+
+    public function deleteLayoutNavItem(int $layoutId, int $builderId): bool
+    {
+        $navigation = $this->getLayoutNavItemByBuilderId($layoutId, $builderId);
+
+        return $navigation?->nodeKey
+            ? $this->deleteLayoutNavItemByKey($layoutId, $navigation->nodeKey)
+            : false;
+    }
+
+    public function deleteLayoutNavItemByKey(int $layoutId, string $nodeKey): bool
+    {
+        $navigation = $this->getLayoutNavItemByKey($layoutId, $nodeKey);
+
+        if (!$navigation || !$navigation->nodeKey) {
+            return false;
+        }
+
+        if (!$navigation->isManual() && !$navigation->isDivider()) {
+            return false;
+        }
+
+        $layout = $navigation->getLayout();
+        CpNav::$plugin->getNavCustomization()->removeNode($layout->uid, $navigation->nodeKey);
+
+        return true;
+    }
+
+    public function resetLayout(int $layoutId): void
+    {
+        $layout = CpNav::$plugin->getLayouts()->getLayoutById($layoutId);
+
+        if (!$layout) {
+            return;
+        }
+
+        CpNav::$plugin->getNavCustomization()->clearCustomization($layout->uid);
+        CpNav::$plugin->getNavCustomization()->acknowledgeCurrentRegistry($layout->uid);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    /**
+     * Flat builder nodes in display order — same shape as NavBuilderApi tree nodes
+     * (subset of fields needed for reparent transforms).
+     */
+    private function _flatBuilderNodes(int $layoutId): array
+    {
+        $nodes = [];
+
+        foreach ($this->getLayoutNavItemsForLayout($layoutId) as $navigation) {
+            if ($navigation->getParent() !== null) {
+                continue;
+            }
+
+            $nodes[] = [
+                'builderId' => (int)$navigation->id,
+                'key' => (string)$navigation->nodeKey,
+                'parentKey' => null,
+                'parentId' => null,
+                'level' => 1,
+            ];
+
+            foreach ($navigation->getChildren() as $child) {
+                $nodes[] = [
+                    'builderId' => (int)$child->id,
+                    'key' => (string)$child->nodeKey,
+                    'parentKey' => (string)$navigation->nodeKey,
+                    'parentId' => (int)$navigation->id,
+                    'level' => 2,
+                ];
+            }
+        }
+
+        return $nodes;
+    }
+
+    private function _buildLayoutNavItems(Layout $layout): array
+    {
+        $registryTree = CpNav::$plugin->getNavSources()->getTree();
+        $overlay = CpNav::$plugin->getNavCustomization()->getCustomizationForLayout($layout->uid);
+        // Edit saved configuration, so unrelated saves cannot persist display-event overrides.
+        $resolved = CpNav::$plugin->getNavResolver()->resolve($registryTree, $overlay, $layout->uid, applyEvents: false);
+        $registryIndex = $this->_indexRegistry($registryTree);
+        $navigations = [];
+        $byKey = [];
+
+        foreach ($resolved as $node) {
+            $navigation = $this->_layoutNavItemFromResolved($layout, $node, $registryIndex[$node->key] ?? null);
+            $byKey[$node->key] = $navigation;
+            $navigations[] = $navigation;
+        }
+
+        foreach ($resolved as $node) {
+            // Attach by canonical identity, never by the potentially colliding display hash.
+            $parent = $node->parentKey !== null ? ($byKey[$node->parentKey] ?? null) : null;
+
+            if ($parent) {
+                $navigation = $byKey[$node->key];
+                $parent->addChild($navigation);
+                $navigation->assignParent($parent);
+            }
+        }
+
+        return $navigations;
+    }
+
+    /**
+     * Highest sibling sort among top-level resolved nodes (registry defaults + overlay).
+     * Used so admin-created manuals/dividers append at the end of the builder tree.
+     */
+    private function _maxTopLevelResolvedSort(Layout $layout, array $overlay): int
+    {
+        $registryTree = CpNav::$plugin->getNavSources()->getTree();
+        $resolved = CpNav::$plugin->getNavResolver()->resolve($registryTree, $overlay, $layout->uid, applyEvents: false);
+        $maxSort = 0;
+
+        foreach ($resolved as $node) {
+            if ($node->parentKey !== null) {
+                continue;
+            }
+
+            $maxSort = max($maxSort, $node->sort);
+        }
+
+        return $maxSort;
+    }
+
+    private function _layoutNavItemFromResolved(Layout $layout, ResolvedNavNode $node, ?NavNode $registryNode): LayoutNavItem
+    {
+        $parentBuilderId = null;
+
+        if ($node->parentKey) {
+            $parentBuilderId = $this->_builderIdForKey($node->parentKey);
+        }
+
+        $navigation = new LayoutNavItem();
+        $navigation->nodeKey = $node->key;
+        $navigation->id = $this->_builderIdForKey($node->key);
+        $navigation->layoutId = $layout->id;
+        $navigation->enabled = $node->enabled;
+        $navigation->level = $node->parentKey ? 2 : 1;
+        $navigation->parentId = $parentBuilderId;
+        $navigation->sortOrder = $node->sort;
+        $navigation->prevLabel = $registryNode->defaultLabel ?? $node->label;
+        $navigation->currLabel = $node->label;
+        $navigation->url = $node->url;
+        $navigation->prevUrl = $registryNode->defaultUrl ?? $node->url;
+        $navigation->type = $this->_typeForKey($node->key, $node);
+        $navigation->handle = $this->_handleForKey($node->key);
+        $navigation->icon = $node->icon;
+        $navigation->customIcon = $node->customIcon;
+        $navigation->newWindow = $node->newWindow;
+        $navigation->isOrphan = $node->isOrphan;
+        $navigation->uid = $this->_uidFromKey($node->key);
+
+        return $navigation;
+    }
+
+    private function _defaultCustomizationNode(string $key, LayoutNavItem $navigation): CustomizationNode
+    {
+        // Canonical defaults stay live, including the provider's per-user window behavior.
+        // Manual/divider are full definitions.
+        $isCustomizationOnly = NodeKey::isCustomizationOnly($key);
+
+        return new CustomizationNode(
+            key: $key,
+            enabled: (bool)$navigation->enabled,
+            sort: (int)($navigation->sortOrder ?? 0),
+            parent: null,
+            label: $isCustomizationOnly
+                ? $navigation->currLabel
+                : ($navigation->currLabel !== $navigation->prevLabel ? $navigation->currLabel : null),
+            type: $isCustomizationOnly ? $navigation->type : null,
+            url: $isCustomizationOnly ? $navigation->url : null,
+            icon: null,
+            customIcon: $navigation->customIcon ?: null,
+            newWindow: $isCustomizationOnly && (bool)$navigation->newWindow,
+        );
+    }
+
+    private function _registryNodeForKey(string $key): ?NavNode
+    {
+        return $this->_indexRegistry(CpNav::$plugin->getNavSources()->getTree())[$key] ?? null;
+    }
+
+    private function _indexRegistry(array $registryTree): array
+    {
+        $index = [];
+
+        $walk = function(array $nodes) use (&$index, &$walk): void {
+            foreach ($nodes as $node) {
+                $index[$node->key] = $node;
+
+                if ($node->children) {
+                    $walk($node->children);
+                }
+            }
+        };
+
+        $walk($registryTree);
+
+        return $index;
+    }
+
+    private function _builderIdForKey(string $key): int
+    {
+        return (int)sprintf('%u', crc32($key));
+    }
+
+    private function _typeForKey(string $key, ResolvedNavNode $node): string
+    {
+        if (str_starts_with($key, NodeKey::NS_MANUAL . ':')) {
+            return LayoutNavItem::TYPE_MANUAL;
+        }
+
+        if (str_starts_with($key, NodeKey::NS_DIVIDER . ':')) {
+            return LayoutNavItem::TYPE_DIVIDER;
+        }
+
+        if (str_starts_with($key, NodeKey::NS_PLUGIN . ':')) {
+            return LayoutNavItem::TYPE_PLUGIN;
+        }
+
+        return LayoutNavItem::TYPE_CRAFT;
+    }
+
+    private function _handleForKey(string $key): string
+    {
+        if (NodeKey::isCustomizationOnly($key)) {
+            return substr($key, strpos($key, ':') + 1);
+        }
+
+        [, $path] = NodeKey::split($key);
+        $parts = explode('/', $path);
+
+        return $parts[0] ?? $path;
+    }
+
+    private function _uidFromKey(string $key): ?string
+    {
+        if (!NodeKey::isCustomizationOnly($key)) {
+            return null;
+        }
+
+        return substr($key, strpos($key, ':') + 1);
+    }
+}

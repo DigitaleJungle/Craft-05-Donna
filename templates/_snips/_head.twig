@@ -1,0 +1,48 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<meta name="description" content=""/>
+<meta name="author" content=""/>
+
+{% hook "seo" %}
+
+{#} Favicon example, see https://realfavicongenerator.net/ {#}
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+<link rel="manifest" href="/site.webmanifest">
+<link rel="mask-icon" href="/safari-pinned-tab.svg" color="#868686">
+<meta name="msapplication-TileColor" content="#da532c">
+<meta name="theme-color" content="#ffffff">
+
+{#} Style Sheet {#}
+<link href="../assets/css/buttons.css" rel="stylesheet">
+
+<link rel="stylesheet" href="css/style.css">
+
+{#}Analytics{#}
+{% if getenv('UMAMI_SITE_ID') %}
+    <script async src="https://analytics.digitalejungle.be/script.js" data-website-id="{{ getenv('UMAMI_SITE_ID') }}"></script>
+{% endif %}
+
+{% for snip in siteConfig.codeHead %}
+    <!-- {{ snip.titel }} --> 
+    {{ snip.code|raw }}
+{% endfor %}
+
+{#}Set colors{#}
+<style>
+    :root{
+        --clr1: {{ getenv('COLOR1') }};
+        --clr1-trans: {{ getenv('COLOR1') }}{{  getenv('TRANS') }};
+        --clr2: {{ getenv('COLOR2') }};
+        --clr2-trans: {{ getenv('COLOR2') }}{{  getenv('TRANS') }};
+        --white: {{ getenv('COLOR_WHITE') }};
+        --white-trans: {{ getenv('COLOR_WHITE') }}{{  getenv('TRANS') }};
+        --light: {{ getenv('COLOR_LIGHT') }};
+        --light-trans: {{ getenv('COLOR_LIGHT') }}{{  getenv('TRANS') }};
+        --dark: {{ getenv('COLOR_DARK') }};
+        --dark-trans: {{ getenv('COLOR_DARK') }}{{  getenv('TRANS') }};
+        --black: {{ getenv('COLOR_BLACK') }};
+        --black-trans: {{ getenv('COLOR_BLACK') }}{{  getenv('TRANS') }};
+    }
+</style>

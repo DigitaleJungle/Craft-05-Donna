@@ -1,0 +1,16 @@
+{% import '_includes/forms' as forms %}
+
+{% extends 'formie/_formfields/field' %}
+
+{% block field %}
+    {{ forms.text({
+        name: name,
+        value: value,
+        readonly: true,
+        inputAttributes: {
+            data: {
+                'formie-calculation-input': true,
+            },
+        },
+    }) }}
+{% endblock %}

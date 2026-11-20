@@ -1,0 +1,729 @@
+<?php
+namespace verbb\formie\integrations\elements;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\Element;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\enums\SubmissionAuthorityType;
+use verbb\formie\errors\IntegrationStepException;
+use verbb\formie\fields\Password;
+use verbb\formie\Formie;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\Table;
+use verbb\formie\helpers\Variables;
+use verbb\formie\models\IntegrationCollection;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+use verbb\formie\references\ReferenceSlot;
+use verbb\formie\references\ReferenceSlotKind;
+
+use Craft;
+use craft\elements\Address as AddressElement;
+use craft\elements\User as UserElement;
+use craft\fieldlayoutelements\BaseNativeField;
+use craft\fieldlayoutelements\CustomField;
+use craft\helpers\Db;
+use craft\helpers\Json;
+
+use Throwable;
+
+class User extends Element
+{
+    // Constants
+    // =========================================================================
+
+    private const RESOURCE_ORIGIN = 'formieUserOrigin';
+
+
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'User');
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public array $groupIds = [];
+
+    #[FormIntegrationSetting]
+    public array $groupUids = [];
+
+    #[FormIntegrationSetting]
+    public bool $activateUser = false;
+
+    #[FormIntegrationSetting]
+    public bool $mergeUserGroups = false;
+
+    #[FormIntegrationSetting]
+    public bool $sendActivationEmail = true;
+
+    public ?AddressElement $address = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Map content provided by form submissions to create {name} elements.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $customFields = [];
+
+        $userFieldLayout = Craft::$app->getFields()->getLayoutByType(UserElement::class);
+        $fields = $this->getFieldLayoutFields($userFieldLayout);
+
+        $customFields[] = new IntegrationCollection([
+            'id' => 'user',
+            'name' => 'User',
+            'fields' => $fields,
+        ]);
+
+        return new IntegrationConfig([
+            'elements' => $customFields,
+            'attributes' => $this->getElementAttributes(),
+        ]);
+    }
+
+    public function getElementAttributes(): array
+    {
+        $attributes = [
+            new IntegrationField([
+                'name' => Craft::t('app', 'Username'),
+                'handle' => 'username',
+                'required' => true,
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'First Name'),
+                'handle' => 'firstName',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Last Name'),
+                'handle' => 'lastName',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Full Name'),
+                'handle' => 'fullName',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Email'),
+                'handle' => 'email',
+                'required' => true,
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('formie', 'Password (New Users Only)'),
+                'handle' => 'newPassword',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Photo'),
+                'handle' => 'photo',
+                'type' => IntegrationField::TYPE_NUMBER,
+            ]),
+        ];
+
+        // Only include address fields if that native field has been added
+        if ($fieldLayout = Craft::$app->getFields()->getLayoutByType(UserElement::class)) {
+            if ($fieldLayout->isFieldIncluded('addresses')) {
+                if ($addressField = $fieldLayout->getField('addresses')) {
+                    $fields = [];
+
+                    foreach (Craft::$app->getFields()->getLayoutByType(AddressElement::class)->getTabs() as $tab) {
+                        foreach ($tab->getElements() as $layoutElement) {
+                            if ($layoutElement instanceof BaseNativeField) {
+                                if (!$layoutElement->label()) {
+                                    continue;
+                                }
+
+                                $attributes[] = new IntegrationField([
+                                    'handle' => $addressField->attribute . '__' . $layoutElement->attribute,
+                                    'name' => Craft::t('formie', '{addressLabel}: {label}', [
+                                        'addressLabel' => $addressField->label(),
+                                        'label' => $layoutElement->label(),
+                                    ]),
+                                    'type' => $this->getFieldTypeForField(get_class($layoutElement)),
+                                    'sourceType' => get_class($layoutElement),
+                                    'required' => $layoutElement->required,
+                                ]);
+                            } elseif ($layoutElement instanceof CustomField) {
+                                $field = $layoutElement->getField();
+
+                                $attributes[] = new IntegrationField([
+                                    'handle' => $addressField->attribute . '__' . $field->handle,
+                                    'name' => Craft::t('formie', '{addressLabel}: {label}', [
+                                        'addressLabel' => $addressField->label(),
+                                        'label' => $field->name,
+                                    ]),
+                                    'type' => $this->getFieldTypeForField(get_class($field)),
+                                    'sourceType' => get_class($field),
+                                    'required' => $layoutElement->required,
+                                ]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return $attributes;
+    }
+
+    public function getUpdateAttributes(): array
+    {
+        $attributes = [];
+
+        $attributes['users'] = [
+            new IntegrationField([
+                'name' => Craft::t('app', 'ID'),
+                'handle' => 'id',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Username'),
+                'handle' => 'username',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'First Name'),
+                'handle' => 'firstName',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Last Name'),
+                'handle' => 'lastName',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Full Name'),
+                'handle' => 'fullName',
+            ]),
+            new IntegrationField([
+                'name' => Craft::t('app', 'Email'),
+                'handle' => 'email',
+            ]),
+        ];
+
+        $userFieldLayout = Craft::$app->getFields()->getLayoutByType(UserElement::class);
+
+        foreach ($userFieldLayout->getCustomFields() as $field) {
+            if (!$this->fieldCanBeUniqueId($field)) {
+                continue;
+            }
+
+            $attributes['users'][] = new IntegrationField([
+                'handle' => $field->handle,
+                'name' => $field->name,
+                'type' => $this->getFieldTypeForField(get_class($field)),
+                'sourceType' => get_class($field),
+            ]);
+        }
+
+
+        return $attributes;
+    }
+
+    public function getGroupOptions(): array
+    {
+        $userGroups = [];
+        $currentUser = Craft::$app->getUser()->getIdentity();
+        $selectedGroupUids = array_fill_keys($this->groupUids, true);
+
+        foreach (Craft::$app->getUserGroups()->getAllGroups() as $key => $group) {
+            // Existing assignments stay visible so an editor who no longer has
+            // assignment authority can preserve or remove them.
+            if ($currentUser && !isset($selectedGroupUids[$group->uid]) && !$currentUser->can("assignUserGroup:$group->uid")) {
+                continue;
+            }
+
+            $userGroups[] = [
+                'label' => $group->name,
+                'value' => $group->uid,
+            ];
+        }
+
+        return $userGroups;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $generalConfig = Craft::$app->getConfig()->getGeneral();
+
+            $user = $this->getElementForPayload(UserElement::class, 'users', $submission);
+            $isNewUser = $this->_isCreatedUser($user);
+
+            // If a new user, set as pending
+            if ($isNewUser && !$user->id) {
+                $user->pending = true;
+            }
+
+            // Get the source form field if we're mapping the password. A few things to do.
+            $passwordField = $this->_getPasswordField($submission);
+            $hashedPassword = null;
+
+            $userGroups = [];
+            $missingGroupUids = [];
+
+            if ($this->mergeUserGroups) {
+                $userGroups = $user->getGroups();
+            }
+
+            foreach ($this->groupUids as $groupUid) {
+                if ($group = Craft::$app->getUserGroups()->getGroupByUid($groupUid)) {
+                    $userGroups[] = $group;
+                } else {
+                    $missingGroupUids[] = $groupUid;
+                }
+            }
+
+            if ($missingGroupUids) {
+                Integration::error($this, Craft::t('formie', 'Unable to find user group(s) “{uids}” for “{type}” element integration.', [
+                    'uids' => implode(', ', $missingGroupUids),
+                    'type' => $this->handle,
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+
+            if ($userGroups) {
+                $user->setGroups($userGroups);
+            }
+
+            $attributeValues = $this->getFieldMappingValues($submission, $this->attributeMapping, $this->getElementAttributes());
+
+            // Filter empty values
+            if (!$this->overwriteValues) {
+                $attributeValues = $this->withoutEmptyMappedValues($attributeValues);
+            }
+
+            // Check if the password was mapped, as if the source field was a Password field.
+            // The value will already be hashed, and we need to do a manual DB-level update
+            if (isset($attributeValues['newPassword'])) {
+                // If this a Password field?
+                if ($passwordField instanceof Password) {
+                    $hashedPassword = ArrayHelper::remove($attributeValues, 'newPassword');
+
+                    // If this is **not** being run via the queue, the password won't be serialized and hashed yet, so ensure it's hashed
+                    if (Craft::$app->getRequest()->getIsSiteRequest()) {
+                        $hashedPassword = Craft::$app->getSecurity()->hashPassword($hashedPassword);
+                    }
+                }
+            }
+
+            // Set the attributes on the user element
+            $this->_setElementAttributes($user, $attributeValues);
+
+            $fields = $this->getConfigValue('elements')[0]->fields ?? [];
+            $fieldValues = $this->getFieldMappingValues($submission, $this->fieldMapping, $fields);
+
+            // Filter empty values
+            if (!$this->overwriteValues) {
+                $fieldValues = $this->withoutEmptyMappedValues($fieldValues);
+            }
+
+            $user->setFieldValues($fieldValues);
+
+            // Although empty, because we pass via reference, we need variables
+            $endpoint = '';
+            $method = '';
+
+            // Allow events to cancel sending - return as success
+            if (!$this->beforeSendPayload($submission, $endpoint, $user, $method)) {
+                return $this->resultForPayload(true);
+            }
+
+            if (!$user instanceof UserElement) {
+                return $this->resultForPayload(IntegrationResult::failed('invalid_user_payload'));
+            }
+
+            // Events may replace the payload, and retries may reload a user created by the
+            // first attempt. Resolve the durable origin against the final target.
+            $isNewUser = $this->_isCreatedUser($user);
+
+            if ($isNewUser && !$user->id) {
+                $user->pending = true;
+            }
+
+            if (!$isNewUser) {
+                $storedUser = UserElement::find()->id($user->id)->status(null)->one();
+
+                if (!$storedUser) {
+                    return $this->resultForPayload(IntegrationResult::failed('existing_user_unavailable'));
+                }
+
+                if (!$this->_canUpdateExistingUser($storedUser)) {
+                    return $this->resultForPayload(IntegrationResult::failed('existing_user_unauthorized'));
+                }
+
+                if ($user->email !== $storedUser->email) {
+                    return $this->resultForPayload(IntegrationResult::failed('existing_user_email_change_not_supported'));
+                }
+
+                if ($hashedPassword !== null || ($user->newPassword !== null && $user->newPassword !== '') || $user->password !== $storedUser->password) {
+                    return $this->resultForPayload(IntegrationResult::failed('existing_user_password_change_not_supported'));
+                }
+
+                // Existing account credentials and activation state remain under Craft's
+                // native account-management flows, even when an event modified the payload.
+                $user->newPassword = null;
+                $user->password = $storedUser->password;
+                $user->active = $storedUser->active;
+                $user->pending = $storedUser->pending;
+            }
+
+            if (!$user->validate()) {
+                Integration::error($this, Craft::t('formie', 'Unable to validate “{type}” element integration. Error: {error}.', [
+                    'type' => $this->handle,
+                    'error' => Json::encode($user->getErrors()),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+
+            if (!Craft::$app->getElements()->saveElement($user, true, true, $this->updateSearchIndexes)) {
+                Integration::error($this, Craft::t('formie', 'Unable to save “{type}” element integration. Error: {error}.', [
+                    'type' => $this->handle,
+                    'error' => Json::encode($user->getErrors()),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+
+            $this->recordDispatchElement($user, [self::RESOURCE_ORIGIN => $isNewUser ? 'created' : 'existing']);
+
+            // Has a Password field been used to map the value? Do a direct DB update as it's been hashed already.
+            // This also needs to be done before sending activation emails
+            if ($hashedPassword) {
+                Db::update(Table::USERS, ['password' => $hashedPassword], ['id' => $user->id], [], false);
+
+                // Update the user model with the password, as activation emails require this
+                $user->password = $hashedPassword;
+            }
+
+            $autoLogin = false;
+
+            if ($isNewUser && $user->getStatus() == UserElement::STATUS_PENDING) {
+                if ($this->activateUser) {
+                    Craft::$app->getUsers()->activateUser($user);
+
+                    if ($user->getErrors()) {
+                        Integration::error($this, Craft::t('formie', 'Unable to activate user for “{type}” element integration. Error: {error}.', [
+                            'type' => $this->handle,
+                            'error' => Json::encode($user->getErrors()),
+                        ]), true);
+
+                        return $this->resultForPayload(false);
+                    }
+
+                    $autoLogin = true;
+                }
+
+                if ($this->sendActivationEmail) {
+                    if (!$this->executeDeliveryWrite('MAIL', 'activation:' . $user->id, ['userId' => $user->id, 'email' => $user->email], function() use ($user) {
+                        if (!Craft::$app->getUsers()->sendActivationEmail($user)) {
+                            throw new IntegrationStepException(IntegrationResult::failed('activation_email_unconfirmed'));
+                        }
+
+                        return true;
+                    })) {
+                        Integration::error($this, Craft::t('formie', 'Unable to send user activation email for “{type}” element integration. Error: {error}.', [
+                            'type' => $this->handle,
+                            'error' => Json::encode($user->getErrors()),
+                        ]), true);
+
+                        return $this->resultForPayload(false);
+                    }
+                }
+            }
+
+            if ($userGroups) {
+                $groupIds = ArrayHelper::getColumn($userGroups, 'id');
+
+                if (!Craft::$app->getUsers()->assignUserToGroups($user->id, $groupIds)) {
+                    Integration::error($this, Craft::t('formie', 'Unable to assign user groups for “{type}” element integration. Error: {error}.', [
+                            'type' => $this->handle,
+                            'error' => Json::encode($user->getErrors()),
+                        ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            // Important to wipe out the field mapped to their password, and save the submission. We don't want to permanently
+            // store the password content against the submission.
+            if ($passwordField) {
+                $submission->setFieldValue($passwordField->handle, '');
+
+                if (!Craft::$app->getElements()->saveElement($submission, false)) {
+                    Integration::error($this, Craft::t('formie', 'Unable to save “{type}” element integration. Error: {error}.', [
+                        'type' => $this->handle,
+                        'error' => Json::encode($submission->getErrors()),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            // Where there any addresses to update?
+            if ($this->address) {
+                $this->address->setOwner($user);
+
+                if (!Craft::$app->getElements()->saveElement($this->address)) {
+                    Integration::error($this, Craft::t('formie', 'Unable to save “{type}” element integration. Error: {error}.', [
+                        'type' => $this->handle,
+                        'error' => Json::encode($this->address->getErrors()),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            // Allow events to say the response is invalid
+            if (!$this->afterSendPayload($submission, '', $user, '', [])) {
+                return $this->resultForPayload(true);
+            }
+
+            // Maybe login the user after activation
+            if ($autoLogin && $generalConfig->autoLoginAfterAccountActivation && Craft::$app->getUser()->getIsGuest()) {
+                // When run from the queue, this will fail due to session being unavailable
+                if (!$this->getQueueJob()) {
+                    Craft::$app->getUser()->login($user, $generalConfig->userSessionDuration);
+                }
+            }
+
+            $this->recordDispatchElement($user, [self::RESOURCE_ORIGIN => $isNewUser ? 'created' : 'existing']);
+        } catch (Throwable $e) {
+            $error = Craft::t('formie', 'Element integration failed for submission “{submission}”. Error: {error} {file}:{line}. Trace: “{trace}”.', [
+                'error' => Integration::getExceptionLogMessage($e),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+                'submission' => $submission->id,
+            ]);
+
+            Integration::error($this, $error);
+
+            return $this->resultForPayload(IntegrationResult::fromException($e));
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $fields = $this->getConfigValue('elements')[0]->fields ?? [];
+
+        $rules[] = [
+            ['fieldMapping'], 'validateFieldMapping', 'params' => $fields, 'when' => function($model) {
+                return $model->enabled;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::checkboxSelectField([
+            'name' => 'groupUids',
+            'label' => Craft::t('formie', 'User Group'),
+            'instructions' => Craft::t('formie', 'Select user groups to assign this new user to.'),
+            'options' => $this->getGroupOptions(),
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'activateUser',
+            'label' => Craft::t('formie', 'Activate User'),
+            'instructions' => Craft::t('formie', 'Whether to activate the user automatically.'),
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'sendActivationEmail',
+            'label' => Craft::t('formie', 'Send Activation Email'),
+            'instructions' => Craft::t('formie', 'Whether to send the activation email for the user automatically.'),
+            'defaultValue' => $this->sendActivationEmail,
+        ]);
+        $schema[] = SchemaHelper::integrationFieldMappingField([
+            'name' => 'attributeMapping',
+            'label' => Craft::t('formie', 'User Attribute Mapping'),
+            'instructions' => Craft::t('formie', 'Choose how your form fields should map to your {label} attributes.', ['label' => 'User']),
+            'integrationLabel' => Craft::t('formie', 'Element Field'),
+            'showRefreshButton' => false,
+            'valueLabel' => Craft::t('formie', 'Form Field / Static Value'),
+            'integrationFields' => $this->convertIntegrationFieldsToSchema($this->getElementAttributes()),
+        ]);
+
+        $elements = $this->getConfigValue('elements');
+        $userFields = [];
+
+        if (is_array($elements) && isset($elements[0])) {
+            $userFields = is_array($elements[0]) ? ($elements[0]['fields'] ?? []) : ($elements[0]->fields ?? []);
+        }
+
+        $fieldMappingSchema = $this->convertIntegrationFieldsToSchema($userFields);
+
+        if ($fieldMappingSchema) {
+            $schema[] = SchemaHelper::integrationFieldMappingField([
+                'name' => 'fieldMapping',
+                'label' => Craft::t('formie', 'User Field Mapping'),
+                'instructions' => Craft::t('formie', 'Choose how your form fields should map to your {label} fields.', ['label' => 'User']),
+                'integrationLabel' => Craft::t('formie', 'Element Field'),
+                'showRefreshButton' => false,
+                'valueLabel' => Craft::t('formie', 'Form Field / Static Value'),
+                'integrationFields' => $fieldMappingSchema,
+            ]);
+        }
+
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'overwriteValues',
+            'label' => Craft::t('formie', 'Overwrite Content'),
+            'instructions' => Craft::t('formie', 'Whether to overwrite existing content, even if empty values are provided.'),
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'updateElement',
+            'label' => Craft::t('formie', 'Update Users'),
+            'instructions' => Craft::t('formie', 'Whether this integration should update an existing user if found, or always create a new user. Visitors can only update their own account, and existing email addresses and passwords cannot be changed here.'),
+        ]);
+
+        $updateMappingSchema = $this->convertIntegrationFieldsToSchema($this->getUpdateAttributes()['users'] ?? []);
+
+        if ($updateMappingSchema) {
+            $schema[] = SchemaHelper::integrationFieldMappingField([
+                'name' => 'updateElementMapping',
+                'label' => Craft::t('formie', 'Update Element Mapping'),
+                'instructions' => Craft::t('formie', 'Select the fields you want to use to check for existing elements. Formie will look for existing elements with the attributes chosen and the values provided in the submission.'),
+                'if' => 'updateElement',
+                'integrationLabel' => Craft::t('formie', 'Element Field'),
+                'showRefreshButton' => false,
+                'valueLabel' => Craft::t('formie', 'Form Field / Static Value'),
+                'integrationFields' => $updateMappingSchema,
+            ]);
+        }
+
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mergeUserGroups',
+            'label' => Craft::t('formie', 'Merge User Groups'),
+            'instructions' => Craft::t('formie', 'Whether existing user groups should be merged with any set above. Otherwise, any existing user groups will be overwritten.'),
+            'if' => 'updateElement',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'updateSearchIndexes',
+            'label' => Craft::t('formie', 'Update Search Index'),
+            'instructions' => Craft::t('formie', 'Whether this integration should update the search indexes to include content for this element.'),
+            'defaultValue' => $this->updateSearchIndexes,
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _setElementAttributes($user, $attributes): void
+    {
+        foreach ($attributes as $userFieldHandle => $fieldValue) {
+            // Special handling for photo - must be an asset. Actually provided as an Asset ID.
+            if ($userFieldHandle === 'photo') {
+                if (is_array($fieldValue)) {
+                    $fieldValue = $fieldValue[0] ?? null;
+                }
+
+                // If explicitly null, that's okay, we might be overwriting values
+                if ($fieldValue !== null) {
+                    // Fetch the asset, if it exists
+                    $asset = Craft::$app->getAssets()->getAssetById($fieldValue);
+
+                    $fieldValue = $asset ?? null;
+                }
+            }
+
+            // Special handling for address fields - note we need to set multiple attributes and save for later
+            // after we've processed the user.
+            if (str_starts_with($userFieldHandle, 'addresses')) {
+                $handles = explode('__', $userFieldHandle);
+
+                // Use the address we're currently dealing with, or find an existing one based off title (label)
+                if (!$this->address) {
+                    $addressTitle = $attributes['addresses__title'] ?? null;
+
+                    $this->address = AddressElement::find()
+                        ->title($addressTitle)
+                        ->owner($user)
+                        ->one() ?? new AddressElement();
+                }
+
+                $this->address->{$handles[1]} = $fieldValue;
+
+                // Don't set these values on the user element
+                continue;
+            }
+
+            $user->{$userFieldHandle} = $fieldValue;
+        }
+    }
+
+    private function _isCreatedUser(UserElement $user): bool
+    {
+        if (!$user->id) {
+            return true;
+        }
+
+        if ($uid = $this->getDeliveryAttemptUid()) {
+            $resource = Formie::$plugin->getDeliveryAttempts()->resource($uid);
+
+            if (($resource['elementType'] ?? null) === UserElement::class && (int)($resource['elementId'] ?? 0) === (int)$user->id) {
+                return ($resource[self::RESOURCE_ORIGIN] ?? null) === 'created';
+            }
+        }
+
+        return false;
+    }
+
+    private function _canUpdateExistingUser(UserElement $user): bool
+    {
+        $context = $this->getDeliveryExecutionContext();
+        $authorityType = SubmissionAuthorityType::tryFrom($context?->authorityType ?? '');
+
+        if ($authorityType === SubmissionAuthorityType::TRUSTED_INTERNAL) {
+            return true;
+        }
+
+        if (!in_array($authorityType, [SubmissionAuthorityType::VISITOR, SubmissionAuthorityType::CONTROL_PANEL], true) || !$context?->actorId) {
+            return false;
+        }
+
+        $actor = Craft::$app->getUsers()->getUserById($context->actorId);
+
+        if (!$actor || $actor->getStatus() !== UserElement::STATUS_ACTIVE) {
+            return false;
+        }
+
+        if ($authorityType === SubmissionAuthorityType::VISITOR) {
+            return (int)$actor->id === (int)$user->id;
+        }
+
+        return Craft::$app->getElements()->canSave($user, $actor);
+    }
+
+    private function _getPasswordField($submission)
+    {
+        $slot = ReferenceSlot::fromStored($this->attributeMapping['newPassword'] ?? '');
+
+        return $slot->kind === ReferenceSlotKind::Exact
+            ? Variables::getFieldForReference((string)$slot->value, $submission)
+            : null;
+    }
+}

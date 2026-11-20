@@ -1,0 +1,37 @@
+{% extends "_snips/_layout.twig" %}
+{% block body %}
+<h1>{{ entry.title }}</h1>
+
+
+{% for section in entry.sections %}
+    {% include "_snips/_sections.twig" %}
+{% else %}
+    <section class="pb-18" data-animated-id="1">
+        <div class="container text-center">
+            <h2 class="py-14 m-0">{{ error.status | default("Geen content") }}</h2>
+        </div>
+        <div class="container text-center">
+            <div class="row">
+                <div id="main-content" class="col">
+                    <div class="content-404-wrapper">
+                        <h1 class="fs-142px">{{ ["Fout", error.code|default(null)]|join(' ') }}</h1>
+                        <h4 class="fs-3 mb-5">{{ error.intro ?? "Deze boodschap is gericht aan de eigenaar van de site." }}</h4>
+                        {% if error is not defined %}
+                            <p class="mb-11">
+                                Er is nog geen content gemaakt voor deze pagina.
+                                </br>Overweeg om de pagine offline te halen, voeg content toe of activeer de content indien deze niet actief staat.
+                            </p>
+                            <a href="/admin/entries/{{ entry.type }}/{{ entry.id }}-{{ entry.slug }}"
+                            class="btn btn-dark btn-hover-border-primary btn-hover-bg-primary">Log in en bewerk</a>
+                        {% else %}
+                            {{ error.message }}
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+{% endfor %}
+
+
+{% endblock %}

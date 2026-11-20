@@ -1,0 +1,134 @@
+{% extends 'formie/_layouts/settings' %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% set title = 'Field Types and Restrictions' | t('formie') %}
+{% set bodyClass = 'formie-field-palette-page' %}
+{% set fullPageForm = craft.app.config.general.allowAdminChanges %}
+
+{% block actionButton %}
+    {% if craft.app.config.general.allowAdminChanges %}
+        <input type="submit" class="btn submit" value="{{ 'Save' | t('formie') }}">
+    {% endif %}
+{% endblock %}
+
+{% block content %}
+
+{% if craft.app.config.general.allowAdminChanges %}
+    {{ actionInput('formie/settings/save-field-palette') }}
+    {{ redirectInput('formie/settings/fields') }}
+    <input type="hidden" name="palette" id="formie-field-palette-payload" value="{{ fieldPalettePayload|e('html_attr') }}">
+{% endif %}
+
+<div class="formie-field-builder-settings">
+    <h2>{{ 'Field Builder' | t('formie') }}</h2>
+    <p class="formie-field-palette-intro">{{ 'Control which field options are available to form editors in the form builder.' | t('formie') }}</p>
+
+    {% namespace 'settings' %}
+        {{ forms.lightswitchField({
+            first: true,
+            label: 'Allow Public Asset Volumes' | t('formie'),
+            instructions: 'Whether File Upload fields can use public asset volumes, and whether “Public URL” is available as an email summary value.' | t('formie'),
+            name: 'allowPublicVolumes',
+            on: settings.allowPublicVolumes,
+            errors: settings.getErrors('allowPublicVolumes'),
+            warning: macros.configWarning('allowPublicVolumes', 'formie'),
+        }) }}
+
+        {{ forms.lightswitchField({
+            label: 'Allow Multi-Select Dropdowns' | t('formie'),
+            instructions: 'Whether form editors can enable “Allow Multiple” on Dropdown and element fields using a dropdown display type.' | t('formie'),
+            name: 'allowMultiSelectDropdowns',
+            on: settings.allowMultiSelectDropdowns,
+            errors: settings.getErrors('allowMultiSelectDropdowns'),
+            warning: macros.configWarning('allowMultiSelectDropdowns', 'formie'),
+        }) }}
+
+        {{ forms.lightswitchField({
+            label: 'Allow Phone Country Selector' | t('formie'),
+            instructions: 'Whether form editors can enable the country code selector on Phone Number fields.' | t('formie'),
+            name: 'allowPhoneCountrySelector',
+            on: settings.allowPhoneCountrySelector,
+            errors: settings.getErrors('allowPhoneCountrySelector'),
+            warning: macros.configWarning('allowPhoneCountrySelector', 'formie'),
+        }) }}
+
+        <hr>
+        <h3>{{ 'Templates and HTML' | t('formie') }}</h3>
+        <p>{{ 'These controls apply to all forms, including existing fields, imports and runtime overrides. Disabling Twig leaves stored templates intact but stops their output. Review existing forms before changing these settings.' | t('formie') }}</p>
+
+        {{ forms.lightswitchField({
+            label: 'Allow Hidden Field Templates' | t('formie'),
+            instructions: 'Allow the Template default value source on Hidden fields. Custom Value and its references remain available when this is off.' | t('formie'),
+            name: 'allowHiddenFieldTemplates',
+            on: settings.allowHiddenFieldTemplates,
+            errors: settings.getErrors('allowHiddenFieldTemplates'),
+            warning: macros.configWarning('allowHiddenFieldTemplates', 'formie'),
+        }) }}
+
+        {{ forms.lightswitchField({
+            label: 'Allow Twig in HTML Fields' | t('formie'),
+            instructions: 'Allow form editors to opt into sandboxed Twig for HTML fields.' | t('formie'),
+            name: 'allowHtmlFieldTwig',
+            on: settings.allowHtmlFieldTwig,
+            toggle: 'html-template-includes',
+            errors: settings.getErrors('allowHtmlFieldTwig'),
+            warning: macros.configWarning('allowHtmlFieldTwig', 'formie'),
+        }) }}
+
+        <div id="html-template-includes" class="{{ not settings.allowHtmlFieldTwig ? 'hidden' }}">
+            {{ forms.lightswitchField({
+                label: 'Allow Template Includes in HTML Fields' | t('formie'),
+                instructions: 'Allow HTML fields with Allow Twig to include site templates. Included templates remain sandboxed. This does not enable includes in Hidden fields or PDF filenames.' | t('formie'),
+                name: 'allowHtmlFieldTemplateIncludes',
+                on: settings.allowHtmlFieldTemplateIncludes,
+                errors: settings.getErrors('allowHtmlFieldTemplateIncludes'),
+                warning: macros.configWarning('allowHtmlFieldTemplateIncludes', 'formie'),
+            }) }}
+        </div>
+
+        {{ forms.lightswitchField({
+            label: 'Require HTML Purification' | t('formie'),
+            instructions: 'Always purify HTML field output, including Twig output, and hide the field’s Purify Content toggle. Turning this off lets each field control purification.' | t('formie'),
+            name: 'requireHtmlPurification',
+            on: settings.requireHtmlPurification,
+            errors: settings.getErrors('requireHtmlPurification'),
+            warning: macros.configWarning('requireHtmlPurification', 'formie'),
+        }) }}
+    {% endnamespace %}
+</div>
+
+<div class="formie-field-palette-section">
+    <h2>{{ 'Field Palette' | t('formie') }}</h2>
+    <p class="formie-field-palette-intro">{{ 'Organise the field types shown in the form builder. Rename groups and fields, reorder them, and disable field types you do not want authors to add.' | t('formie') }}</p>
+    <div class="formie-field-palette"></div>
+</div>
+
+{% endblock %}
+
+{% css %}
+.formie-field-palette-page #content {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+.formie-field-builder-settings,
+.formie-field-palette-section {
+    background: var(--white);
+    border-radius: var(--large-border-radius);
+    box-shadow: var(--pane-shadow);
+    margin-bottom: 24px;
+    padding: 24px;
+}
+
+.formie-field-palette-page .formie-field-palette-intro {
+    margin-bottom: 24px;
+}
+
+.formie-field-palette-section .formie-field-palette-intro {
+    margin-bottom: 24px;
+}
+{% endcss %}

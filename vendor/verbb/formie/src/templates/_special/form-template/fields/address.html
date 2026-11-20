@@ -1,0 +1,9 @@
+{% fieldtag 'subFieldRows' %}
+    {% for row in field.getEnabledRows() %}
+        {% fieldtag 'subFieldRow' %}
+            {% for field in row.getEnabledFields() %}
+                {{ craft.formie.renderField(form, field) }}
+            {% endfor %}
+        {% endfieldtag %}
+    {% endfor %}
+{% endfieldtag %}

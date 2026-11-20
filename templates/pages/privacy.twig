@@ -1,0 +1,40 @@
+{% from "_snips/_macros.twig" import translate %}
+{% extends "_snips/_layout.twig" %}
+{% block body %}
+
+{% include "_snips/_hero.twig" with {
+    title: translate('privacybeleid')
+}%}
+{% from "_snips/_macros.twig" import addressList %}
+{% from "_snips/_macros.twig" import contactList %}
+
+{% set contacts = company.people.contactPerson(1) %}
+{% set phone = company.telephone|first %}
+{% set mail = company.email|first %}
+{% set replaceArray = {
+    '[companyName]': company.companyName,
+    '[hoofdzetel]': addressList(HQ),
+    '[btwNummer]': company.vat,
+    '[website]': '<a href="' ~ currentSite.baseUrl ~ '">' ~ currentSite.baseUrl ~ '</a>',
+    '[websitePrivacy]': '<a href="' ~ currentSite.baseUrl ~ 'privacy-policy">' ~ currentSite.baseUrl ~ '</a>',
+    '[websiteTerms]': '<a href="' ~ currentSite.baseUrl ~ 'terms-conditions">' ~ currentSite.baseUrl ~ '</a>',
+    '[addressList]': addressList(addresses),
+    '[contactsList]': contactList(contacts)
+} %}
+
+<section id="privacyPolicy" class="main-content about-us section-pad">
+    <div class="container pb-15 pt-11">
+        <div class="row">
+            <div class="col-md-12">
+                <div class="text-center pb-10 mb-3">
+                    <h2 class="mw-xl-50 mw-lg-60 mx-lg-auto mb-8 ">{{ company.privacyTitle| replace(replaceArray)|raw }}</h2>
+                    {{ company.privacyIntro|attr({ class: 'mw-xl-60 mw-lg-75 mx-lg-auto mb-0 ' })| replace(replaceArray)|raw }}
+                </div>
+                <div class="rich-text">                
+                    {{ company.privacyDeclaration| replace(replaceArray)|raw }}
+            </div>
+        </div>
+    </div>
+</section>
+
+{% endblock %}

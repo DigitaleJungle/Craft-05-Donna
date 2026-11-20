@@ -1,0 +1,29 @@
+# the ddev folder and config
+# uncomment this for projects other than Craft-00-Boilerplate
+# /.ddev
+.ddev/traefik/certs/
+.env
+/.claude
+
+# ds_store files
+.DS_Store
+
+# the license key
+/config/license.key
+
+# Storage folder content: logs etc.
+/storage/*
+
+# Uploaded assets and transforms
+/web/assets/icons/*
+/web/assets/images/*
+/web/assets/videos/*
+/web/assets/transforms/*
+
+# Work in progress
+templates/_partials/sections
+templates/work.twig
+
+# EasyAppointment config file
+/web/boeken/config.php
+templates/status-check.html

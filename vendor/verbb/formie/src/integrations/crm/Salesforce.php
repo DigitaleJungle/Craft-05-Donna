@@ -1,0 +1,1418 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\errors\IntegrationException;
+use verbb\formie\events\ModifyFieldIntegrationValueEvent;
+use verbb\formie\events\ModifyFieldIntegrationValuesEvent;
+use verbb\formie\fields\FileUpload;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\Assets;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\base\LocalFsInterface;
+use craft\elements\db\AssetQuery;
+use craft\helpers\App;
+use craft\helpers\DateTimeHelper;
+use craft\helpers\Json;
+
+
+use DateTime;
+use DateTimeInterface;
+use DateTimeZone;
+use Throwable;
+
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Psr7\Uri;
+use League\OAuth1\Client\Credentials\TokenCredentials as OAuth1Token;
+use League\OAuth2\Client\Token\AccessToken as OAuth2Token;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\clients\salesforce\token\SalesforceAccessToken;
+use verbb\auth\models\Token;
+use verbb\auth\providers\Salesforce as SalesforceProvider;
+
+class Salesforce extends Crm implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return SalesforceProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'Salesforce';
+    }
+
+    protected static function defineOptionSources(): array
+    {
+        return [
+            [
+                'handle' => 'salesforce-picklists',
+                'label' => Craft::t('formie', 'Picklists'),
+                'storage' => 'objects',
+                'objectKeys' => ['contact', 'lead', 'opportunity', 'account', 'case'],
+                'objectLabels' => [
+                    'contact' => Craft::t('formie', 'Contact'),
+                    'lead' => Craft::t('formie', 'Lead'),
+                    'opportunity' => Craft::t('formie', 'Opportunity'),
+                    'account' => Craft::t('formie', 'Account'),
+                    'case' => Craft::t('formie', 'Case'),
+                ],
+                'optionSourceTypes' => ['picklist', 'multipicklist'],
+                'collectionLabel' => Craft::t('formie', 'Object'),
+                'collectionInstructions' => Craft::t('formie', 'Choose the Salesforce object that owns the field.'),
+                'collectionPlaceholder' => Craft::t('formie', 'Select an object'),
+                'remoteHandleLabel' => Craft::t('formie', 'Option Source'),
+                'remoteHandleInstructions' => Craft::t('formie', 'Choose which picklist field supplies the options.'),
+                'remoteHandlePlaceholder' => Craft::t('formie', 'Select a picklist'),
+                'collectionRequiredMessage' => Craft::t('formie', 'Select a Salesforce object.'),
+                'remoteHandleRequiredMessage' => Craft::t('formie', 'Select a picklist field.'),
+                'emptyCollectionsWarning' => Craft::t('formie', 'No Salesforce objects are available. Refresh the integration field mapping first.'),
+                'emptySourcesWarning' => Craft::t('formie', 'No picklist fields are available. Refresh the integration field mapping first.'),
+            ],
+        ];
+    }
+
+    /**
+     * Salesforce REST expects ISO-8601 datetimes (e.g. with "T" and timezone), not `Y-m-d H:i:s`.
+     */
+    private static function _normalizeMappedDateTimeForSalesforce(mixed $rawValue, mixed $value): ?string
+    {
+        foreach ([$rawValue, $value] as $candidate) {
+            if ($candidate instanceof DateTimeInterface) {
+                return self::_dateTimeInterfaceToSalesforceUtc($candidate);
+            }
+        }
+
+        foreach ([$value, $rawValue] as $candidate) {
+            if (is_string($candidate) && $candidate !== '' && ($dt = DateTimeHelper::toDateTime($candidate))) {
+                return self::_dateTimeInterfaceToSalesforceUtc($dt);
+            }
+        }
+
+        return null;
+    }
+
+    private static function _dateTimeInterfaceToSalesforceUtc(DateTimeInterface $date): string
+    {
+        $dt = $date instanceof DateTime ? clone $date : DateTime::createFromInterface($date);
+        $dt->setTimezone(new DateTimeZone('UTC'));
+
+        return $dt->format('Y-m-d\TH:i:s') . '.000Z';
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const GRANT_AUTHORIZATION_CODE = 'authorization_code';
+    public const GRANT_CLIENT_CREDENTIALS = 'client_credentials';
+    public const GRANT_PASSWORD = 'password';
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $apiDomain = null;
+    public ?string $authDomain = null;
+    public ?string $grant = null;
+    public ?string $matchLead = null;
+    public bool|string $useSandbox = false;
+    public bool|string $useCredentials = false;
+    public ?string $username = null;
+
+    #[Sensitive]
+    public ?string $password = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToContact = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToLead = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToOpportunity = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToAccount = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToCase = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToCampaignMember = false;
+
+    #[FormIntegrationSetting]
+    public ?array $contactFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $leadFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $opportunityFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $accountFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $caseFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $campaignMemberFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public bool $duplicateLeadTask = false;
+
+    #[FormIntegrationSetting]
+    public string $duplicateLeadTaskSubject = 'Task';
+
+    #[FormIntegrationSetting]
+    public bool $mapToContactAttachments = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToLeadAttachments = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToOpportunityAttachments = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToAccountAttachments = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToCaseAttachments = false;
+
+    private array $users = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getUseSandbox(): string
+    {
+        return App::parseBooleanEnv($this->useSandbox);
+    }
+
+    public function getUseCredentials(): string
+    {
+        return App::parseBooleanEnv($this->useCredentials);
+    }
+
+    public function getGrant(): string
+    {
+        $grant = App::parseEnv($this->grant);
+
+        if (in_array($grant, [self::GRANT_AUTHORIZATION_CODE, self::GRANT_CLIENT_CREDENTIALS, self::GRANT_PASSWORD], true)) {
+            return $grant;
+        }
+
+        // Preserve integrations migrated from Formie 3 before the grant selector was introduced.
+        return $this->getUseCredentials() ? self::GRANT_PASSWORD : self::GRANT_AUTHORIZATION_CODE;
+    }
+
+    public function getAuthDomain(): ?string
+    {
+        $domain = App::parseEnv($this->authDomain);
+
+        return is_string($domain) && $domain !== '' ? rtrim($domain, '/') : null;
+    }
+
+    public function getUsername(): string
+    {
+        return App::parseEnv($this->username);
+    }
+
+    public function getPassword(): string
+    {
+        return App::parseEnv($this->password);
+    }
+
+    public function getApiDomain(): string
+    {
+        $domain = $this->getAuthDomain();
+
+        if ($this->getGrant() === self::GRANT_CLIENT_CREDENTIALS) {
+            // Existing connections already retain Salesforce's instance URL. Keep
+            // using it unless an explicit authentication domain overrides it.
+            $domain ??= $this->getInstanceUrl($this->getToken());
+
+            if (!$domain || in_array(strtolower((string)parse_url($domain, PHP_URL_HOST)), ['login.salesforce.com', 'test.salesforce.com'], true)) {
+                throw new IntegrationException(Craft::t('formie', 'Enter your Salesforce My Domain URL in Authentication Domain to use Client Credentials. The generic login and test domains do not support this grant.'));
+            }
+        }
+
+        if ($domain) {
+            return $domain;
+        }
+
+        $prefix = $this->getUseSandbox() ? 'test' : 'login';
+
+        return "https://{$prefix}.salesforce.com";
+    }
+
+    public function getBaseApiUrl(?Token $token): ?string
+    {
+        $instanceUrl = $this->getInstanceUrl($token);
+
+        if (!$instanceUrl) {
+            return null;
+        }
+
+        return "$instanceUrl/services/data/v49.0/";
+    }
+
+    public function getInstanceUrl(?Token $token): ?string
+    {
+        $instanceUrl = $token?->values['instance_url'] ?? null;
+
+        if (is_string($instanceUrl) && $instanceUrl !== '') {
+            return rtrim($instanceUrl, '/');
+        }
+
+        $accessToken = $token?->getToken();
+
+        if ($accessToken instanceof SalesforceAccessToken) {
+            $instanceUrl = $accessToken->getInstanceUrl();
+
+            if (is_string($instanceUrl) && $instanceUrl !== '') {
+                return rtrim($instanceUrl, '/');
+            }
+        }
+
+        $apiDomain = App::parseEnv($this->apiDomain);
+
+        if (is_string($apiDomain) && $apiDomain !== '') {
+            return rtrim($apiDomain, '/');
+        }
+
+        return null;
+    }
+
+    public function afterFetchAccessToken(Token $token): void
+    {
+        $instanceUrl = $this->getInstanceUrl($token);
+
+        if (!$instanceUrl) {
+            throw new IntegrationException(Craft::t('formie', 'Salesforce response missing `instance_url`.'));
+        }
+
+        $values = $token->values;
+        $values['instance_url'] = $instanceUrl;
+        $token->values = $values;
+        $this->apiDomain = $instanceUrl;
+    }
+
+    public function getOAuthProviderConfig(): array
+    {
+        $config = parent::getOAuthProviderConfig();
+        $config['baseApiUrl'] = fn(?Token $token) => $this->getBaseApiUrl($token);
+        $config['domain'] = $this->getApiDomain();
+
+        return $config;
+    }
+
+    public function getAuthorizationUrlOptions(): array
+    {
+        $options = parent::getAuthorizationUrlOptions();
+
+        $options['scope'] = [
+            'api',
+            'openid',
+            'refresh_token',
+            'offline_access',
+        ];
+
+        return $options;
+    }
+
+    public function getAccessToken(): OAuth1Token|OAuth2Token|null
+    {
+        $oauthProvider = $this->getOAuthProvider();
+        $endpoint = new Uri($oauthProvider->getBaseAccessTokenUrl([]));
+        Integration::info($this, 'Token request: ' . Json::encode([
+            'endpoint' => (string)$endpoint->withUserInfo('')->withQuery('')->withFragment(''),
+            'grant_type' => $this->getGrant(),
+        ]));
+
+        // Retain the legacy password grant for existing service-user integrations.
+        if ($this->getGrant() === self::GRANT_PASSWORD) {
+            $token = $oauthProvider->getAccessToken(self::GRANT_PASSWORD, [
+                'client_id' => $this->getClientId(),
+                'client_secret' => $this->getClientSecret(),
+                'username' => $this->getUsername(),
+                'password' => $this->getPassword(),
+            ]);
+
+            return $token;
+        }
+
+        return parent::getAccessToken();
+    }
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        Integration::info($this, 'Refreshing Salesforce field settings: ' . Json::encode([
+            'dataKey' => $this->settingsContext->dataKey,
+            'mapToLead' => $this->mapToLead,
+            'enabled' => $this->getEnabled(),
+            'objects' => array_keys(array_filter([
+                'contact' => $this->mapToContact,
+                'lead' => $this->mapToLead,
+                'opportunity' => $this->mapToOpportunity,
+                'account' => $this->mapToAccount,
+                'case' => $this->mapToCase,
+                'campaignMember' => $this->mapToCampaignMember,
+            ])),
+        ]));
+
+        try {
+            $this->_fetchSalesforceUsers();
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        $objectDefinitions = [
+            'contact' => ['enabled' => $this->mapToContact, 'sObject' => 'Contact'],
+            'lead' => ['enabled' => $this->mapToLead, 'sObject' => 'Lead'],
+            'opportunity' => ['enabled' => $this->mapToOpportunity, 'sObject' => 'Opportunity'],
+            'account' => ['enabled' => $this->mapToAccount, 'sObject' => 'Account'],
+            'case' => ['enabled' => $this->mapToCase, 'sObject' => 'Case', 'excludeNames' => ['IsClosedOnCreate']],
+        ];
+
+        foreach ($objectDefinitions as $settingsKey => $definition) {
+            if (!$this->_shouldFetchSettingsKey($settingsKey, (bool)$definition['enabled'])) {
+                continue;
+            }
+
+            $fields = $this->_fetchSObjectSettings(
+                $definition['sObject'],
+                $definition['excludeNames'] ?? [],
+            );
+
+            if ($fields !== null) {
+                $settings[$settingsKey] = $fields;
+            }
+        }
+
+        if ($this->_shouldFetchSettingsKey('campaignMember', $this->mapToCampaignMember)) {
+            $campaignMemberFields = $this->_fetchCampaignMemberSettings();
+
+            if ($campaignMemberFields !== null) {
+                $settings['campaignMember'] = $campaignMemberFields;
+            }
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function getConfig(bool $useCache = true): IntegrationConfig
+    {
+        try {
+            $config = parent::getConfig($useCache);
+
+            if (!$useCache) {
+                Integration::info($this, 'Salesforce field refresh completed: ' . Json::encode([
+                    'integrationId' => $this->id,
+                    'dataKey' => $this->settingsContext->dataKey,
+                    'fieldCounts' => array_map(static fn($fields) => is_array($fields) ? count($fields) : null, $config->all()),
+                    'fetchedAt' => $config->fetchedAt,
+                    'stale' => $config->isStale(),
+                ]));
+            }
+
+            return $config;
+        } catch (Throwable $e) {
+            Integration::error($this, 'Salesforce field settings failed: ' . get_class($e));
+            throw $e;
+        }
+    }
+
+    public function getMappedFieldValue(string $mappedFieldValue, Submission $submission, IntegrationField $integrationField): mixed
+    {
+        $value = parent::getMappedFieldValue($mappedFieldValue, $submission, $integrationField);
+
+        // SalesForce needs values delimited with semicolon's
+        if ($integrationField->getType() === IntegrationField::TYPE_ARRAY) {
+            $value = is_array($value) ? implode(';', $value) : $value;
+        }
+
+        return $value;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function createDeliveryHttpHandler(): callable
+    {
+        return $this->_withRequestDiagnostics(parent::createDeliveryHttpHandler());
+    }
+
+    protected function defineFieldMappingSchema(string $settingsKey, ?string $selectedCollectionField = null): array
+    {
+        $fields = parent::defineFieldMappingSchema($settingsKey, $selectedCollectionField);
+        $config = $this->getConfig();
+        Integration::info($this, 'Salesforce mapping schema: ' . Json::encode([
+            'integrationId' => $this->id,
+            'dataKey' => $settingsKey,
+            'fields' => count($fields),
+            'cachedFields' => is_array($config->get($settingsKey)) ? count($config->get($settingsKey)) : null,
+            'fetchedAt' => $config->fetchedAt,
+            'stale' => $config->isStale(),
+        ]));
+
+        return $fields;
+    }
+
+
+    protected function modifyFieldMappingValue(ModifyFieldIntegrationValueEvent $event): void
+    {
+        if ($event->integrationField->getType() !== IntegrationField::TYPE_DATETIME) {
+            return;
+        }
+
+        $formatted = self::_normalizeMappedDateTimeForSalesforce($event->rawValue, $event->value);
+
+        if ($formatted !== null) {
+            $event->value = $formatted;
+        }
+    }
+
+    protected function modifyFieldMappingValues(ModifyFieldIntegrationValuesEvent $event): void
+    {
+        if (!is_array($event->fieldValues) || !is_array($event->fieldSettings)) {
+            return;
+        }
+
+        foreach ($event->fieldValues as $tag => $value) {
+            $integrationField = ArrayHelper::firstWhere($event->fieldSettings, 'handle', $tag);
+
+            if ($integrationField?->getType() === IntegrationField::TYPE_ARRAY && is_array($value)) {
+                $event->fieldValues[$tag] = implode(';', $value);
+                continue;
+            }
+
+            if (!$integrationField || $integrationField->getType() !== IntegrationField::TYPE_DATETIME) {
+                continue;
+            }
+
+            $formatted = self::_normalizeMappedDateTimeForSalesforce($value, $value);
+
+            if ($formatted !== null) {
+                $event->fieldValues[$tag] = $formatted;
+            }
+        }
+    }
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $contactValues = $this->getFieldMappingValues($submission, $this->contactFieldMapping, 'contact');
+            $leadValues = $this->getFieldMappingValues($submission, $this->leadFieldMapping, 'lead');
+            $opportunityValues = $this->getFieldMappingValues($submission, $this->opportunityFieldMapping, 'opportunity');
+            $accountValues = $this->getFieldMappingValues($submission, $this->accountFieldMapping, 'account');
+            $caseValues = $this->getFieldMappingValues($submission, $this->caseFieldMapping, 'case');
+            $campaignMemberValues = $this->getFieldMappingValues($submission, $this->campaignMemberFieldMapping, 'campaignMember');
+
+            $accountId = null;
+            $accountOwnerId = null;
+
+            if ($this->mapToAccount) {
+                $accountPayload = $this->_prepPayload($accountValues);
+
+                $response = $this->deliverPayload($submission, 'sobjects/Account', $accountPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $accountId = $response['id'] ?? '';
+
+                if (!$accountId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “accountId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($accountPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+
+                if ($this->mapToAccountAttachments) {
+                    $this->processAttachments($submission, $accountId);
+                }
+            }
+
+            $contactId = null;
+            $contactOwnerId = null;
+
+            if ($this->mapToContact) {
+                $contactPayload = $this->_prepPayload($contactValues);
+
+                // Doesn't support upsert, so try to find the record first
+                if (isset($contactPayload['Email'])) {
+                    $email = $this->_escapeSoqlString((string)$contactPayload['Email']);
+
+                    $response = $this->request('GET', 'query', [
+                        'query' => ['q' => "SELECT ID,OwnerId FROM Contact WHERE Email = '{$email}' LIMIT 1"],
+                    ]);
+                }
+
+                $contactId = $response['records'][0]['Id'] ?? '';
+                $contactOwnerId = $response['records'][0]['OwnerId'] ?? '';
+
+                if ($accountId) {
+                    $contactPayload['AccountId'] = $accountId;
+                }
+
+                // Update the record
+                if ($contactId) {
+                    $response = $this->deliverPayload($submission, "sobjects/Contact/$contactId", $contactPayload, 'PATCH');
+
+                    if ($response === false) {
+                        return $this->resultForPayload(true);
+                    }
+                } else {
+                    // Create the new record
+                    $response = $this->deliverPayload($submission, 'sobjects/Contact', $contactPayload);
+
+                    if ($response === false) {
+                        return $this->resultForPayload(true);
+                    }
+
+                    $contactId = $response['id'] ?? '';
+
+                    if (!$contactId) {
+                        Integration::error($this, Craft::t('formie', 'Missing return “contactId” {response}. Sent payload {payload}', [
+                            'response' => Json::encode($response),
+                            'payload' => Json::encode($contactPayload),
+                        ]), true);
+
+                        return $this->resultForPayload(false);
+                    }
+
+                    // Have to re-fetch the contact to get more values
+                    $contactId = $this->_escapeSoqlString((string)$contactId);
+
+                    $response = $this->request('GET', 'query', [
+                        'query' => ['q' => "SELECT ID,OwnerId FROM Contact WHERE Id = '{$contactId}' LIMIT 1"],
+                    ]);
+
+                    $contactId = $response['records'][0]['Id'] ?? '';
+                    $contactOwnerId = $response['records'][0]['OwnerId'] ?? '';
+                }
+
+                if ($this->mapToContactAttachments) {
+                    $this->processAttachments($submission, $contactId);
+                }
+            }
+
+            if ($this->mapToLead) {
+                $leadPayload = $this->_prepPayload($leadValues);
+
+                // Add contact ID as the owner, if not set
+                if ($contactOwnerId && !isset($leadPayload['OwnerId'])) {
+                    $leadPayload['OwnerId'] = $contactOwnerId;
+                }
+
+                if (isset($leadPayload['IsUnreadByOwner'])) {
+                    $leadPayload['IsUnreadByOwner'] = (bool)$leadPayload['IsUnreadByOwner'];
+                } else {
+                    $leadPayload['IsUnreadByOwner'] = true;
+                }
+
+                try {
+                    $response = $this->deliverPayload($submission, 'sobjects/Lead', $leadPayload);
+
+                    if ($response === false) {
+                        return $this->resultForPayload(true);
+                    }
+
+                    $leadId = $response['id'] ?? '';
+
+                    if (!$leadId) {
+                        Integration::error($this, Craft::t('formie', 'Missing return “leadId” {response}. Sent payload {payload}', [
+                            'response' => Json::encode($response),
+                            'payload' => Json::encode($leadPayload),
+                        ]), true);
+
+                        return $this->resultForPayload(false);
+                    }
+
+                    if ($this->mapToLeadAttachments) {
+                        $this->processAttachments($submission, $leadId);
+                    }
+                } catch (Throwable $e) {
+                    Integration::apiError($this, $e, false);
+
+                    $taskCreated = false;
+
+                    // Check if we should enable tasks to be created for duplicates
+                    if ($e instanceof RequestException && $e->getResponse()) {
+                        $response = Json::decode((string)$e->getResponse()->getBody());
+                        $responseCode = $response[0]['errorCode'] ?? '';
+
+                        // Check if a duplicate lead and if we should create a task instead.
+                        if ($responseCode === 'DUPLICATES_DETECTED') {
+                            Integration::info($this, 'Duplicate lead found.', false);
+
+                            if ($this->duplicateLeadTask) {
+                                Integration::info($this, 'Attempting to create task for duplicate lead.', false);
+
+                                $taskPayload = [
+                                    'Subject' => $this->duplicateLeadTaskSubject,
+
+                                    // Try and use the lead, or use the contact
+                                    'WhoId' => $response[0]['duplicateResult']['matchResults'][0]['matchRecords'][0]['record']['Id'] ?? $contactId,
+                                    'Description' => '',
+                                ];
+
+                                foreach ($leadPayload as $key => $item) {
+                                    $taskPayload['Description'] .= $key . ': ' . $item . "\n";
+                                }
+
+                                try {
+                                    $response = $this->deliverPayload($submission, 'sobjects/Task', $taskPayload);
+
+                                    if ($response === false) {
+                                        return $this->resultForPayload(true);
+                                    }
+
+                                    $taskCreated = true;
+
+                                    Integration::info($this, Craft::t('formie', 'Response from task-creation {response}. Sent payload {payload}', [
+                                        'response' => Json::encode($response),
+                                        'payload' => Json::encode($taskPayload),
+                                    ]));
+                                } catch (Throwable $e) {
+                                    Integration::apiError($this, $e);
+
+                                    return $this->resultForPayload(false);
+                                }
+                            }
+                        }
+                    }
+
+                    // Unless we handle the duplicate lead by creating a task, we should show it failed
+                    if (!$taskCreated) {
+                        return $this->resultForPayload(false);
+                    }
+                }
+            }
+
+            if ($this->mapToOpportunity) {
+                $opportunityPayload = $this->_prepPayload($opportunityValues);
+
+                // Add contact ID as the owner, if not set
+                if ($contactOwnerId && !isset($opportunityPayload['OwnerId'])) {
+                    $opportunityPayload['OwnerId'] = $contactOwnerId;
+                }
+
+                if (isset($opportunityPayload['IsPrivate'])) {
+                    $opportunityPayload['IsPrivate'] = (bool)$opportunityPayload['IsPrivate'];
+                } else {
+                    $opportunityPayload['IsPrivate'] = false;
+                }
+
+                if (isset($opportunityPayload['CloseDate'])) {
+                    $opportunityPayload['CloseDate'] = DateTimeHelper::toDateTime($opportunityPayload['CloseDate'])->format('Y-m-d');
+                } else {
+                    $opportunityPayload['CloseDate'] = (new DateTime())->format('Y-m-d');
+                }
+
+                if ($accountId) {
+                    $opportunityPayload['AccountId'] = $accountId;
+                }
+
+                $response = $this->deliverPayload($submission, 'sobjects/Opportunity', $opportunityPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $opportunityId = $response['id'] ?? '';
+
+                if (!$opportunityId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “opportunityId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($opportunityPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+
+                if ($this->mapToOpportunityAttachments) {
+                    $this->processAttachments($submission, $opportunityId);
+                }
+            }
+
+            if ($this->mapToCase) {
+                $casePayload = $this->_prepPayload($caseValues);
+
+                if ($contactId) {
+                    $casePayload['ContactId'] = $contactId;
+                }
+
+                if ($accountId) {
+                    $casePayload['AccountId'] = $accountId;
+                }
+
+                $response = $this->deliverPayload($submission, 'sobjects/Case', $casePayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $caseId = $response['id'] ?? '';
+
+                if (!$caseId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “caseId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($casePayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+
+                if ($this->mapToCaseAttachments) {
+                    $this->processAttachments($submission, $caseId);
+                }
+            }
+
+            if ($this->mapToCampaignMember) {
+                $campaignMemberPayload = $this->_prepPayload($campaignMemberValues);
+
+                if ($contactId) {
+                    $campaignMemberPayload['ContactId'] = $contactId;
+                }
+
+                if ($accountId) {
+                    $campaignMemberPayload['AccountId'] = $accountId;
+                }
+
+                if ($leadId) {
+                    $campaignMemberPayload['LeadId'] = $leadId;
+                }
+
+                $response = $this->deliverPayload($submission, 'sobjects/CampaignMember', $campaignMemberPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $campaignMemberId = $response['id'] ?? '';
+
+                if (!$campaignMemberId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “campaignMemberId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($campaignMemberPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+        $rules[] = [['grant'], 'in', 'range' => [self::GRANT_AUTHORIZATION_CODE, self::GRANT_CLIENT_CREDENTIALS, self::GRANT_PASSWORD], 'skipOnEmpty' => true];
+        $rules[] = [
+            ['username', 'password'], 'required', 'when' => function($model) {
+                return $model->enabled && $model->getGrant() === self::GRANT_PASSWORD;
+            },
+        ];
+
+        $contact = $this->getConfigValue('contact');
+        $lead = $this->getConfigValue('lead');
+        $opportunity = $this->getConfigValue('opportunity');
+        $account = $this->getConfigValue('account');
+        $case = $this->getConfigValue('case');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['contactFieldMapping'], 'validateFieldMapping', 'params' => $contact, 'when' => function($model) {
+                return $model->enabled && $model->mapToContact;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['leadFieldMapping'], 'validateFieldMapping', 'params' => $lead, 'when' => function($model) {
+                return $model->enabled && $model->mapToLead;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['opportunityFieldMapping'], 'validateFieldMapping', 'params' => $opportunity, 'when' => function($model) {
+                return $model->enabled && $model->mapToOpportunity;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['accountFieldMapping'], 'validateFieldMapping', 'params' => $account, 'when' => function($model) {
+                return $model->enabled && $model->mapToAccount;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['caseFieldMapping'], 'validateFieldMapping', 'params' => $case, 'when' => function($model) {
+                return $model->enabled && $model->mapToCase;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['campaignMemberFieldMapping'], 'validateFieldMapping', 'params' => $case, 'when' => function($model) {
+                return $model->enabled && $model->mapToCampaignMember;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToContact',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Contact']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Contacts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'contactFieldMapping',
+            'if' => 'mapToContact',
+            'dataLabel' => 'Contact',
+            'dataKey' => 'contact',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToLead',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Lead']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Leads']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'leadFieldMapping',
+            'if' => 'mapToLead',
+            'dataLabel' => 'Lead',
+            'dataKey' => 'lead',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToOpportunity',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Opportunity']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Opportunities']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'opportunityFieldMapping',
+            'if' => 'mapToOpportunity',
+            'dataLabel' => 'Opportunity',
+            'dataKey' => 'opportunity',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToAccount',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Account']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Accounts']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'accountFieldMapping',
+            'if' => 'mapToAccount',
+            'dataLabel' => 'Account',
+            'dataKey' => 'account',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToCase',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Case']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Cases']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'caseFieldMapping',
+            'if' => 'mapToCase',
+            'dataLabel' => 'Case',
+            'dataKey' => 'case',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToCampaignMember',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Campaign Member']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Campaign Members']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'campaignMemberFieldMapping',
+            'if' => 'mapToCampaignMember',
+            'dataLabel' => 'Campaign Member',
+            'dataKey' => 'campaignMember',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToContactAttachments',
+            'label' => Craft::t('formie', 'Map Attachments'),
+            'instructions' => Craft::t('formie', 'Whether to map file-upload fields to attachments in Salesforce.'),
+            'if' => 'mapToContact',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToLeadAttachments',
+            'label' => Craft::t('formie', 'Map Attachments'),
+            'instructions' => Craft::t('formie', 'Whether to map file-upload fields to attachments in Salesforce.'),
+            'if' => 'mapToLead',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'duplicateLeadTask',
+            'label' => Craft::t('formie', 'Create Task on Duplicate Lead'),
+            'instructions' => Craft::t('formie', 'Whether to create a task on duplicate lead detected errors.'),
+            'if' => 'mapToLead',
+        ]);
+        $schema[] = SchemaHelper::textField([
+            'name' => 'duplicateLeadTaskSubject',
+            'label' => Craft::t('formie', 'Task Subject'),
+            'instructions' => Craft::t('formie', 'The task subject for duplicate lead tasks.'),
+            'if' => 'duplicateLeadTask',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToOpportunityAttachments',
+            'label' => Craft::t('formie', 'Map Attachments'),
+            'instructions' => Craft::t('formie', 'Whether to map file-upload fields to attachments in Salesforce.'),
+            'if' => 'mapToOpportunity',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToAccountAttachments',
+            'label' => Craft::t('formie', 'Map Attachments'),
+            'instructions' => Craft::t('formie', 'Whether to map file-upload fields to attachments in Salesforce.'),
+            'if' => 'mapToAccount',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToCaseAttachments',
+            'label' => Craft::t('formie', 'Map Attachments'),
+            'instructions' => Craft::t('formie', 'Whether to map file-upload fields to attachments in Salesforce.'),
+            'if' => 'mapToCase',
+        ]);
+
+        return $schema;
+    }
+
+    protected function processAttachments(Submission $submission, string $id): void
+    {
+        $localAttachments = [];
+
+        // For any File Upload field, add as an attachment.
+        if ($assets = $this->_getAssetsForSubmission($submission)) {
+            foreach ($assets as $asset) {
+                // Step 1: Upload file as ContentVersion
+                $path = Assets::getFullAssetFilePath($asset);
+
+                // If a non-local asset, store so we can delete later
+                if (!($asset->getVolume()->getFs() instanceof LocalFsInterface)) {
+                    $localAttachments[] = $path;
+                }
+
+                $fileContent = base64_encode(file_get_contents($path));
+                $fileName = basename($path);
+
+                $response = $this->deliverPayload($submission, 'sobjects/ContentVersion', [
+                    'Title' => $fileName,
+                    'PathOnClient' => $fileName,
+                    'VersionData' => $fileContent,
+                ]);
+
+                $contentVersionId = $response['id'] ?? null;
+
+                if (!$contentVersionId) {
+                    continue;
+                }
+
+                // Step 2: Get ContentDocumentId from ContentVersion
+                $contentVersionId = $this->_escapeSoqlString((string)$contentVersionId);
+                $query = "SELECT ContentDocumentId FROM ContentVersion WHERE Id = '$contentVersionId'";
+                $response = $this->request('GET', 'query', [
+                    'query' => ['q' => $query],
+                ]);
+
+                $records = $response['records'] ?? [];
+                $contentDocumentId = $records[0]['ContentDocumentId'] ?? null;
+
+                if (!$contentDocumentId) {
+                    continue;
+                }
+
+                $response = $this->deliverPayload($submission, 'sobjects/ContentDocumentLink', [
+                    'ContentDocumentId' => $contentDocumentId,
+                    'LinkedEntityId' => $id,
+                    'ShareType' => 'V',
+                ]);
+            }
+        }
+
+        foreach ($localAttachments as $path) {
+            if (file_exists($path)) {
+                unlink($path);
+            }
+        }
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'boolean' => IntegrationField::TYPE_BOOLEAN,
+            'multipicklist' => IntegrationField::TYPE_ARRAY,
+            'int' => IntegrationField::TYPE_NUMBER,
+            'number' => IntegrationField::TYPE_FLOAT,
+            'currency' => IntegrationField::TYPE_FLOAT,
+            'double' => IntegrationField::TYPE_FLOAT,
+            'date' => IntegrationField::TYPE_DATE,
+            'datetime' => IntegrationField::TYPE_DATETIME,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _escapeSoqlString(string $value): string
+    {
+        return addcslashes($value, "\\'");
+    }
+
+    private function _withRequestDiagnostics(callable $handler): callable
+    {
+        // Temporary diagnostics at the transport include automatic token exchanges and retries.
+        return function(RequestInterface $request, array $options) use ($handler) {
+            $started = microtime(true);
+            $endpoint = $request->getUri()->withUserInfo('')->withQuery('')->withFragment('');
+            $path = preg_replace('~(/sobjects/[^/]+/)(?!describe(?:/|$))[^/]+~', '$1{recordId}', $endpoint->getPath());
+            $diagnostics = [
+                'requestId' => uniqid('salesforce-', true),
+                'integrationId' => $this->id,
+                'method' => $request->getMethod(),
+                'endpoint' => (string)$endpoint->withPath($path),
+                'grant_type' => $this->getGrant(),
+            ];
+            parse_str($request->getUri()->getQuery(), $query);
+
+            if (isset($query['q']) && is_string($query['q']) && preg_match('/\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)/i', $query['q'], $match)) {
+                $diagnostics['queryObject'] = $match[1];
+            }
+
+            Integration::info($this, 'Salesforce HTTP request: ' . Json::encode($diagnostics));
+            $failed = function(Throwable $e) use ($diagnostics, $started): never {
+                Integration::error($this, 'Salesforce HTTP request failed: ' . Json::encode($diagnostics + [
+                    'durationMs' => (int)((microtime(true) - $started) * 1000),
+                    'exception' => get_class($e),
+                    'httpStatus' => $e instanceof RequestException ? $e->getResponse()?->getStatusCode() : null,
+                ]));
+                throw $e;
+            };
+
+            try {
+                $promise = $handler($request, $options);
+            } catch (Throwable $e) {
+                return $failed($e);
+            }
+
+            return $promise->then(function(ResponseInterface $response) use ($diagnostics, $started) {
+                Integration::info($this, 'Salesforce HTTP response: ' . Json::encode($diagnostics + [
+                    'durationMs' => (int)((microtime(true) - $started) * 1000),
+                    'httpStatus' => $response->getStatusCode(),
+                ]));
+
+                return $response;
+            }, $failed);
+        };
+    }
+
+    private function _getCustomFields(array $fields, array $excludeNames = []): array
+    {
+        $customFields = [];
+        $skipped = ['notUpdateable' => 0, 'unsupportedTypes' => [], 'excludedNames' => 0];
+
+        $supportedFields = [
+            'string',
+            'textarea',
+            'email',
+            'url',
+            'address',
+            'picklist',
+            'phone',
+            'reference',
+            'boolean',
+            'multipicklist',
+            'int',
+            'number',
+            'currency',
+            'double',
+            'date',
+            'datetime',
+        ];
+
+        foreach ($fields as $key => $field) {
+            if (!$field['updateable']) {
+                $skipped['notUpdateable']++;
+                continue;
+            }
+
+            // Only allow supported types
+            if (!in_array($field['type'], $supportedFields)) {
+                $skipped['unsupportedTypes'][$field['type']] = ($skipped['unsupportedTypes'][$field['type']] ?? 0) + 1;
+                continue;
+            }
+
+            // Exclude any names
+            if (in_array($field['name'], $excludeNames)) {
+                $skipped['excludedNames']++;
+                continue;
+            }
+
+            $options = [];
+
+            // Populate some fields
+            if (($field['name'] === 'OwnerId') && $this->users) {
+                $options = array_merge($options, $this->users);
+            }
+
+            // Any picklist values should be kept
+            $pickListValues = $field['picklistValues'] ?? [];
+
+            foreach ($pickListValues as $pickListValue) {
+                $options[] = [
+                    'label' => $pickListValue['label'],
+                    'value' => $pickListValue['value'],
+                ];
+            }
+
+            // Any Boolean fields should have a true/false option to pick from
+            if ($field['type'] === 'boolean') {
+                $options[] = [
+                    'label' => Craft::t('formie', 'True'),
+                    'value' => 'true',
+                ];
+
+                $options[] = [
+                    'label' => Craft::t('formie', 'False'),
+                    'value' => 'false',
+                ];
+            }
+
+            if ($options) {
+                $options = [
+                    'label' => $field['label'],
+                    'options' => $options,
+                ];
+            }
+
+            // There's no consensus for what makes a required field, but this is close!
+            $required = false;
+            $isCreateable = $field['createable'] ?? null;
+            $isNillable = $field['nillable'] ?? null;
+
+            if ($isCreateable === true && $isNillable === false && $field['type'] !== 'boolean') {
+                $required = true;
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => $field['name'],
+                'name' => $field['label'],
+                'type' => $this->_convertFieldType($field['type']),
+                'sourceType' => $field['type'],
+                'required' => $required,
+                'options' => $options,
+            ]);
+        }
+
+        Integration::info($this, 'Salesforce field filtering: ' . Json::encode($skipped));
+
+        return $customFields;
+    }
+
+    private function _shouldFetchSettingsKey(string $settingsKey, bool $enabled): bool
+    {
+        if (!$enabled) {
+            return false;
+        }
+
+        $dataKey = trim((string)($this->settingsContext->dataKey ?? ''));
+
+        if ($dataKey !== '') {
+            return $dataKey === $settingsKey;
+        }
+
+        return true;
+    }
+
+    private function _fetchSalesforceUsers(): void
+    {
+        Integration::info($this, 'Fetching Salesforce users for field options.');
+        $response = $this->request('GET', 'query', [
+            'query' => ['q' => 'SELECT ID,Name FROM User LIMIT 20'],
+        ]);
+
+        Integration::info($this, 'Salesforce user options received: ' . count($response['records'] ?? []));
+
+        foreach ($response['records'] ?? [] as $user) {
+            $this->users[] = [
+                'label' => $user['Name'],
+                'value' => $user['Id'],
+            ];
+        }
+    }
+
+    private function _fetchSObjectSettings(string $sObject, array $excludeNames = []): ?array
+    {
+        try {
+            Integration::info($this, "Fetching Salesforce {$sObject} fields.");
+            $response = $this->request('GET', "sobjects/{$sObject}/describe");
+            $fields = $response['fields'] ?? [];
+            Integration::info($this, "{$sObject} describe response: " . Json::encode([
+                'hasFields' => is_array($response) && array_key_exists('fields', $response),
+                'createable' => $response['createable'] ?? null,
+                'updateable' => $response['updateable'] ?? null,
+                'queryable' => $response['queryable'] ?? null,
+            ]));
+            $customFields = $this->_getCustomFields($fields, $excludeNames);
+            $updateable = count(array_filter($fields, static fn(array $field) => !empty($field['updateable'])));
+            $createable = count(array_filter($fields, static fn(array $field) => !empty($field['createable'])));
+
+            Integration::info($this, "{$sObject} field refresh: received " . count($fields) . " fields, {$updateable} updateable, {$createable} createable, " . count($customFields) . ' available for mapping.');
+
+            return $customFields;
+        } catch (RequestException $e) {
+            if ($this->_isSalesforceNotFoundError($e)) {
+                Integration::info($this, Craft::t('formie', 'Salesforce {object} object is not available for this org.', [
+                    'object' => $sObject,
+                ]));
+
+                return null;
+            }
+
+            Integration::apiError($this, $e);
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return null;
+    }
+
+    private function _fetchCampaignMemberSettings(): ?array
+    {
+        try {
+            $response = $this->request('GET', 'sobjects/CampaignMember/describe');
+            $fields = $response['fields'] ?? [];
+
+            $response = $this->request('GET', 'query', [
+                'query' => ['q' => 'SELECT ID,Name FROM Campaign'],
+            ]);
+
+            $campaignOptions = [];
+
+            foreach ($response['records'] ?? [] as $campaign) {
+                $campaignOptions[] = [
+                    'label' => $campaign['Name'],
+                    'value' => $campaign['Id'],
+                ];
+            }
+
+            return array_merge([
+                new IntegrationField([
+                    'handle' => 'CampaignId',
+                    'name' => Craft::t('formie', 'Campaign ID'),
+                    'required' => true,
+                    'options' => [
+                        'label' => Craft::t('formie', 'Campaign'),
+                        'options' => $campaignOptions,
+                    ],
+                ]),
+            ], $this->_getCustomFields($fields));
+        } catch (RequestException $e) {
+            if ($this->_isSalesforceNotFoundError($e)) {
+                Integration::info($this, Craft::t('formie', 'Salesforce {object} object is not available for this org.', [
+                    'object' => 'CampaignMember',
+                ]));
+
+                return null;
+            }
+
+            Integration::apiError($this, $e);
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return null;
+    }
+
+    private function _isSalesforceNotFoundError(RequestException $e): bool
+    {
+        $response = $e->getResponse();
+
+        if (!$response) {
+            return false;
+        }
+
+        if ($response->getStatusCode() === 404) {
+            return true;
+        }
+
+        $body = (string)$response->getBody();
+
+        return str_contains($body, 'NOT_FOUND');
+    }
+
+    private function _prepPayload(array $fields): array
+    {
+        $payload = $fields;
+
+        // Check to see if the ownerId is an email, special handling for that
+        $ownerId = $payload['OwnerId'] ?? '';
+
+        if ($ownerId && str_contains($ownerId, '@')) {
+            $ownerId = ArrayHelper::remove($payload, 'OwnerId');
+
+            $payload['Owner'] = [
+                'attributes' => ['type' => 'User'],
+                'Email' => $ownerId,
+            ];
+        }
+
+        return $payload;
+    }
+
+    private function _getAssetsForSubmission(Submission $submission): array
+    {
+        $assets = [];
+
+        foreach ($submission->getFieldValuesForField(FileUpload::class) as $value) {
+            if ($value instanceof AssetQuery) {
+                $assets[] = $value->all();
+            }
+        }
+
+        return array_merge(...$assets);
+    }
+}

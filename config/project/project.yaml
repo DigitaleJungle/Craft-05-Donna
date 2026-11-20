@@ -1,0 +1,241 @@
+dateModified: 1795184963
+fs:
+  cloudinary:
+    name: Cloudinary
+    settings:
+      apiKey: $CLOUD_API
+      apiSecret: $CLOUD_SECRET
+      cloudName: $CLOUD_NAME
+      cname: ''
+      dynamicFolders: true
+      hasUrls: true
+      privateCdn: false
+    type: thomasvantuycom\craftcloudinary\fs\CloudinaryFs
+    url: $PRIMARY_SITE_URL/assets/cloud
+  localImages:
+    hasUrls: true
+    name: 'Lokale Afbeeldingen'
+    settings:
+      path: '@webroot/assets/images'
+    type: craft\fs\Local
+    url: $PRIMARY_SITE_URL/assets/images
+  transforms:
+    hasUrls: true
+    name: Transformaties
+    settings:
+      path: '@webroot/assets/transforms'
+    type: craft\fs\Local
+    url: $PRIMARY_SITE_URL/assets/transforms
+meta:
+  __names__:
+    0d1afeea-2a98-4702-acb3-f63560fb7eab: 'Korte Rijke Tekst zonder H1' # Korte Rijke Tekst zonder H1
+    1cb50d21-4d84-414b-9e24-21da43fd7b53: 'Algemene Configuratie' # Algemene Configuratie
+    6b47ac04-fae5-4489-a9a2-6dcf0a2479f3: Vertalingen # Vertalingen
+    7a49e618-c7d4-4eaf-9d03-21485fd787da: Archived # Archived
+    7ffdfd36-7734-4748-b81e-237d6f77de6f: 'Sociale Kanalen' # Sociale Kanalen
+    14cf6089-a079-4523-bba2-29e524a8370a: Afbeelding # Afbeelding
+    61f50be0-c91b-4420-8fa7-a164a9627f0e: Cloudinary # Cloudinary
+    064db357-5bd4-42bb-8917-a1f1a4f0d4d5: New # New
+    0153fe0a-6367-4650-b3f1-a3f71b9ea062: Afbeeldingen # Afbeeldingen
+    43081c08-917f-47d9-89d8-d198e04bd751: Link # Link
+    1869565a-c70f-4243-a46f-b63a2c6e2b52: Draft # Draft
+    14888277-4e7f-426c-bec3-4c0ce3d5a25c: Formulier # Formulier
+    ab857b30-7e5f-4d9c-a740-ac6d15843b29: Sandbox # Sandbox
+    ae13b1a5-a40a-4e61-a3aa-9ed0bc9f9faf: 'main Menu' # main Menu
+    b02dc466-76dc-48ac-9fa2-f1a0f2d94371: 'Grote Titel' # Grote Titel
+    b575c543-72da-44f7-b508-81ee110ced49: 'Stijl & Opmaak' # Stijl & Opmaak
+    be07e03d-1c05-46b5-a373-53f308dce9e6: Active # Active
+    c5c66daa-734e-4c55-8b7a-fb3bc33dc9e8: $PROJECT_NAME # $PROJECT_NAME
+    c9669560-d701-485b-be4d-53b5a3af6709: 'Platte Tekst' # Platte Tekst
+    d4ecdb56-3a81-4556-9fa7-7b28a2ff0918: Engels # Engels
+    ea4dcda8-1c8d-48aa-905c-4a55180e3f95: Frans # Frans
+    ebdc1624-028b-480d-b467-609de986d170: 'Bedrijf & Juridisch' # Bedrijf & Juridisch
+    f0a60ed6-a878-4807-a5aa-01d1bd8a4cc5: Unsplash # Unsplash
+    f5f570df-6934-444a-a3d4-a7c0369ccc63: Social # Social
+plugins:
+  buttonbox:
+    edition: standard
+    enabled: true
+    schemaVersion: 3.1.0
+  ckeditor:
+    edition: standard
+    enabled: true
+    schemaVersion: 5.6.0.0
+  cloudinary:
+    edition: standard
+    enabled: true
+    schemaVersion: 2.0.0
+  colour-swatches:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.4.3
+  control-panel-element-counter:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.0.0
+  cp-nav:
+    edition: standard
+    enabled: true
+    schemaVersion: 6.0.2
+  easy-gallery:
+    edition: standard
+    enabled: true
+    licenseKey: $GALLERY_KEY
+    schemaVersion: 1.2.1
+  embeddedassets:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.0.0
+  expanded-singles:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.0.0
+  formie:
+    edition: standard
+    enabled: true
+    licenseKey: $FORMIE_KEY
+    schemaVersion: 4.0.111
+    settings:
+      ajaxTimeout: 10
+      alertEmails: null
+      alertEmailsUserGroup: null
+      allowHiddenFieldTemplates: true
+      allowHtmlFieldTemplateIncludes: true
+      allowHtmlFieldTwig: true
+      allowLegacySignatureImageUrls: true
+      allowMultiSelectDropdowns: true
+      allowPhoneCountrySelector: true
+      allowPublicVolumes: true
+      allowedSubmitMethods: both
+      anonymousFormBootstrapRateLimit: 30
+      anonymousFormRateWindowSeconds: 60
+      anonymousFormRefreshRateLimit: 120
+      compatibilityMode: true
+      completionQueryAllowlist:
+        - utm_source
+        - utm_medium
+        - utm_campaign
+        - utm_term
+        - utm_content
+      defaultCpSubmissionFieldConditions: follow
+      defaultEmailTemplate: ''
+      defaultErrorMessagePosition: verbb\formie\positions\BelowInput
+      defaultExportFolder: '@storage/formie-export'
+      defaultFormStencil: ''
+      defaultFormTemplate: ''
+      defaultInstructionsPosition: verbb\formie\positions\AboveInput
+      defaultLabelPosition: verbb\formie\positions\AboveInput
+      defaultPage: forms
+      deliveryEvidenceRetentionDays: 30
+      emptyValuePlaceholder: 'No response.'
+      enableBackSubmission: true
+      enableCsrfValidationForGuests: true
+      enableLargeFieldStorage: false
+      enableMultiPageForms: true
+      enableUnloadWarning: true
+      encryptionKey: null
+      errorAriaLive: polite
+      filterIntegrationMapping: true
+      includeDraftElementUsage: false
+      includeFlatpickrCss: true
+      includeRevisionElementUsage: false
+      integrationAlertEmails: null
+      integrationAlertEmailsUserGroup: null
+      integrationApiErrorHandling:
+        -
+          __assoc__:
+            -
+              - severity
+              - rate_limited
+            -
+              - action
+              - logWarning
+        -
+          __assoc__:
+            -
+              - severity
+              - rejected
+            -
+              - action
+              - logWarning
+        -
+          __assoc__:
+            -
+              - severity
+              - failure
+            -
+              - action
+              - failQueue
+      maxEmailAttachmentSizeMb: 15
+      maxIncompleteSubmissionAge: 30
+      maxSentNotificationsAge: 30
+      maxStagedUploadBytes: 67108864
+      maxStagedUploadFiles: 50
+      outputConsoleMessages: true
+      paymentWebhookProxyUrl: null
+      pdfPaperOrientation: portrait
+      pdfPaperSize: letter
+      plainTextHtmlSanitizationMode: preserve
+      pluginName: Formie
+      queuePriority: null
+      redirectUri: null
+      reportAsyncExportRowThreshold: 1000
+      reportExportSingleUseDownload: true
+      reportInteractiveExportExpiryHours: 72
+      reportScheduledExportExpiryHours: 48
+      reportTablePageSize: 100
+      requireHtmlPurification: false
+      saveResumeTokenTtlDays: 14
+      sendEmailAlerts: false
+      sendIntegrationAlerts: false
+      sentNotifications: true
+      setOnlyCurrentPagePayload: false
+      staticCacheRefreshOnLoad: false
+      submissionSidebarFormOrder: dateCreatedDesc
+      submissionStateRetentionDays: 30
+      submissionsBehaviour: all
+      useCssLayers: false
+      useQueueForIntegrations: true
+      useQueueForNotifications: true
+      validateCustomTemplates: true
+  free-nav:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.0.1
+    settings:
+      activeClass: active
+      ariaEnabled: true
+      cacheDuration: 3600
+      cacheEnabled: true
+      defaultPreset: mega
+      hasChildrenClass: has-children
+      restApiEnabled: true
+  llm-ready:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.5.0
+  phone-number:
+    edition: standard
+    enabled: true
+    schemaVersion: 1.0.0
+  qrcode:
+    edition: standard
+    enabled: true
+    schemaVersion: 0.0.1
+  seo:
+    edition: standard
+    enabled: true
+    schemaVersion: 3.2.0
+system:
+  edition: solo
+  live: true
+  name: Test
+  schemaVersion: 5.12.0.2
+  timeZone: Europe/Brussels
+users:
+  allowPublicRegistration: false
+  defaultGroup: null
+  photoSubpath: null
+  photoVolumeUid: null
+  require2fa: false
+  requireEmailVerification: true

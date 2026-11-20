@@ -1,0 +1,816 @@
+<?php
+namespace verbb\formie\base;
+
+use verbb\formie\Formie;
+use verbb\formie\browser\modules\BrowserModuleManifestBuilder;
+use verbb\formie\cache\RenderCache;
+use verbb\formie\client\bootstrap\FormBootstrapBuilder;
+use verbb\formie\deprecations\PluginDeprecations;
+use verbb\formie\elements\Submission as SubmissionElement;
+use verbb\formie\events\ModifyTwigEnvironmentEvent;
+use verbb\formie\helpers\Plugin as FormiePluginHelper;
+use verbb\formie\helpers\ValidationMessagesHelper;
+use verbb\formie\log\SubmissionLogTarget;
+use verbb\formie\models\HiddenDefaultTemplateContext;
+use verbb\formie\models\HiddenDefaultTemplateFormContext;
+use verbb\formie\models\HiddenDefaultTemplateRequestContext;
+use verbb\formie\models\HiddenDefaultTemplateSiteContext;
+use verbb\formie\references\ReferenceCatalogue;
+use verbb\formie\server\ServerRenderPayloadBuilder;
+use verbb\formie\services\BrowserAssets;
+use verbb\formie\services\CaptchaProviders;
+use verbb\formie\services\Cleanup;
+use verbb\formie\services\ClientEventTemplates;
+use verbb\formie\services\Compatibility;
+use verbb\formie\services\Countries;
+use verbb\formie\services\CustomFields;
+use verbb\formie\services\DeliveryAttempts;
+use verbb\formie\services\EmailDomains;
+use verbb\formie\services\EmailTemplates;
+use verbb\formie\services\Emails;
+use verbb\formie\services\Factories;
+use verbb\formie\services\FieldPalette;
+use verbb\formie\services\FieldSiteOverrides;
+use verbb\formie\services\FieldTypeDefinitions;
+use verbb\formie\services\Fields;
+use verbb\formie\services\FileUploads;
+use verbb\formie\services\UploadReferences;
+use verbb\formie\services\FormDefaults;
+use verbb\formie\services\FormGroupDefaults;
+use verbb\formie\services\FormGroupPolicy;
+use verbb\formie\services\FormGroups;
+use verbb\formie\services\FormPreview;
+use verbb\formie\services\FormSessions;
+use verbb\formie\services\FormSiteOverrides;
+use verbb\formie\services\FormSitePropagation;
+use verbb\formie\services\FormStatuses;
+use verbb\formie\services\FormTemplates;
+use verbb\formie\services\Forms;
+use verbb\formie\services\IntegrationDispatcher;
+use verbb\formie\services\IntegrationRunner;
+use verbb\formie\services\IntegrationTriggers;
+use verbb\formie\services\Integrations;
+use verbb\formie\services\NotificationTriggers;
+use verbb\formie\services\Notifications;
+use verbb\formie\services\OptionSources;
+use verbb\formie\services\PaymentWebhooks;
+use verbb\formie\services\Payments;
+use verbb\formie\services\PdfTemplates;
+use verbb\formie\services\Permissions;
+use verbb\formie\services\Plans;
+use verbb\formie\services\QuestionnaireResults;
+use verbb\formie\services\QuestionnaireScoring;
+use verbb\formie\services\Relations;
+use verbb\formie\services\Rendering;
+use verbb\formie\services\Repair;
+use verbb\formie\services\ReportColumns;
+use verbb\formie\services\ReportEditor;
+use verbb\formie\services\ReportExport;
+use verbb\formie\services\ReportExportFiles;
+use verbb\formie\services\ReportQuery;
+use verbb\formie\services\ReportScheduledDelivery;
+use verbb\formie\services\ReportViewer;
+use verbb\formie\services\Reports;
+use verbb\formie\services\ScheduledReports;
+use verbb\formie\services\SentNotifications;
+use verbb\formie\services\Service;
+use verbb\formie\services\SpamProtection;
+use verbb\formie\services\Stencils;
+use verbb\formie\services\SubmissionDispatches;
+use verbb\formie\services\SubmissionGrants;
+use verbb\formie\services\SubmissionGuards;
+use verbb\formie\services\SubmissionMetadata;
+use verbb\formie\services\SubmissionOperations;
+use verbb\formie\services\SubmissionProcessor;
+use verbb\formie\services\SubmissionProgress;
+use verbb\formie\services\SubmissionRequests;
+use verbb\formie\services\SubmissionStatuses;
+use verbb\formie\services\SubmissionWorkflow;
+use verbb\formie\services\Submissions;
+use verbb\formie\services\Subscriptions;
+use verbb\formie\services\Templates;
+use verbb\formie\services\ThemeConfig;
+use verbb\formie\services\TiptapExtensions;
+use verbb\formie\theme\slots\FieldSlotRegistry;
+use verbb\formie\theme\slots\FormSlotRegistry;
+use verbb\formie\web\assets\cp\CpReactAsset;
+
+use Craft;
+use craft\elements\User;
+use craft\helpers\App;
+
+use yii\base\Event;
+use yii\base\Model;
+
+use ArrayAccess;
+
+use nystudio107\pluginvite\services\VitePluginService;
+use verbb\base\helpers\Plugin;
+use verbb\base\LogTrait;
+
+trait PluginTrait
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function config(): array
+    {
+        Plugin::bootstrapPlugin('formie');
+        SubmissionLogTarget::register();
+
+        // Build the Twig allow-list before the templates service is registered
+        // so extension code can widen the safe client surface without replacing
+        // Formie's sandbox configuration wholesale.
+        $event = new ModifyTwigEnvironmentEvent([
+            'allowedTags' => [],
+            'allowedFilters' => [],
+            'allowedFunctions' => [],
+            'allowedMethods' => [],
+            'allowedProperties' => [],
+        ]);
+
+        // Formie 4 values extend the Formie 3 marker, so one allow-list keeps
+        // canonical and legacy third-party value objects available to Twig.
+        $event->allowedMethods[FieldValueInterface::class] = ['__toString'];
+
+        $event->allowedProperties[FieldValueInterface::class] = function(FieldValueInterface $value, string $property): bool {
+            if ($value instanceof Model && in_array($property, $value->attributes(), true)) {
+                return true;
+            }
+
+            if ($value instanceof ArrayAccess && $value->offsetExists($property)) {
+                return true;
+            }
+
+            return property_exists($value, $property);
+        };
+
+        $event->allowedProperties[SubmissionElement::class] = function(SubmissionElement $submission, string $property): bool {
+            if (in_array($property, $submission->attributes(), true)) {
+                return true;
+            }
+
+            // The documented `user.*` object-template values resolve through
+            // this virtual relation, whose properties are separately bounded.
+            if ($property === 'user') {
+                return true;
+            }
+
+            if (strncmp($property, 'field:', 6) === 0) {
+                return $submission->getFieldByHandle(substr($property, 6)) !== null;
+            }
+
+            return $submission->getFieldByHandle($property) !== null;
+        };
+
+        $allowModelAttributes = function(Model $model, string $property): bool {
+            return in_array($property, $model->attributes(), true);
+        };
+
+        $event->allowedProperties[HiddenDefaultTemplateContext::class] = $allowModelAttributes;
+        $event->allowedProperties[HiddenDefaultTemplateFormContext::class] = $allowModelAttributes;
+        $event->allowedProperties[HiddenDefaultTemplateSiteContext::class] = $allowModelAttributes;
+        $event->allowedProperties[HiddenDefaultTemplateRequestContext::class] = $allowModelAttributes;
+
+        $event->allowedProperties[User::class] = function(User $user, string $property): bool {
+            if (in_array($property, ['id', 'email', 'username', 'fullName', 'firstName', 'lastName'], true)) {
+                return true;
+            }
+
+            return $user->getFieldLayout()?->getFieldByHandle($property) !== null;
+        };
+
+        Event::trigger(self::class, self::EVENT_MODIFY_TWIG_ENVIRONMENT, $event);
+
+        return [
+            'components' => [
+                'countries' => Countries::class,
+                'referenceCatalogue' => ReferenceCatalogue::class,
+                'compatibility' => Compatibility::class,
+                'customFields' => CustomFields::class,
+                'cpAssets' => [
+                    'class' => VitePluginService::class,
+                    'assetClass' => CpReactAsset::class,
+                    // Default off: Craft serves built CP dist. Kit changes are picked up by
+                    // rebuilding plugin-kit (`npm run build:plugin-kit`) then the CP — not by
+                    // Vite HMR into kit src. Opt in with FORMIE_USE_VITE_DEV_SERVER=true for
+                    // plugin-local HMR only (same model as Navigation).
+                    'useDevServer' => filter_var(App::parseEnv('$FORMIE_USE_VITE_DEV_SERVER') ?: false, FILTER_VALIDATE_BOOL),
+                    'devServerPublic' => rtrim(App::parseEnv('$FORMIE_CP_DEV_SERVER_PUBLIC') ?: 'http://localhost:3900/', '/') . '/',
+                    'errorEntry' => 'src/plugin-kit-register.js',
+                    'cacheKeySuffix' => '',
+                    'devServerInternal' => rtrim(App::parseEnv('$FORMIE_CP_DEV_SERVER_INTERNAL') ?: 'http://localhost:3900/', '/') . '/',
+                    'checkDevServer' => true,
+                    'includeReactRefreshShim' => true,
+                ],
+                'emailDomains' => EmailDomains::class,
+                'emails' => Emails::class,
+                'emailTemplates' => EmailTemplates::class,
+                'factories' => Factories::class,
+                'fieldTypeDefinitions' => FieldTypeDefinitions::class,
+                'fieldPalette' => FieldPalette::class,
+                'fields' => Fields::class,
+                'fieldSlotRegistry' => FieldSlotRegistry::class,
+                'fileUploads' => FileUploads::class,
+                'uploadReferences' => UploadReferences::class,
+                'formDefaults' => FormDefaults::class,
+                'formGroupDefaults' => FormGroupDefaults::class,
+                'formGroupPolicy' => FormGroupPolicy::class,
+                'fieldSiteOverrides' => FieldSiteOverrides::class,
+                'formSiteOverrides' => FormSiteOverrides::class,
+                'formSitePropagation' => FormSitePropagation::class,
+                'forms' => Forms::class,
+                'formSlotRegistry' => FormSlotRegistry::class,
+                'clientFormBootstrapBuilder' => FormBootstrapBuilder::class,
+                'formGroups' => FormGroups::class,
+                'formPreview' => FormPreview::class,
+                'formTemplates' => FormTemplates::class,
+                'captchaProviders' => CaptchaProviders::class,
+                'cleanup' => Cleanup::class,
+                'integrations' => Integrations::class,
+                'integrationDispatcher' => IntegrationDispatcher::class,
+                'integrationRunner' => IntegrationRunner::class,
+                'deliveryAttempts' => DeliveryAttempts::class,
+                'submissionDispatches' => SubmissionDispatches::class,
+                'integrationTriggers' => IntegrationTriggers::class,
+                'notificationTriggers' => NotificationTriggers::class,
+                'serverRenderPayloadBuilder' => ServerRenderPayloadBuilder::class,
+                'browserModuleManifestBuilder' => BrowserModuleManifestBuilder::class,
+                'notifications' => Notifications::class,
+                'payments' => Payments::class,
+                'paymentWebhooks' => PaymentWebhooks::class,
+                'permissions' => Permissions::class,
+                'questionnaireResults' => QuestionnaireResults::class,
+                'questionnaireScoring' => QuestionnaireScoring::class,
+                'pdfTemplates' => PdfTemplates::class,
+                'plans' => Plans::class,
+                'clientEventTemplates' => ClientEventTemplates::class,
+                'optionSources' => OptionSources::class,
+                'repair' => Repair::class,
+                'relations' => Relations::class,
+                'reports' => Reports::class,
+                'reportEditor' => ReportEditor::class,
+                'reportColumns' => ReportColumns::class,
+                'reportQuery' => ReportQuery::class,
+                'reportExport' => ReportExport::class,
+                'reportExportFiles' => ReportExportFiles::class,
+                'reportScheduledDelivery' => ReportScheduledDelivery::class,
+                'reportViewer' => ReportViewer::class,
+                'scheduledReports' => ScheduledReports::class,
+                'renderCache' => RenderCache::class,
+                'rendering' => Rendering::class,
+                'browserAssets' => BrowserAssets::class,
+                'formSessions' => FormSessions::class,
+                'sentNotifications' => SentNotifications::class,
+                'spamProtection' => SpamProtection::class,
+                'service' => Service::class,
+                'submissionStatuses' => SubmissionStatuses::class,
+                'statuses' => static fn() => Formie::$plugin->getSubmissionStatuses(),
+                'formStatuses' => FormStatuses::class,
+                'stencils' => Stencils::class,
+                'submissions' => Submissions::class,
+                'submissionProcessor' => SubmissionProcessor::class,
+                'submissionRequests' => SubmissionRequests::class,
+                'submissionGuards' => SubmissionGuards::class,
+                'submissionProgress' => SubmissionProgress::class,
+                'submissionGrants' => SubmissionGrants::class,
+                'submissionMetadata' => SubmissionMetadata::class,
+                'submissionWorkflow' => SubmissionWorkflow::class,
+                'subscriptions' => Subscriptions::class,
+                'templates' => [
+                    'class' => Templates::class,
+                    'pluginClass' => Formie::class,
+                    'additionalAllowedTags' => $event->allowedTags,
+                    'additionalAllowedFilters' => $event->allowedFilters,
+                    'additionalAllowedFunctions' => $event->allowedFunctions,
+                    'additionalAllowedMethods' => $event->allowedMethods,
+                    'additionalAllowedProperties' => $event->allowedProperties,
+                ],
+                'themeConfig' => ThemeConfig::class,
+                'tiptapExtensions' => TiptapExtensions::class,
+                'submissionOperations' => SubmissionOperations::class,
+            ],
+        ];
+    }
+
+
+    // Traits
+    // =========================================================================
+
+    use LogTrait;
+    use PluginDeprecations;
+
+
+    // Properties
+    // =========================================================================
+
+    public static ?Formie $plugin = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getReferenceCatalogue(): ReferenceCatalogue
+    {
+        return $this->get('referenceCatalogue');
+    }
+
+    public function getCountries(): Countries
+    {
+        return $this->get('countries');
+    }
+
+    public function getCompatibility(): Compatibility
+    {
+        return $this->get('compatibility');
+    }
+
+    public function getCustomFields(): CustomFields
+    {
+        return $this->get('customFields');
+    }
+
+    public function getCpAssets(): VitePluginService
+    {
+        return $this->get('cpAssets');
+    }
+
+    public function registerCpFormBuilderAssets(): void
+    {
+        FormiePluginHelper::registerCpFormBuilderAssets();
+    }
+
+    public function registerCpNewFormAssets(): void
+    {
+        FormiePluginHelper::registerCpNewFormAssets();
+    }
+
+    public function registerCpDefaultsAssets(): void
+    {
+        FormiePluginHelper::registerCpDefaultsAssets();
+    }
+
+    public function registerCpFieldPaletteAssets(): void
+    {
+        FormiePluginHelper::registerCpFieldPaletteAssets();
+    }
+
+    public function registerCpStencilNewAssets(): void
+    {
+        FormiePluginHelper::registerCpStencilNewAssets();
+    }
+
+    public function registerCpStencilEditAssets(): void
+    {
+        FormiePluginHelper::registerCpStencilEditAssets();
+    }
+
+    public function registerCpIntegrationConnectAssets(): void
+    {
+        FormiePluginHelper::registerCpIntegrationConnectAssets();
+    }
+
+    public function registerCpPluginSettingsAssets(): void
+    {
+        FormiePluginHelper::registerCpPluginSettingsAssets();
+    }
+
+    public function registerCpSubmissionsAssets(): void
+    {
+        FormiePluginHelper::registerCpSubmissionsAssets();
+    }
+
+    public function registerCpSentNotificationsAssets(): void
+    {
+        FormiePluginHelper::registerCpSentNotificationsAssets();
+    }
+
+    public function registerCpWidgetsAssets(): void
+    {
+        FormiePluginHelper::registerCpWidgetsAssets();
+    }
+
+    public function getEmailDomains(): EmailDomains
+    {
+        return $this->get('emailDomains');
+    }
+
+    public function getEmails(): Emails
+    {
+        return $this->get('emails');
+    }
+
+    public function getEmailTemplates(): EmailTemplates
+    {
+        return $this->get('emailTemplates');
+    }
+
+    public function getFactories(): Factories
+    {
+        return $this->get('factories');
+    }
+
+    public function getFields(): Fields
+    {
+        return $this->get('fields');
+    }
+
+    public function getFieldPalette(): FieldPalette
+    {
+        return $this->get('fieldPalette');
+    }
+
+    public function getBrowserAssets(): BrowserAssets
+    {
+        return $this->get('browserAssets');
+    }
+
+    public function getClientFormBootstrapBuilder(): FormBootstrapBuilder
+    {
+        return $this->get('clientFormBootstrapBuilder');
+    }
+
+    public function getServerRenderPayloadBuilder(): ServerRenderPayloadBuilder
+    {
+        return $this->get('serverRenderPayloadBuilder');
+    }
+
+    public function getBrowserModuleManifestBuilder(): BrowserModuleManifestBuilder
+    {
+        return $this->get('browserModuleManifestBuilder');
+    }
+
+    public function getFormSessions(): FormSessions
+    {
+        return $this->get('formSessions');
+    }
+
+    public function getFieldTypeDefinitions(): FieldTypeDefinitions
+    {
+        return $this->get('fieldTypeDefinitions');
+    }
+
+    public function getForms(): Forms
+    {
+        return $this->get('forms');
+    }
+
+    public function getFormDefaults(): FormDefaults
+    {
+        return $this->get('formDefaults');
+    }
+
+    public function getFormGroups(): FormGroups
+    {
+        return $this->get('formGroups');
+    }
+
+    public function getFormGroupDefaults(): FormGroupDefaults
+    {
+        return $this->get('formGroupDefaults');
+    }
+
+    public function getFormGroupPolicy(): FormGroupPolicy
+    {
+        return $this->get('formGroupPolicy');
+    }
+
+    public function getFieldSiteOverrides(): FieldSiteOverrides
+    {
+        return $this->get('fieldSiteOverrides');
+    }
+
+    public function getFormSiteOverrides(): FormSiteOverrides
+    {
+        return $this->get('formSiteOverrides');
+    }
+
+    public function getFormSitePropagation(): FormSitePropagation
+    {
+        return $this->get('formSitePropagation');
+    }
+
+    public function getFormPreview(): FormPreview
+    {
+        return $this->get('formPreview');
+    }
+
+    public function getFormTemplates(): FormTemplates
+    {
+        return $this->get('formTemplates');
+    }
+
+    public function getCaptchaProviders(): CaptchaProviders
+    {
+        return $this->get('captchaProviders');
+    }
+
+    public function getCleanup(): Cleanup
+    {
+        return $this->get('cleanup');
+    }
+
+    public function getIntegrations(): Integrations
+    {
+        return $this->get('integrations');
+    }
+
+    public function getIntegrationDispatcher(): IntegrationDispatcher
+    {
+        return $this->get('integrationDispatcher');
+    }
+
+    public function getDeliveryAttempts(): DeliveryAttempts
+    {
+        return $this->get('deliveryAttempts');
+    }
+
+    public function getSubmissionDispatches(): SubmissionDispatches
+    {
+        return $this->get('submissionDispatches');
+    }
+
+    public function getIntegrationRunner(): IntegrationRunner
+    {
+        return $this->get('integrationRunner');
+    }
+
+    public function getIntegrationTriggers(): IntegrationTriggers
+    {
+        return $this->get('integrationTriggers');
+    }
+
+    public function getNotificationTriggers(): NotificationTriggers
+    {
+        return $this->get('notificationTriggers');
+    }
+
+    public function getNotifications(): Notifications
+    {
+        return $this->get('notifications');
+    }
+
+    public function getPayments(): Payments
+    {
+        return $this->get('payments');
+    }
+
+    public function getPaymentWebhooks(): PaymentWebhooks
+    {
+        return $this->get('paymentWebhooks');
+    }
+
+    public function getPermissions(): Permissions
+    {
+        return $this->get('permissions');
+    }
+
+    public function getQuestionnaireResults(): QuestionnaireResults
+    {
+        return $this->get('questionnaireResults');
+    }
+
+    public function getQuestionnaireScoring(): QuestionnaireScoring
+    {
+        return $this->get('questionnaireScoring');
+    }
+
+    public function getPdfTemplates(): PdfTemplates
+    {
+        return $this->get('pdfTemplates');
+    }
+
+    public function getPlans(): Plans
+    {
+        return $this->get('plans');
+    }
+
+    public function getClientEventTemplates(): ClientEventTemplates
+    {
+        return $this->get('clientEventTemplates');
+    }
+
+    public function getOptionSources(): OptionSources
+    {
+        return $this->get('optionSources');
+    }
+
+    public function getRepair(): Repair
+    {
+        return $this->get('repair');
+    }
+
+    public function getRelations(): Relations
+    {
+        return $this->get('relations');
+    }
+
+    public function getReports(): Reports
+    {
+        return $this->get('reports');
+    }
+
+    public function getReportEditor(): ReportEditor
+    {
+        return $this->get('reportEditor');
+    }
+
+    public function getReportColumns(): ReportColumns
+    {
+        return $this->get('reportColumns');
+    }
+
+    public function getReportQuery(): ReportQuery
+    {
+        return $this->get('reportQuery');
+    }
+
+    public function getReportExport(): ReportExport
+    {
+        return $this->get('reportExport');
+    }
+
+    public function getReportExportFiles(): ReportExportFiles
+    {
+        return $this->get('reportExportFiles');
+    }
+
+    public function getReportScheduledDelivery(): ReportScheduledDelivery
+    {
+        return $this->get('reportScheduledDelivery');
+    }
+
+    public function getReportViewer(): ReportViewer
+    {
+        return $this->get('reportViewer');
+    }
+
+    public function getScheduledReports(): ScheduledReports
+    {
+        return $this->get('scheduledReports');
+    }
+
+    public function getRenderCache(): RenderCache
+    {
+        return $this->get('renderCache');
+    }
+
+    public function getRendering(): Rendering
+    {
+        return $this->get('rendering');
+    }
+
+    public function getSentNotifications(): SentNotifications
+    {
+        return $this->get('sentNotifications');
+    }
+
+    public function getService(): Service
+    {
+        return $this->get('service');
+    }
+
+    public function getSpamProtection(): SpamProtection
+    {
+        return $this->get('spamProtection');
+    }
+
+    public function getSubmissionStatuses(): SubmissionStatuses
+    {
+        return $this->get('submissionStatuses');
+    }
+
+    public function getFormStatuses(): FormStatuses
+    {
+        return $this->get('formStatuses');
+    }
+
+    public function getStencils(): Stencils
+    {
+        return $this->get('stencils');
+    }
+
+    public function getSubmissions(): Submissions
+    {
+        return $this->get('submissions');
+    }
+
+    public function getSubmissionProcessor(): SubmissionProcessor
+    {
+        return $this->get('submissionProcessor');
+    }
+
+    public function getSubmissionRequests(): SubmissionRequests
+    {
+        return $this->get('submissionRequests');
+    }
+
+    public function getSubmissionGuards(): SubmissionGuards
+    {
+        return $this->get('submissionGuards');
+    }
+
+    public function getSubmissionMetadata(): SubmissionMetadata
+    {
+        return $this->get('submissionMetadata');
+    }
+
+    public function getSubmissionWorkflow(): SubmissionWorkflow
+    {
+        return $this->get('submissionWorkflow');
+    }
+
+    public function getSubmissionOperations(): SubmissionOperations
+    {
+        return $this->get('submissionOperations');
+    }
+
+    public function getSubmissionGrants(): SubmissionGrants
+    {
+        return $this->get('submissionGrants');
+    }
+
+    public function getSubmissionProgress(): SubmissionProgress
+    {
+        return $this->get('submissionProgress');
+    }
+
+    public function getThemeConfigService(): ThemeConfig
+    {
+        return $this->get('themeConfig');
+    }
+
+    public function getTiptapExtensions(): TiptapExtensions
+    {
+        return $this->get('tiptapExtensions');
+    }
+
+    public function getFormSlotRegistry(): FormSlotRegistry
+    {
+        return $this->get('formSlotRegistry');
+    }
+
+    public function getFieldSlotRegistry(): FieldSlotRegistry
+    {
+        return $this->get('fieldSlotRegistry');
+    }
+
+    public function getSubscriptions(): Subscriptions
+    {
+        return $this->get('subscriptions');
+    }
+
+    public function getUploadReferences(): UploadReferences
+    {
+        return $this->get('uploadReferences');
+    }
+
+    public function getFileUploads(): FileUploads
+    {
+        return $this->get('fileUploads');
+    }
+
+    public function getTemplates(): Templates
+    {
+        return $this->get('templates');
+    }
+
+    /**
+     * Register dynamically-translated message keys with the plugin-translator module, if present.
+     *
+     * Called during static translation file regen. No-ops when the module is not installed.
+     */
+    public function registerTranslationExtractStrings(): void
+    {
+        $module = Craft::$app->getModule('plugin-translator', false);
+
+        if (!$module) {
+            return;
+        }
+
+        $moduleClass = get_class($module);
+        $eventClass = 'modules\\plugintranslator\\events\\RegisterTranslationStringsEvent';
+
+        if (!defined($moduleClass . '::EVENT_REGISTER_TRANSLATION_STRINGS')) {
+            return;
+        }
+
+        if (!class_exists($eventClass)) {
+            return;
+        }
+
+        if (!class_exists(ValidationMessagesHelper::class)) {
+            return;
+        }
+
+        if (!method_exists(ValidationMessagesHelper::class, 'translationExtractStringList')) {
+            return;
+        }
+
+        $event = new $eventClass([
+            'strings' => ValidationMessagesHelper::translationExtractStringList(),
+        ]);
+
+        $module->trigger(constant($moduleClass . '::EVENT_REGISTER_TRANSLATION_STRINGS'), $event);
+    }
+}

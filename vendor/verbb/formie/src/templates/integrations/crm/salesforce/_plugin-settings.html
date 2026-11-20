@@ -1,0 +1,94 @@
+{% extends 'formie/_layouts/integrations/plugin-settings' %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% block content %}
+
+{{ macros.proxyField(fieldVariables, 'autosuggestField', {
+    label: 'Consumer Key' | t('formie'),
+    instructions: 'Enter your {name} {label} here.' | t('formie'),
+    name: 'clientId',
+    required: true,
+    suggestEnvVars: true,
+    value: integration.settings.clientId ?? '',
+    warning: macros.configWarning('clientId', 'formie'),
+    errors: integration.getErrors('clientId'),
+}) }}
+
+{{ macros.proxyField(fieldVariables, 'autosuggestField', {
+    label: 'Consumer Secret' | t('formie'),
+    instructions: 'Enter your {name} {label} here.' | t('formie'),
+    name: 'clientSecret',
+    required: true,
+    suggestEnvVars: true,
+    value: integration.settings.clientSecret ?? '',
+    warning: macros.configWarning('clientSecret', 'formie'),
+    errors: integration.getErrors('clientSecret'),
+}) }}
+
+{% set useCredentials = integration.settings.useCredentials ?? false %}
+{% set grant = integration.settings.grant ?? (useCredentials ? 'password' : 'authorization_code') %}
+
+{{ macros.proxyField(fieldVariables, 'selectField', {
+    label: 'Grant' | t('formie'),
+    instructions: 'Select the type of OAuth grant to use.' | t('formie'),
+    name: 'grant',
+    required: true,
+    value: grant,
+    options: [
+        { label: 'Authorization Code' | t('formie'), value: 'authorization_code' },
+        { label: 'Client Credentials' | t('formie'), value: 'client_credentials' },
+        { label: 'Password' | t('formie'), value: 'password' },
+    ],
+    toggle: true,
+    targetPrefix: '.salesforce-oauth-settings-',
+    warning: macros.configWarning('grant', 'formie'),
+    errors: integration.getErrors('grant'),
+}) }}
+
+<div class="salesforce-oauth-settings-client_credentials {{ grant != 'client_credentials' ? 'hidden' }}">
+    {{ macros.proxyField(fieldVariables, 'autosuggestField', {
+        label: 'Authentication Domain' | t('formie'),
+        instructions: 'Enter your Salesforce My Domain URL, such as https://example.my.salesforce.com. Client Credentials cannot use login.salesforce.com or test.salesforce.com. Existing connections can reuse their saved instance URL when this is blank.' | t('formie'),
+        name: 'authDomain',
+        suggestEnvVars: true,
+        value: integration.settings.authDomain ?? '',
+        warning: macros.configWarning('authDomain', 'formie'),
+        errors: integration.getErrors('authDomain'),
+    }) }}
+</div>
+
+{{ macros.proxyField(fieldVariables, 'booleanMenuField', {
+    label: 'Use Sandbox' | t('formie'),
+    instructions: 'Whether to use the {name} sandbox.' | t('formie'),
+    name: 'useSandbox',
+    includeEnvVars: true,
+    value: integration.settings.useSandbox ?? false,
+    warning: macros.configWarning('useSandbox', 'formie'),
+    errors: integration.getErrors('useSandbox'),
+}) }}
+
+<div class="salesforce-oauth-settings-password {{ grant != 'password' ? 'hidden' }}">
+    {{ macros.proxyField(fieldVariables, 'autosuggestField', {
+        label: 'Username' | t('formie'),
+        instructions: 'Enter your {name} {label} here.' | t('formie'),
+        name: 'username',
+        suggestEnvVars: true,
+        value: integration.settings.username ?? '',
+        warning: macros.configWarning('username', 'formie'),
+        errors: integration.getErrors('username'),
+    }) }}
+
+    {{ macros.proxyField(fieldVariables, 'autosuggestField', {
+        label: 'Password' | t('formie'),
+        instructions: 'Enter your {name} {label} here.' | t('formie'),
+        name: 'password',
+        suggestEnvVars: true,
+        value: integration.settings.password ?? '',
+        warning: macros.configWarning('password', 'formie'),
+        errors: integration.getErrors('password'),
+    }) }}
+</div>
+
+{% endblock %}

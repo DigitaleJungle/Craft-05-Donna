@@ -1,0 +1,309 @@
+<?php
+namespace verbb\formie\integrations\helpdesk;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\HelpDesk;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\ArrayHelper;
+use craft\helpers\Json;
+use craft\helpers\StringHelper;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Gorgias extends HelpDesk
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Gorgias';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $apiUrl = null;
+    public ?string $username = null;
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToTicket = false;
+
+    #[FormIntegrationSetting]
+    public ?array $ticketFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to Gorgias.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToTicket && $this->settingsContext->dataKey === 'ticket') {
+                $response = $this->request('GET', 'custom-fields', [
+                'query' => [
+                    'object_type' => 'Ticket',
+                ],
+            ]);
+
+                $fields = $response['data'] ?? [];
+
+                $ticketFields = array_merge([
+                    new IntegrationField([
+                        'handle' => 'message',
+                        'name' => Craft::t('formie', 'Message'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'channel',
+                        'name' => Craft::t('formie', 'Channel'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'tags',
+                        'name' => Craft::t('formie', 'Tags'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'subject',
+                        'name' => Craft::t('formie', 'Subject'),
+                    ]),
+                ], $this->_getCustomFields($fields));
+
+                $settings['ticket'] = $ticketFields;
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'account');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            if ($this->mapToTicket) {
+                $ticketValues = $this->getFieldMappingValues($submission, $this->ticketFieldMapping, 'ticket');
+
+                $ticketPayload = $this->_prepCustomFields($ticketValues);
+
+                $subject = ArrayHelper::remove($ticketPayload, 'subject') ?? 'New Form Submission';
+                $name = ArrayHelper::remove($ticketPayload, 'name') ?? 'Anonymous';
+                $email = ArrayHelper::remove($ticketPayload, 'email') ?? 'no-reply@example.com';
+                $message = ArrayHelper::remove($ticketPayload, 'message');
+                $channel = ArrayHelper::remove($ticketPayload, 'channel') ?? 'contact_form';
+                $tags = ArrayHelper::remove($ticketPayload, 'tags') ?? [];
+
+                $ticketPayload['from_agent'] = false;
+                $ticketPayload['channel'] = $channel;
+                $ticketPayload['tags'] = is_array($tags) ? $tags : array_filter(array_map('trim', explode(',', $tags)));
+
+                $ticketPayload['messages'] = [[
+                    'body_text' => $message,
+                    'via' => 'form',
+                    'channel' => $channel,
+                    'from_agent' => false,
+                    'source' => [
+                        'type' => 'form',
+                        'from' => [
+                            'address' => $email,
+                            'name' => $name,
+                        ],
+                    ],
+                    'sender' => [
+                        'email' => $email,
+                        'name' => $name,
+                    ],
+                ]];
+
+                $response = $this->deliverPayload($submission, 'tickets', $ticketPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $ticketId = $response['id'] ?? '';
+
+                if (!$ticketId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “ticketId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($ticketPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiUrl', 'username', 'apiKey'], 'required'];
+
+        $ticket = $this->getConfigValue('ticket');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['ticketFieldMapping'], 'validateFieldMapping', 'params' => $ticket, 'when' => function($model) {
+                return $model->enabled && $model->mapToTicket;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        $url = rtrim(App::parseEnv($this->apiUrl), '/');
+        $username = App::parseEnv($this->username);
+        $password = App::parseEnv($this->apiKey);
+
+        return Craft::createGuzzleClient([
+            'base_uri' => "$url/",
+            'auth' => [$username, $password],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToTicket',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Ticket']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Tickets']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'ticketFieldMapping',
+            'if' => 'mapToTicket',
+            'dataLabel' => 'Ticket',
+            'dataKey' => 'ticket',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            // 'boolean' => IntegrationField::TYPE_BOOLEAN,
+            // 'legal' => IntegrationField::TYPE_BOOLEAN,
+            // 'multi_choice' => IntegrationField::TYPE_ARRAY,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $field) {
+            $options = [];
+
+            $fieldOptions = $field['definition']['input_settings']['choices'] ?? [];
+
+            foreach ($fieldOptions as $key => $fieldOption) {
+                $options[] = [
+                    'label' => $fieldOption,
+                    'value' => $fieldOption,
+                ];
+            }
+
+            if ($options) {
+                $options = [
+                    'label' => $field['label'],
+                    'options' => $options,
+                ];
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => 'custom:' . $field['id'],
+                'name' => $field['label'],
+                'type' => $this->_convertFieldType($field['definition']['data_type']),
+                'sourceType' => $field['definition']['data_type'],
+                'required' => $field['required'],
+                'options' => $options,
+            ]);
+        }
+
+        return $customFields;
+    }
+
+    private function _prepCustomFields(array $fields): array
+    {
+        $payload = $fields;
+
+        foreach ($payload as $key => $value) {
+            if (StringHelper::startsWith($key, 'custom:')) {
+                ArrayHelper::remove($payload, $key);
+
+                $payload['custom_fields'][] = [
+                    'id' => str_replace('custom:', '', $key),
+                    'value' => $value,
+                ];
+            }
+        }
+
+        return $payload;
+    }
+}

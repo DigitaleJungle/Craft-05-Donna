@@ -1,0 +1,253 @@
+<?php
+namespace verbb\formie\helpers;
+
+use verbb\formie\Formie;
+
+use Craft;
+use craft\helpers\HtmlPurifier;
+use craft\helpers\StringHelper as CraftStringHelper;
+
+use HTMLPurifier as Purifier;
+use HTMLPurifier_Config;
+
+class StringHelper extends CraftStringHelper
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function toId(mixed $value, bool $allowNull = true): ?int
+    {
+        if ($allowNull && ($value === null || $value === '')) {
+            return null;
+        }
+
+        if ($value === null || is_scalar($value)) {
+            return (int)$value;
+        }
+
+        return null;
+    }
+
+    public static function cleanString(string $string): string
+    {
+        return self::_getPurifier()->purify($string);
+    }
+
+    public static function cleanRichTextRequest(string $string, bool $allowImages): string
+    {
+        if ($allowImages) {
+            return self::cleanString($string);
+        }
+
+        return HtmlPurifier::process($string, [
+            'HTML.ForbiddenElements' => ['img'],
+            'URI.DisableExternalResources' => true,
+        ]);
+    }
+
+    public static function sanitizeMessageHtml(string $string): string
+    {
+        return trim(HtmlPurifier::process($string));
+    }
+
+    public static function sanitizeMessageHtmlRecursive(mixed $value): mixed
+    {
+        if (is_string($value)) {
+            return self::sanitizeMessageHtml($value);
+        }
+
+        if (is_array($value)) {
+            foreach ($value as $key => $item) {
+                $value[$key] = self::sanitizeMessageHtmlRecursive($item);
+            }
+        }
+
+        return $value;
+    }
+
+    public static function sanitizeUrlAttribute(?string $url): ?string
+    {
+        if ($url === null) {
+            return null;
+        }
+
+        $decodedUrl = trim(html_entity_decode($url, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+
+        if ($decodedUrl === '') {
+            return null;
+        }
+
+        $cleanUrl = preg_replace('/[\x00-\x1F\x7F]+/u', '', $decodedUrl) ?? $decodedUrl;
+        $normalizedUrl = preg_replace('/\s+/u', '', $cleanUrl) ?? $cleanUrl;
+
+        if (preg_match('/^([a-z][a-z0-9+\-.]*):/i', $normalizedUrl, $matches)) {
+            $scheme = strtolower($matches[1]);
+
+            if (!in_array($scheme, self::ALLOWED_URL_PROTOCOLS, true)) {
+                return null;
+            }
+        }
+
+        return $cleanUrl;
+    }
+
+    public static function sanitizeRedirectUrl(string $url): string
+    {
+        $url = trim($url);
+
+        if ($url === '') {
+            return '';
+        }
+
+        $cleanUrl = preg_replace('/[\x00-\x1F\x7F]+/u', '', $url) ?? $url;
+        $decodedUrl = html_entity_decode($cleanUrl, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $normalizedUrl = preg_replace('/[\x00-\x20\x7F]+/u', '', $decodedUrl) ?? $decodedUrl;
+        $normalizedUrl = str_replace('\\', '/', rawurldecode($normalizedUrl));
+
+        if (str_starts_with($normalizedUrl, '//')) {
+            return '';
+        }
+
+        if (preg_match('/^([a-z][a-z0-9+\-.]*):/i', $normalizedUrl, $matches) && !in_array(strtolower($matches[1]), ['http', 'https'], true)) {
+            return '';
+        }
+
+        return parse_url($decodedUrl) === false ? '' : $cleanUrl;
+    }
+
+    public static function encodePathSegment(mixed $value): string
+    {
+        $segment = rawurlencode((string)$value);
+
+        return match ($segment) {
+            '.' => '%2E',
+            '..' => '%2E%2E',
+            default => $segment,
+        };
+    }
+
+    public static function normalizePlainText(string $string): string
+    {
+        $string = self::convertToUtf8($string);
+        $normalized = preg_replace('/[^\P{C}\t\n\r]/u', '', $string);
+
+        return $normalized ?? $string;
+    }
+
+    public static function sanitizePlainTextInput(string $string): string
+    {
+        $string = self::normalizePlainText($string);
+
+        return html_entity_decode(self::_getPurifier(['HTML.Allowed' => ''])->purify($string), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+
+    public static function decdec(string $str): string
+    {
+        Craft::$app->getDeprecator()->log(__METHOD__, 'StringHelper::decdec() is deprecated. Use the field-storage codec for persisted content or Craft’s security service for transient data.');
+        $stored = $str;
+        $key = Formie::$plugin->getSettings()->getSecurityKey();
+
+        if (strncmp($str, 'base64:', 7) === 0) {
+            $decoded = base64_decode(substr($str, 7), true);
+
+            if ($decoded === false) {
+                return $stored;
+            }
+
+            $str = $decoded;
+        }
+
+        if (strncmp($str, 'crypt:', 6) === 0) {
+            $decrypted = Craft::$app->getSecurity()->decryptByKey(substr($str, 6), $key);
+
+            return $decrypted === false ? $stored : $decrypted;
+        }
+
+        return $str;
+    }
+
+    public static function encenc(string $str): string
+    {
+        Craft::$app->getDeprecator()->log(__METHOD__, 'StringHelper::encenc() is deprecated. Use the field-storage codec for persisted content or Craft’s security service for transient data.');
+        $key = Formie::$plugin->getSettings()->getSecurityKey();
+
+        return 'base64:' . base64_encode('crypt:' . Craft::$app->getSecurity()->encryptByKey($str, $key));
+    }
+
+    public static function getCharacterCount(string $value): int
+    {
+        $text = self::_getPlainText($value);
+
+        // Browser `maxlength` counts newline characters as one character, so
+        // normalize transport-specific CRLF pairs before comparing lengths.
+        $text = str_replace(["\r\n", "\r"], "\n", $text);
+
+        $count = preg_match_all(self::GRAPHEME_PATTERN, $text);
+
+        return $count === false ? mb_strlen($text, 'UTF-8') : $count;
+    }
+
+    public static function getWordCount(string $value): int
+    {
+        $text = self::_getPlainText($value);
+        $count = preg_match_all(self::WORD_PATTERN, $text);
+
+        return $count === false ? strlen($text) : $count;
+    }
+
+    public static function normalizeText(string $value): string
+    {
+        $text = self::_getPlainText($value);
+        $normalized = preg_replace('/[\p{Z}\x{0009}-\x{000D}\x{0085}\x{FEFF}]+/u', ' ', $text);
+
+        return trim($normalized ?? $text);
+    }
+
+    private static function _getPlainText(string $value): string
+    {
+        // Strip all HTML tags (if any)
+        $text = strip_tags($value);
+
+        // Decode HTML entities (e.g. &#x1F389; → 🎉)
+        $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        // Browser form values are UTF-8; replace malformed transport bytes before
+        // applying Unicode-aware patterns so invalid input cannot bypass a limit.
+        return mb_scrub($text, 'UTF-8');
+    }
+
+    private static function _getPurifier(array $settings = []): Purifier
+    {
+        $key = json_encode($settings);
+
+        if (!isset(self::$_purifiers[$key])) {
+            // `HtmlPurifier::process()` requests a raw HTML definition, which HTMLPurifier never caches,
+            // so it rebuilds the definition on every call. That's too slow for values read in bulk, such
+            // as exports. Configure each purifier once, the same way as `process()`, and reuse it.
+            $config = HTMLPurifier_Config::create($settings);
+            $config->autoFinalize = false;
+            $config->set('Cache.SerializerPath', Craft::$app->getRuntimePath());
+            $config->set('Cache.SerializerPermissions', 0775);
+
+            HtmlPurifier::configure($config);
+
+            self::$_purifiers[$key] = new Purifier($config);
+        }
+
+        return self::$_purifiers[$key];
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    private const GRAPHEME_PATTERN = '/\X/u';
+    private const WORD_PATTERN = '/[^\p{Z}\x{0009}-\x{000D}\x{0085}\x{FEFF}]+/u';
+    private const ALLOWED_URL_PROTOCOLS = ['http', 'https', 'mailto', 'tel', 'ftp'];
+
+
+    // Properties
+    // =========================================================================
+
+    private static array $_purifiers = [];
+}

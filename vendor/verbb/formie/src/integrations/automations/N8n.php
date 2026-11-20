@@ -1,0 +1,109 @@
+<?php
+namespace verbb\formie\integrations\automations;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Automation;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\Json;
+
+use Throwable;
+
+class N8n extends Automation
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsConnection(): bool
+    {
+        return false;
+    }
+
+    public static function displayName(): string
+    {
+        return 'n8n';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[FormIntegrationSetting]
+    #[Sensitive]
+    public ?string $webhook = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to n8n.');
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+        $payload = [];
+        $response = [];
+
+        try {
+            $payload = $this->generatePayloadValues($submission);
+
+            $response = $this->deliverPayload($submission, $this->getEndpointUrl($this->webhook, $submission), $payload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+        } catch (Throwable $e) {
+            // Save a different payload to logs
+            Integration::error($this, Craft::t('formie', 'API error: “{message}” {file}:{line}. Payload: “{payload}”. Response: “{response}”', [
+                'message' => Integration::getExceptionLogMessage($e),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'payload' => Json::encode($payload),
+                'response' => Json::encode($response),
+            ]));
+
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['webhook'], 'required', 'on' => [Integration::SCENARIO_FORM]];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::textField([
+            'label' => Craft::t('formie', 'Webhook URL'),
+            'instructions' => Craft::t('formie', 'Enter the {name} webhook URL that will be triggered when a submission is made.', ['name' => $this->displayName()]),
+            'name' => 'webhook',
+            'required' => true,
+        ]);
+
+        $schema[] = SchemaHelper::integrationSendTestPayloadButtonField();
+
+        return $schema;
+    }
+}

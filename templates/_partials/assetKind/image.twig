@@ -1,0 +1,30 @@
+{% set class = class ~ ' overflow-hidden' %}
+{% set attributes = (attributes ?? {})|merge({
+    width: asset.getWidth(size), 
+    height: asset.getHeight(size),
+    class,
+}) %}
+
+{% switch asset.extension %}
+
+    {% case "svg" %}
+    
+        {{ svg(asset)|attr({
+            width: asset.getWidth(size), 
+            height: asset.getHeight(size),
+            class
+        }) }}
+
+    {% default %}
+        <picture {{ attr(attributes) }}>
+            {% if link|length %}
+                <a href="{{ link }}" {{ gallery ? 'data-gallery='~gallery : '' }}>
+
+            {% endif %}
+                {{ asset.getImg(size, ['1.5x', '2x', '3x']) }}
+            {% if link|length %}
+                </a>
+            {% endif %}
+        </picture>
+
+{% endswitch %}

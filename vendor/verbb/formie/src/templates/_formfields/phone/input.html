@@ -1,0 +1,31 @@
+{% set value = field.serializeValueForClientInput(value ?? null, element ?? null) %}
+{% import '_includes/forms' as forms %}
+
+{% extends 'formie/_formfields/field' %}
+
+{% block field %}
+    {{ forms.text({
+        id: field.handle,
+        type: 'tel',
+        name: field.handle ~ '[number]',
+        required: field.required ? true : false,
+        value: value.number ?? '',
+        inputAttributes: {
+            'data-formie-input': true,
+            'data-formie-phone-input': true,
+            'data-formie-input-type': 'tel',
+        },
+    }) }}
+
+    {% if field.countryEnabled %}
+        {{ tag('input', {
+            type: 'hidden',
+            name: field.handle ~ '[country]',
+            value: value.country ?? '',
+            'data-formie-input': true,
+            'data-formie-phone-country-input': true,
+            'data-formie-input-type': 'hidden',
+            'data-formie-country': true,
+        }) }}
+    {% endif %}
+{% endblock %}

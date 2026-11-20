@@ -1,0 +1,43 @@
+{% set showTitle = section.simplePlainText is not empty %}
+{% set showIntro = section.shortRichText is not empty %}
+{% set showIcon = section.iconPicture is not empty %}
+
+{% set totalWidth = 12 %}
+{% set colStop = 0 %}
+
+<section id="section-{{ entry.id }}" >
+    <div>
+        <div class="row">
+            {% if showTitle or showIntro or showIcon %}
+            
+                <div class="text-center pb-lg-17 pb-13 mb-3">
+                    {% if showIcon %}
+                        {{ section.iconPicture|first.render({
+                            size: "pictolg",
+                            classes: 'mb-5 mt-5' 
+                        }) }}
+                    {% endif %}
+                    {% if showTitle %}
+                        <h2 class="mw-xl-50 mw-lg-60 mx-lg-auto mb-8">{{ section.title }}</h2>
+                    {% endif %}
+                    {% if showIntro %}
+                        {{ section.shortRichText|attr({ clas: 'mw-xl-60 mw-lg-75 mx-lg-auto mb-0 ' }) }}
+                    {% endif %}
+                </div>
+
+            {% endif %}
+        
+            {% for contentBlock in section.contentBlocks %}
+                {% set rightWidth = contentBlock.width.right ?? 0 %}
+                {% set leftWidth = contentBlock.width.left ?? 12 %}
+                {% set colWidth = max(0, min(12, rightWidth - leftWidth)) %}
+                {% set colStart = max(0, min(12 - colStop, leftWidth - colStop)) %}
+                {% set colStop = colWidth + colStart + colStop %}
+                    <div id="content-{{ contentBlock.id }}" class="col-lg-{{ colWidth }} offset-lg-{{ colStart }}">
+                        {{ contentBlock.render() }}
+                    </div>
+                               
+            {% endfor %}
+        </div>
+    </div>
+</section>

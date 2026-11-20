@@ -1,0 +1,30 @@
+{% set link = entry.ctaLink ?? '#' %}
+{% set umami = (entry.umami is not empty) ? { 
+    'data-umami-event': entry.umami[0].umamiEvent[0],
+    'data-umami-event-detail': entry.umami[0].detail,
+ } : {} %}
+
+{% if entry.style %}
+
+    {% set classes = {
+        class: [
+            'link',
+            entry.colorSolid ? entry.colorSolid.color[0].text,
+            entry.alt ? 'link-alt' : 'link-prim',
+            'link-' ~ entry.size
+        ]
+    } %}
+
+{% else %}
+    {% set classes = {
+        class: [
+            'btn',
+            'btn-'~entry.size,
+            entry.colorCombo ? entry.colorCombo.class,
+            entry.alt ? 'btn-alt' : 'btn-prim'
+        ]
+    } %}
+    
+{% endif %}
+
+{{ entry.ctaLink.link|attr(classes|merge(umami)) }}

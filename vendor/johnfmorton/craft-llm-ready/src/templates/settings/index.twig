@@ -1,0 +1,452 @@
+{% import '_includes/forms.twig' as forms %}
+
+{# Settings present in the plugin's config file (config/llm-ready.php, or
+   config/craft/llm-ready.php on Craft 6) override the control panel.
+   Mirror Craft's own general-settings treatment: a warning line under the
+   field and the input disabled, so nobody flips a switch that has no
+   effect. `overridden` is the list of keys the config file sets. #}
+{% set overridden = (configOverrides ?? {})|keys %}
+{% macro configWarning(setting, configFile) -%}
+    {{ 'This is being overridden by the {setting} setting in {file}.'|t('llm-ready', {
+        setting: '<code>' ~ setting ~ '</code>',
+        file: '<code>' ~ configFile ~ '</code>',
+    })|raw }}
+{%- endmacro %}
+{% from _self import configWarning %}
+
+{{ forms.lightswitchField({
+    label: 'Enabled',
+    instructions: 'Whether LLM Ready is globally enabled.',
+    id: 'enabled',
+    name: 'enabled',
+    warning: 'enabled' in overridden ? configWarning('enabled', configFile) : null,
+    disabled: 'enabled' in overridden,
+    on: settings.enabled,
+}) }}
+
+<hr>
+
+<h2>Detection Methods</h2>
+
+{{ forms.lightswitchField({
+    label: 'Content Negotiation',
+    instructions: 'Serve Markdown when the request includes an <code>Accept: text/markdown</code> header.',
+    id: 'enableContentNegotiation',
+    name: 'enableContentNegotiation',
+    warning: 'enableContentNegotiation' in overridden ? configWarning('enableContentNegotiation', configFile) : null,
+    disabled: 'enableContentNegotiation' in overridden,
+    on: settings.enableContentNegotiation,
+}) }}
+
+{# AI Bot User-Agent Detection (design 4b): field header with two lines
+   of instructions, the long explanation behind a "When is it unsafe?"
+   disclosure, the lightswitch with a visible inline label, then the Cache
+   check pane — distinct objects instead of one prose block. #}
+{% set uaDetectionHtml %}
+    <details class="llm-ready-unsafe">
+        <summary><span class="llm-ready-caret">▶</span> {{ 'When is it unsafe? (Cloudflare, Fastly, Varnish, Servd…)'|t('llm-ready') }}</summary>
+        <p>{{ 'Shared caches don’t key on User-Agent, so a Markdown response generated for a bot can be stored and replayed to human visitors on the same URL. Any CDN or full-page cache (Blitz included) in front of the site makes this setting unsafe on canonical URLs. Use the cache check below if unsure.'|t('llm-ready') }}</p>
+    </details>
+
+    <div class="llm-ready-ua-switch">
+        {{ forms.lightswitch({
+            id: 'enableUserAgentDetection',
+            name: 'enableUserAgentDetection',
+            on: settings.enableUserAgentDetection,
+            labelId: 'enableUserAgentDetection-label',
+            disabled: 'enableUserAgentDetection' in overridden,
+        }) }}
+        <span id="enableUserAgentDetection-label" class="llm-ready-ua-switch__label">{{ 'Serve Markdown to known AI bots'|t('llm-ready') }}</span>
+    </div>
+    {% if 'enableUserAgentDetection' in overridden %}
+        <p class="warning with-icon">{{ configWarning('enableUserAgentDetection', configFile) }}</p>
+    {% endif %}
+
+    {% include 'llm-ready/_partials/cache-check' with cacheCheck only %}
+{% endset %}
+
+{{ forms.field({
+    label: 'AI Bot User-Agent Detection',
+    instructions: 'Serve Markdown on the **canonical** URL to known AI crawlers (GPTBot, ClaudeBot, etc.). Off by default — and keep it off behind a shared cache or CDN, where cached Markdown can reach real visitors.',
+}, uaDetectionHtml) }}
+
+{% css %}
+.llm-ready-unsafe {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #596673;
+}
+.llm-ready-unsafe > summary {
+    cursor: pointer;
+    list-style: none;
+    color: #1f5f9e;
+}
+.llm-ready-unsafe > summary::-webkit-details-marker {
+    display: none;
+}
+.llm-ready-unsafe > summary:hover {
+    color: #12437a;
+    text-decoration: underline;
+}
+.llm-ready-unsafe .llm-ready-caret {
+    display: inline-block;
+    font-size: 9px;
+    transition: transform .15s;
+}
+.llm-ready-unsafe[open] > summary .llm-ready-caret {
+    transform: rotate(90deg);
+}
+.llm-ready-unsafe > p {
+    margin: 8px 0 0;
+    line-height: 1.5;
+    max-width: 640px;
+}
+.llm-ready-ua-switch {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 16px;
+}
+.llm-ready-ua-switch__label {
+    font-size: 14px;
+    color: #3f4d5a;
+}
+{% endcss %}
+
+{% set botListNotes = [] %}
+{% if 'additionalBotUserAgents' in overridden %}
+    {% set botListNotes = botListNotes|merge([configWarning('additionalBotUserAgents', configFile)]) %}
+{% endif %}
+{% for key in ['botUserAgents', 'excludeBotUserAgents']|filter(k => k in overridden) %}
+    {% set botListNotes = botListNotes|merge(['{file} also sets {setting}, which changes the effective bot list.'|t('llm-ready', {
+        setting: '<code>' ~ key ~ '</code>',
+        file: '<code>' ~ configFile ~ '</code>',
+    })]) %}
+{% endfor %}
+{{ forms.editableTableField({
+    label: 'Additional Bot User-Agents',
+    instructions: 'Add custom user-agent strings to detect as AI bots.',
+    id: 'additionalBotUserAgents',
+    name: 'additionalBotUserAgents',
+    warning: botListNotes ? botListNotes|join(' ')|raw : null,
+    static: 'additionalBotUserAgents' in overridden,
+    cols: {
+        value: {
+            heading: 'User-Agent String',
+            type: 'singleline',
+        },
+    },
+    rows: settings.additionalBotUserAgents|map(ua => { value: ua }),
+    allowAdd: true,
+    allowDelete: true,
+    allowReorder: true,
+}) }}
+
+<hr>
+
+<h2>Content Extraction</h2>
+
+{{ forms.textField({
+    label: 'Content Selector',
+    instructions: 'CSS selectors for extracting main content from HTML (comma-separated). Used when no dedicated LLM template is configured.',
+    id: 'contentSelector',
+    name: 'contentSelector',
+    warning: 'contentSelector' in overridden ? configWarning('contentSelector', configFile) : null,
+    disabled: 'contentSelector' in overridden,
+    value: settings.contentSelector,
+    placeholder: 'main, article, [role="main"], .content, #content',
+}) }}
+
+{{ forms.textField({
+    label: 'Exclude Selector',
+    instructions: 'CSS selectors for elements to remove from the HTML before Markdown conversion (comma-separated). Use this for decorative or non-content elements such as carousels, marquees, or anything marked with `[data-nosnippet]`.',
+    id: 'excludeSelector',
+    name: 'excludeSelector',
+    warning: 'excludeSelector' in overridden ? configWarning('excludeSelector', configFile) : null,
+    disabled: 'excludeSelector' in overridden,
+    value: settings.excludeSelector,
+    placeholder: '.carousel, [data-nosnippet], newsletter-signup',
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Flatten Card Links',
+    instructions: 'Rewrite links that wrap a whole card (image, heading, date) into one line: the heading as the link, the rest as plain text after it.',
+    id: 'flattenCardLinks',
+    name: 'flattenCardLinks',
+    warning: 'flattenCardLinks' in overridden ? configWarning('flattenCardLinks', configFile) : null,
+    disabled: 'flattenCardLinks' in overridden,
+    on: settings.flattenCardLinks,
+}) }}
+
+{# `htmlConverterOptions` is config-file only. Its `remove_nodes` key replaces
+   this list outright, so it disables the field the way a direct override does. #}
+{% set excludeElementsConfigKey = (configOverrides.htmlConverterOptions ?? {}).remove_nodes is defined %}
+{% set excludeElementsNotes = [] %}
+{% if 'excludeElements' in overridden %}
+    {% set excludeElementsNotes = excludeElementsNotes|merge([configWarning('excludeElements', configFile)]) %}
+{% endif %}
+{% if excludeElementsConfigKey %}
+    {% set excludeElementsNotes = excludeElementsNotes|merge(['{file} sets {setting}, which replaces this list.'|t('llm-ready', {
+        setting: '<code>htmlConverterOptions.remove_nodes</code>',
+        file: '<code>' ~ configFile ~ '</code>',
+    })]) %}
+{% endif %}
+{{ forms.textField({
+    label: 'Excluded Elements',
+    instructions: 'HTML elements to remove during Markdown conversion, along with everything inside them (comma-separated tag names). The default removes scripts, styles, navigation, page headers and footers, media embeds, forms and inline SVG — take `header` and `footer` out if your articles use them for the title block or byline, or add your own, such as `aside` or `newsletter-signup`. Clear the field to remove nothing. For classes, IDs and attributes, use Exclude Selector above.',
+    id: 'excludeElements',
+    name: 'excludeElements',
+    warning: excludeElementsNotes ? excludeElementsNotes|join(' ')|raw : null,
+    disabled: 'excludeElements' in overridden or excludeElementsConfigKey,
+    value: settings.excludeElements,
+    placeholder: constant('johnfmorton\\llmready\\models\\Settings::DEFAULT_EXCLUDE_ELEMENTS'),
+    errors: settings.getErrors('excludeElements'),
+}) }}
+
+<hr>
+
+<h2>Response Headers</h2>
+
+{{ forms.lightswitchField({
+    label: 'X-Robots-Tag: noindex',
+    instructions: 'Add a <code>noindex</code> header to Markdown responses to prevent search engines from indexing them.',
+    id: 'noindexHeader',
+    name: 'noindexHeader',
+    warning: 'noindexHeader' in overridden ? configWarning('noindexHeader', configFile) : null,
+    disabled: 'noindexHeader' in overridden,
+    on: settings.noindexHeader,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Auto-inject Discovery Tag',
+    instructions: 'Automatically add <code>&lt;link rel="alternate" type="text/markdown"&gt;</code> to HTML pages.',
+    id: 'autoInjectDiscoveryTag',
+    name: 'autoInjectDiscoveryTag',
+    warning: 'autoInjectDiscoveryTag' in overridden ? configWarning('autoInjectDiscoveryTag', configFile) : null,
+    disabled: 'autoInjectDiscoveryTag' in overridden,
+    on: settings.autoInjectDiscoveryTag,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Auto-inject Link Header',
+    instructions: 'Add an HTTP <code>Link</code> response header (RFC 8288) pointing at the Markdown alternate. Useful for crawlers that inspect headers without parsing HTML.',
+    id: 'autoInjectLinkHeader',
+    name: 'autoInjectLinkHeader',
+    warning: 'autoInjectLinkHeader' in overridden ? configWarning('autoInjectLinkHeader', configFile) : null,
+    disabled: 'autoInjectLinkHeader' in overridden,
+    on: settings.autoInjectLinkHeader,
+}) }}
+
+<hr>
+
+<h2>Caching</h2>
+
+{{ forms.textField({
+    label: 'Cache TTL (seconds)',
+    instructions: 'How long to cache Markdown output. <code>/llms.txt</code> and section listing pages are rebuilt in the background once their copy is this old, or as soon as content changes, and the previous copy is served until the new one is ready. Set to <code>0</code> to disable caching — on a large site that builds them on every request, which can be slow enough to time out.',
+    id: 'cacheTtl',
+    name: 'cacheTtl',
+    warning: 'cacheTtl' in overridden ? configWarning('cacheTtl', configFile) : null,
+    disabled: 'cacheTtl' in overridden,
+    value: settings.cacheTtl,
+    type: 'number',
+    min: 0,
+    size: 10,
+}) }}
+
+<hr>
+
+<h2>llms.txt</h2>
+
+{{ forms.lightswitchField({
+    label: 'Enable llms.txt',
+    instructions: 'Serve <code>/llms.txt</code> and <code>/.well-known/llms.txt</code>. Turn this off to remove the route — it will return a 404, and the home page stops advertising it — while leaving <code>.md</code> URLs, content negotiation and discovery tags working.',
+    id: 'enableLlmsTxt',
+    name: 'enableLlmsTxt',
+    warning: 'enableLlmsTxt' in overridden ? configWarning('enableLlmsTxt', configFile) : null,
+    disabled: 'enableLlmsTxt' in overridden,
+    on: settings.enableLlmsTxt,
+}) }}
+
+<p class="light">Site Title and Site Description accept plain text, or a Craft object template with the site available as <code>site</code>. A template can read a field that content editors manage — on a global set, e.g. <code>{{ '{{ siteInfo.llmTitle }}' }}</code>, or on a Single, e.g. <code>{{ "{{ craft.entries.section('siteInfo').site(site).one().llmDescription ?? '' }}" }}</code> — so the value lives in content rather than project config and can differ per site. See <a href="https://github.com/johnfmorton/craft-llm-ready/blob/main/DOCUMENTATION.md#letting-editors-manage-the-site-title-and-description">Letting editors manage the site title and description</a>.</p>
+
+{{ forms.textField({
+    label: 'Site Title',
+    instructions: 'The <code>/llms.txt</code> H1 heading. Leave blank to use the site\'s name, which is per site — a fixed title here applies to every site. Collapsed to one line; a template that renders to nothing falls back to the site\'s name.',
+    id: 'llmsTxtTitle',
+    name: 'llmsTxtTitle',
+    warning: 'llmsTxtTitle' in overridden ? configWarning('llmsTxtTitle', configFile) : null,
+    disabled: 'llmsTxtTitle' in overridden,
+    value: settings.llmsTxtTitle,
+    placeholder: 'e.g., Acme Developer Docs',
+}) }}
+
+{{ forms.textareaField({
+    label: 'Site Description',
+    instructions: 'Introduction text for <code>/llms.txt</code>, shown as a blockquote below the heading. Rich text is reduced to plain text with paragraph breaks kept; a template that renders to nothing omits the blockquote.',
+    id: 'llmsTxtIntro',
+    name: 'llmsTxtIntro',
+    warning: 'llmsTxtIntro' in overridden ? configWarning('llmsTxtIntro', configFile) : null,
+    disabled: 'llmsTxtIntro' in overridden,
+    value: settings.llmsTxtIntro,
+    rows: 4,
+}) }}
+
+{{ forms.textField({
+    label: 'Entries per Section',
+    instructions: 'How many of each section\'s most recent entries <code>/llms.txt</code> lists. Set to <code>0</code> to list every entry. A higher limit makes the file larger and slower to build — run <code>php craft llm-ready/indexes/regenerate</code> after deploys to build it ahead of visitors.',
+    id: 'llmsTxtEntryLimit',
+    name: 'llmsTxtEntryLimit',
+    warning: 'llmsTxtEntryLimit' in overridden ? configWarning('llmsTxtEntryLimit', configFile) : null,
+    disabled: 'llmsTxtEntryLimit' in overridden,
+    value: settings.llmsTxtEntryLimit,
+    type: 'number',
+    min: 0,
+    size: 10,
+    errors: settings.getErrors('llmsTxtEntryLimit'),
+}) }}
+
+{{ forms.textField({
+    label: 'Description Field',
+    instructions: 'Field handle to use for entry descriptions in <code>/llms.txt</code> and listing pages (e.g., <code>summary</code>, <code>excerpt</code>). Use dot notation to traverse sub-fields and sub-objects (e.g., <code>seo.seoDescription</code> for a ContentBlock sub-field, or <code>seo.description</code> for an Ether SEO field). Append <code>()</code> to call a no-argument method (e.g., <code>myField.getResolvedValue()</code>). Generated Field handles are also supported. For SEOmatic, use the special value <code>seomatic:description</code> to invoke SEOmatic\'s full resolution chain. See <a href="https://github.com/johnfmorton/craft-llm-ready/blob/main/SEO-PLUGINS.md">SEO-PLUGINS.md</a> for SEOmatic, Ether SEO, SEOmate, and SEO Fields recipes. Leave blank to auto-extract from the first text field. When set, the configured field is authoritative — no fallback is attempted if it resolves to nothing.',
+    id: 'descriptionField',
+    name: 'descriptionField',
+    warning: 'descriptionField' in overridden ? configWarning('descriptionField', configFile) : null,
+    disabled: 'descriptionField' in overridden,
+    value: settings.descriptionField,
+    placeholder: 'e.g., summary or seo.seoDescription',
+}) }}
+
+<hr>
+
+<h2>Listing Pages</h2>
+
+{{ forms.textField({
+    label: 'Entries per Listing Page',
+    instructions: 'How many of a section\'s most recent entries its listing page lists — the page at the section\'s base URL plus <code>.md</code>, e.g. <code>/blog.md</code>. Set to <code>0</code> to list every entry. A higher limit makes the page larger and slower to build — run <code>php craft llm-ready/indexes/regenerate</code> after deploys to build it ahead of visitors.',
+    id: 'listingPageEntryLimit',
+    name: 'listingPageEntryLimit',
+    warning: 'listingPageEntryLimit' in overridden ? configWarning('listingPageEntryLimit', configFile) : null,
+    disabled: 'listingPageEntryLimit' in overridden,
+    value: settings.listingPageEntryLimit,
+    type: 'number',
+    min: 0,
+    size: 10,
+    errors: settings.getErrors('listingPageEntryLimit'),
+}) }}
+
+<hr>
+
+<h2>Front Matter</h2>
+
+<p class="light">Overrides for the YAML front matter that appears at the top of each Markdown response.</p>
+
+{{ forms.textField({
+    label: 'Title Field',
+    instructions: 'Optional field handle used for the front-matter <code>title:</code> value. Supports the same syntax as Description Field (dot notation, <code>()</code> method calls, Generated Field handles, and <code>seomatic:title</code>), or a Craft object template for custom logic with the entry available as <code>entry</code> — e.g. <code>{{ entry.longTitle ?: entry.title }}</code>. Leave blank to use the entry\'s native title. If set but resolving to an empty value, falls back to the entry\'s native title — every Markdown response always has a title. See <a href="https://github.com/johnfmorton/craft-llm-ready/blob/main/DOCUMENTATION.md#customizing-the-title-and-author">Customizing the title and author</a> for examples.',
+    id: 'titleField',
+    name: 'titleField',
+    warning: 'titleField' in overridden ? configWarning('titleField', configFile) : null,
+    disabled: 'titleField' in overridden,
+    value: settings.titleField,
+    placeholder: 'e.g., longTitle or seomatic:title',
+}) }}
+
+{{ forms.textField({
+    label: 'Author Override',
+    instructions: 'Leave blank to use each entry\'s own authors (all of them, comma-separated, on multi-author entries). Enter a fixed name, such as an editorial team, to use it on every entry instead of individual editor names. For per-entry logic, enter a Craft object template with the entry available as <code>entry</code> — e.g. <code>{% if entry.section.handle == \'blog\' %}{{ entry.authors|map(a =&gt; a.fullName ?: a.username)|join(\', \') }}{% endif %}</code> shows the authors in the blog section only. A template that renders to nothing omits the <code>author:</code> line. See <a href="https://github.com/johnfmorton/craft-llm-ready/blob/main/DOCUMENTATION.md#customizing-the-title-and-author">Customizing the title and author</a> for more examples, including combining several author fields.',
+    id: 'authorOverride',
+    name: 'authorOverride',
+    warning: 'authorOverride' in overridden ? configWarning('authorOverride', configFile) : null,
+    disabled: 'authorOverride' in overridden,
+    value: settings.authorOverride,
+    placeholder: 'e.g., Acme Editorial Team',
+}) }}
+
+<hr>
+
+<h2>Analytics</h2>
+
+{{ forms.lightswitchField({
+    label: 'Enable Analytics',
+    instructions: 'Log requests to <code>.md</code> pages, <code>/llms.txt</code>, and content negotiation responses for the analytics dashboard.',
+    id: 'enableAnalytics',
+    name: 'enableAnalytics',
+    warning: 'enableAnalytics' in overridden ? configWarning('enableAnalytics', configFile) : null,
+    disabled: 'enableAnalytics' in overridden,
+    on: settings.enableAnalytics,
+}) }}
+
+{{ forms.textField({
+    label: 'Data Retention (days)',
+    instructions: 'How many days of analytics data to keep. Older data can be purged via the dashboard or the <code>llm-ready/analytics/purge</code> console command.',
+    id: 'analyticsRetentionDays',
+    name: 'analyticsRetentionDays',
+    warning: 'analyticsRetentionDays' in overridden ? configWarning('analyticsRetentionDays', configFile) : null,
+    disabled: 'analyticsRetentionDays' in overridden,
+    value: settings.analyticsRetentionDays,
+    type: 'number',
+    min: 1,
+    size: 10,
+}) }}
+
+<hr>
+
+<h2>Section Settings</h2>
+<p class="light">Configure which sections serve Markdown output and optionally assign dedicated LLM templates. <strong>Label</strong> is the name used in <code>/llms.txt</code> and Markdown output. Leave blank to use the section name.</p>
+
+{% for sectionInfo in sectionData %}
+    <h3 style="margin-top: 24px;">{{ sectionInfo.section.name }} <span class="light">({{ sectionInfo.type }})</span></h3>
+
+    <table class="data fullwidth">
+        <thead>
+            {# Explicit widths keep every section's table aligned — each is a
+               separate <table>, so without them the browser would size the
+               columns from the site names in that table alone. #}
+            <tr>
+                <th style="width: 25%;">Site</th>
+                <th style="width: 10%;">Enabled</th>
+                <th style="width: 35%;">LLM Template</th>
+                <th style="width: 30%;">Label</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for siteInfo in sectionInfo.sites %}
+                <tr>
+                    <td>{{ siteInfo.site.name }}</td>
+                    <td>
+                        {% set toggleName = 'sectionSettings[' ~ sectionInfo.section.id ~ '][' ~ siteInfo.site.id ~ '][enabled]' %}
+                        <div>
+                            {{ forms.lightswitch({
+                                name: toggleName,
+                                on: siteInfo.enabled,
+                                small: true,
+                            }) }}
+                        </div>
+                    </td>
+                    <td>
+                        {% set templateName = 'sectionSettings[' ~ sectionInfo.section.id ~ '][' ~ siteInfo.site.id ~ '][llmTemplate]' %}
+                        {{ forms.text({
+                            name: templateName,
+                            value: siteInfo.llmTemplate,
+                            placeholder: 'e.g., _llm/blog',
+                        }) }}
+                    </td>
+                    <td>
+                        {% set labelName = 'sectionSettings[' ~ sectionInfo.section.id ~ '][' ~ siteInfo.site.id ~ '][label]' %}
+                        {{ forms.text({
+                            name: labelName,
+                            value: siteInfo.label,
+                            placeholder: sectionInfo.section.name,
+                            maxlength: 255,
+                        }) }}
+                    </td>
+                </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endfor %}
+
+{% if sectionData is empty %}
+    <p class="zilch">No sections with URLs found.</p>
+{% endif %}

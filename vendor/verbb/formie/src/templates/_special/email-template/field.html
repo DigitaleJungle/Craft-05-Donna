@@ -1,0 +1,11 @@
+<p>
+    {% if field.hasReferenceBlockLabel() and not (renderOptions.hideName ?? false) %}
+        <strong>{{ field.label }}</strong><br>
+    {% endif %}
+
+    {% if field.isValueEmpty(value, submission) and field.hasReferenceBlockPlaceholder() %}
+        {{ notification.getPlaceholder() }}
+    {% else %}
+        {{ field.getReferenceBlockHtml(submission, notification, value) | raw }}
+    {% endif %}
+</p>

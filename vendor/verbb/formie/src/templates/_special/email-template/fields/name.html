@@ -1,0 +1,21 @@
+{% apply spaceless %}
+    {% if value and field.settings.useMultipleFields %}
+        {% for field in field.getEnabledFields() %}
+            {% set value = submission.getFieldValue(field.valueKey()) ?? field.getInitialValue(submission) %}
+
+            {% if field.hasReferenceBlockLabel() %}
+                <strong>{{ field.label }}:</strong>
+            {% endif %}
+
+            {% if field.isValueEmpty(value, submission) and field.hasReferenceBlockPlaceholder() %}
+                {{ notification.getPlaceholder() }}
+            {% else %}
+                {{ field.getReferenceBlockHtml(submission, notification, value) | raw }}
+            {% endif %}
+
+            <br>
+        {% endfor %}
+    {% else %}
+        {{ field.getValueAsString(value, submission) }}
+    {% endif %}
+{% endapply %}

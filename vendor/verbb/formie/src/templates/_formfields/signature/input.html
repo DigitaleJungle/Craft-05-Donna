@@ -1,0 +1,46 @@
+<div class="fui-signature formie-signature-pad" data-formie-signature-pad>
+    <canvas
+        class="formie-signature-canvas"
+        data-formie-signature-canvas
+        width="640"
+        height="180"
+        style="display: block; width: 100%;"
+    ></canvas>
+
+    <p
+        class="formie-signature-message"
+        data-formie-signature-message
+        data-formie-signature-message-no-canvas="{{ 'This browser does not support canvas, which is required for signatures.' | t('formie') }}"
+        data-formie-signature-message-init-failed="{{ 'The signature pad could not be loaded. Try refreshing the page.' | t('formie') }}"
+        role="status"
+        hidden
+    ></p>
+
+    <input type="hidden" name="{{ field.handle }}" value="{{ value ?? '' }}" data-formie-signature-input>
+
+    <div class="formie-signature-actions">
+        {% if downloadUrl %}
+            <a
+                href="{{ downloadUrl }}"
+                class="btn"
+                download="{{ field.handle ~ '-signature.png' }}"
+            >
+                {{- 'Download' | t('formie') -}}
+            </a>
+        {% endif %}
+
+        <button
+            type="button"
+            class="btn"
+            data-formie-signature-clear
+            aria-label="{{ 'Clear signature' | t('formie') }}"
+            title="{{ 'Clear signature' | t('formie') }}"
+        >
+            {{- 'Clear' | t('formie') -}}
+        </button>
+    </div>
+</div>
+
+<noscript>
+    <p class="formie-signature-message formie-signature-message-noscript">{{ 'Signatures require JavaScript. Enable JavaScript to sign this form.' | t('formie') }}</p>
+</noscript>

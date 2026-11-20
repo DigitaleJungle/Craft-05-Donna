@@ -1,0 +1,10 @@
+{% set value = field.serializeValueForClientInput(value ?? null, element ?? null) %}
+{{ fieldtag('fieldInput', {
+    value: value.number ?? null,
+}) }}
+
+{% if field.countryEnabled %}
+    {{ fieldtag('fieldCountryInput', {
+        value: value.country ?? null,
+    }) }}
+{% endif %}

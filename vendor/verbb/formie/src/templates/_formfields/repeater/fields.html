@@ -1,0 +1,48 @@
+{% set element = element ?? null %}
+
+{% set html %}
+    <fieldset class="formie-repeater-item-wrapper" data-formie-repeater-item-wrapper>
+        {% set index = index ?? '__ROW__' %}
+
+        {# Namespace tag can't handle `0`, which is what our indexes start at, being arrays #}
+        {% set namespace = index != '__ROW__' ? 'row' ~ (index + 1) : index %}
+        
+        {% namespace namespace %}
+            <div class="formie-nested-field-rows" data-formie-nested-field-rows>
+                {% for row in field.getRows(index) %}
+                    <div class="formie-nested-field-row" data-formie-nested-field-row>
+                        {% for field in row.getFields() %}
+                            {% include 'formie/_formfields/repeater/field' with {
+                                field: field,
+                                element: element,
+                                required: field.required,
+                            } only %}
+                        {% endfor %}
+                    </div>
+                {% endfor %}
+            </div>
+        {% endnamespace %}
+
+        {% set buttonAttributes = {
+            class: 'btn formie-button formie-button-icon formie-repeater-remove-button',
+            type: 'button',
+            'data-remove-repeater-row': field.handle,
+            'data-formie-repeater-remove': true,
+            'data-formie-icon': 'close',
+            'aria-label': 'Remove row' | t('formie'),
+            'title': 'Remove row' | t('formie'),
+        } %}
+
+        <button {{ attr(buttonAttributes) }}>
+            {{ 'Remove' | t('formie') }}
+        </button>
+    </fieldset>
+{% endset %}
+
+{{ tag('div', {
+    class: 'formie-nested-field formie-repeater-item',
+    'data-repeater-row': true,
+    'data-formie-repeater-item': true,
+    'data-formie-repeater-item-id': index,
+    html: html,
+}) }}

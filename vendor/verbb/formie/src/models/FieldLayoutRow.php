@@ -1,0 +1,208 @@
+<?php
+namespace verbb\formie\models;
+
+use verbb\formie\Formie;
+use verbb\formie\base\FieldInterface;
+use verbb\formie\elements\Form;
+use verbb\formie\helpers\FieldTraversal;
+use verbb\formie\helpers\ValidationHelper;
+
+use Craft;
+use craft\base\SavableComponent;
+
+class FieldLayoutRow extends SavableComponent
+{
+    // Properties
+    // =========================================================================
+
+    // public ?int $ownerId = null;
+    public ?int $layoutId = null;
+    public ?int $pageId = null;
+    public ?int $sortOrder = null;
+    public ?string $uid = null;
+
+    private ?Form $_form = null;
+    private ?FieldLayout $_layout = null;
+    private ?FieldLayoutPage $_page = null;
+    private array $_fields = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getForm(): ?Form
+    {
+        if ($this->_form || !$this->layoutId) {
+            return $this->_form;
+        }
+
+        return $this->_form = Formie::$plugin->getForms()->getFormByLayoutId($this->layoutId);
+    }
+
+    public function getLayout(): ?FieldLayout
+    {
+        if ($this->_layout || !$this->layoutId) {
+            return $this->_layout;
+        }
+
+        return $this->_layout = Formie::$plugin->getFields()->getLayoutById($this->layoutId);
+    }
+
+    public function getPage(): ?FieldLayoutPage
+    {
+        if ($this->_page || !$this->pageId) {
+            return $this->_page;
+        }
+
+        return $this->_page = Formie::$plugin->getFields()->getPageById($this->pageId);
+    }
+
+    public function getFields(): array
+    {
+        return $this->_hydrateFields();
+    }
+
+    public function getEnabledFields(): array
+    {
+        return array_values(array_filter($this->getFields(), static fn(FieldInterface $field) => !$field->getIsDisabled()));
+    }
+
+    public function getRenderableFields(): array
+    {
+        return array_values(array_filter($this->getEnabledFields(), static fn(FieldInterface $field) => !$field->getIsBuilderField()));
+    }
+
+    public function getFieldsRecursively(): array
+    {
+        return FieldTraversal::recursively($this->getFields());
+    }
+
+    public function setFields(array $fields): void
+    {
+        // Store raw field config payloads until the row is actually asked for field objects.
+        // Formie layouts are much more form-specific than Craft's global field registry, so the lazy
+        // seam lives here as well: layout hydration can stay cheap, while callers still get the same
+        // concrete `FieldInterface` instances once they traverse into a row.
+        $this->_fields = [];
+
+        foreach ($fields as $field) {
+            $this->_fields[] = $field;
+        }
+    }
+
+    public function withParentField(FieldInterface $parent, string|int|null $namespace = null): self
+    {
+        $row = clone $this;
+        $row->_fields = array_map(
+            static fn(FieldInterface $field) => $field->withParentField($parent, $namespace),
+            $this->_hydrateFields(),
+        );
+
+        return $row;
+    }
+
+    public function getFieldByHandle(string $handle): ?FieldInterface
+    {
+        foreach ($this->getFields() as $field) {
+            if ($field->handle === $handle) {
+                return $field;
+            }
+        }
+
+        return null;
+    }
+
+    public function getIsHidden(): bool
+    {
+        $fields = [];
+
+        foreach ($this->getEnabledFields() as $field) {
+            if (!$field->getIsHidden()) {
+                $fields[] = $field;
+            }
+        }
+
+        return !(bool)$fields;
+    }
+
+    public function getFormBuilderConfig(): array
+    {
+        return [
+            'id' => $this->id,
+            'layoutId' => $this->layoutId,
+            'pageId' => $this->pageId,
+            'errors' => $this->getErrors(),
+            'fields' => array_map(function($field) {
+                return $field->getFormBuilderConfig();
+            }, $this->getFields()),
+        ];
+    }
+
+    public function getCpEditConfig(): array
+    {
+        return [
+            'fields' => array_values(array_filter(array_map(static function(FieldInterface $field) {
+                if ($field->getIsBuilderField()) {
+                    return null;
+                }
+
+                return $field->getCpEditConfig();
+            }, $this->getEnabledFields()))),
+        ];
+    }
+
+    public function getClientRenderedDefinition(): array
+    {
+        return [
+            'fields' => array_values(array_filter(array_map(static function(FieldInterface $field) {
+                if ($field->getIsBuilderField()) {
+                    return null;
+                }
+
+                return $field->getClientRenderedDefinition();
+            }, $this->getEnabledFields()))),
+        ];
+    }
+
+    public function validateFields(): void
+    {
+        foreach ($this->getFields() as $fieldKey => $field) {
+            if (!$field->validate()) {
+                ValidationHelper::addPrefixedErrors($this, $field->getErrors(), "fields.$fieldKey");
+            }
+        }
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['fields'], 'validateFields'];
+
+        return $rules;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _hydrateFields(): array
+    {
+        $fieldsService = Formie::$plugin->getFields();
+
+        foreach ($this->_fields as $fieldKey => $field) {
+            if ($field instanceof FieldInterface) {
+                continue;
+            }
+
+            $this->_fields[$fieldKey] = $fieldsService->hydrateField($field);
+        }
+
+
+        return $this->_fields;
+    }
+}

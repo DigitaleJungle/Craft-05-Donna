@@ -1,0 +1,29 @@
+<div class="accordions">
+    <ul class="accordion">
+        {% for question in entry.faq %}
+            <li {% if loop.first %}class="active"{% endif %}>
+                <a>{{ question.title }}</a>
+                <span>{{ question.answer }}</span>
+            </li>
+        {% endfor %}
+    </ul>
+</div>
+
+<script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+        {% for question in entry.faq.all() %}
+        {
+            "@type": "Question",
+            "name": {{ question.title|json_encode|raw }},
+            "acceptedAnswer": {
+                "@type": "Answer",
+                "text": {{ question.answer|json_encode|raw }}
+            }
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+    ]
+}
+</script>

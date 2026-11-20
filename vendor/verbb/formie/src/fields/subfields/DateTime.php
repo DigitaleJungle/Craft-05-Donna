@@ -1,0 +1,71 @@
+<?php
+namespace verbb\formie\fields\subfields;
+
+use verbb\formie\base\ChildFieldInterface;
+use verbb\formie\fields\SingleLineText;
+use verbb\formie\fields\subfields\traits\DateSubFieldValueTrait;
+use verbb\formie\models\SlotTag;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+
+class DateTime extends SingleLineText implements ChildFieldInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Date - Time');
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    protected const DEFAULT_INPUT_TEMPLATE_PATH = 'fields/single-line-text';
+    protected const DEFAULT_REFERENCE_BLOCK_TEMPLATE_PATH = 'fields/single-line-text';
+
+
+    // Traits
+    // =========================================================================
+
+    use DateSubFieldValueTrait;
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        $tag = parent::defineSlotTag($key, $context);
+
+        if ($key === 'fieldInput') {
+            // Core attributes take precedence over the saved sub-field input attributes.
+            $tag?->mergeCoreAttributes(['type' => 'time']);
+        }
+
+        if ($key === 'fieldInput' && $this->getParentField()?->getDisplayType() === 'datePicker') {
+            $attributes = array_filter(
+                $this->getInputAttributes(),
+                fn($value, $attribute) => $attribute !== 'type',
+                ARRAY_FILTER_USE_BOTH,
+            );
+
+            $tag?->mergeCoreAttributes(['type' => 'text']);
+            $tag?->mergeInstanceAttributes($attributes);
+            $tag?->mergeInstanceAttributes([
+                'data-formie-date-datepicker-input' => true,
+            ]);
+        }
+
+        return $tag;
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        return array_merge(parent::defineClientRenderedInput(), [
+            'inputType' => 'time',
+        ]);
+    }
+}

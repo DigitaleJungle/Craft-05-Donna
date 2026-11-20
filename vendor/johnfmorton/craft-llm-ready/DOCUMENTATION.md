@@ -1,0 +1,895 @@
+# LLM Ready Documentation
+
+LLM Ready serves Markdown versions of your Craft CMS pages to AI crawlers and large language models. It works out of the box with zero template changes — install the plugin and your content is immediately available as Markdown.
+
+> **Using an AI coding assistant?** Point your agent to [AI-INSTALL.md](AI-INSTALL.md) for a step-by-step installation and configuration runbook designed for Claude Code, Codex, Gemini, and similar tools.
+
+## How it works
+
+LLM Ready intercepts requests for Markdown content using three detection methods:
+
+1. **`.md` URL suffix** — Append `.md` to any entry URL (e.g., `/blog/my-post.md`). This is the primary method used by AI crawlers in practice, and the one to rely on.
+2. **Content negotiation** — Requests with an `Accept: text/markdown` header receive Markdown instead of HTML.
+3. **AI bot user-agent detection** — Known AI crawlers (GPTBot, ClaudeBot, etc.) receive Markdown on the canonical URL. **Off by default** — see below.
+
+When a Markdown request is detected, LLM Ready resolves the entry from the URL, converts its content to Markdown, and serves it with appropriate headers.
+
+Crawlers find the `.md` URLs on their own: `/llms.txt` lists every one of them, and each HTML page carries a `<link rel="alternate">` tag and an HTTP `Link` header pointing at its Markdown alternate. Every one of those is a distinct URL whose response never varies, so the whole thing stays cacheable.
+
+### Why User-Agent detection is off by default
+
+Methods 2 and 3 change the response *on the canonical URL* based on a request header. Method 3 is the risky one: a shared cache that stores the page under the URL alone cannot tell the two representations apart, so a single AI-bot request can be cached and then replayed to every subsequent visitor as raw Markdown.
+
+The standards answer is to declare `Vary: User-Agent`. That is correct but unusable — `User-Agent` has effectively unbounded cardinality, so honouring it would give every browser build its own cache entry and destroy the hit ratio. That is precisely why Cloudflare, among others, ignores `Vary` for HTML. Correct and cache-efficient are mutually exclusive here, so the setting defaults to off and the canonical URL keeps a single representation.
+
+**Turn it on if nothing caches in front of your site.** Served straight from the origin, it works exactly as before with no downside. Behind Cloudflare, Fastly, Varnish, Azure Front Door, or a platform edge such as Servd, leave it off and let `.md` plus discovery do the work. You don't have to work out which of those you are on your own — see [Shared-cache detection](#shared-cache-detection) below.
+
+Markdown served on the canonical URL — by either method — carries `Cache-Control: private, no-store` and `Vary: User-Agent, Accept` so that it is never stored by a shared cache. The `.md` URLs are unaffected and remain fully cacheable.
+
+> **Upgrading from 1.5.x or earlier?** This setting used to default to on. An upgrade migration pins it to on for your site, so the upgrade itself changes nothing — the migration won't switch a working feature off behind your back. Fresh installs get the new default of off.
+>
+> **You should still make the change yourself if anything caches in front of your site.** Turn AI Bot User-Agent Detection off in the plugin settings. That removes the variation on the canonical URL rather than only neutralising it with cache headers, and your crawlers keep working through `.md`, `/llms.txt`, and the discovery tag and header. Origin-only sites can leave it on.
+
+### Shared-cache detection
+
+Whether the setting is safe for *your* site depends on whether a shared cache sits in front of it — and the plugin now works most of that out for you rather than sending you off to check. A shared-cache check appears directly below the AI Bot User-Agent Detection toggle on the settings page, and the same summary lives at **Utilities → LLM Ready Cache Check**. It gathers three tiers of evidence:
+
+1. **Request headers (automatic).** A proxying edge stamps identifying headers on requests it forwards to the origin: `CF-Ray` and friends for Cloudflare in proxied mode, `Fastly-Client-IP` for Fastly, `X-Varnish` or a `Via: … varnish` for Varnish, `True-Client-IP` for Akamai, `X-Azure-FDID` and `X-Azure-Ref` for Azure Front Door, plus the generic `Via`, `Surrogate-Capability` and `CDN-Loop` signals. This cleanly separates the two Cloudflare modes, which is the distinction that matters most in practice: DNS-only Cloudflare never touches their edge and sends no `CF-*` headers, while orange-cloud proxying always does — so a site that is safe today starts warning the moment the proxy is switched on.
+2. **Page caches running inside Craft (automatic).** An in-Craft page cache never sees the response's cache headers, so its configuration is read directly instead. If Blitz is installed with caching on, the check reports it — as a warning when `cacheNonHtmlResponses` is enabled (the documented Blitz setting that removes the incidental protection around non-HTML responses), or as an informational note otherwise.
+3. **Active probe (behind a button).** **Run cache probe** requests a URL twice and inspects the second response for cache-hit evidence (`Age`, `X-Cache: HIT`, `CF-Cache-Status: HIT`). A hit is the one result that constitutes proof. Azure Front Door's `X-Cache` values are read for what they mean: `TCP_HIT` is a hit, `TCP_MISS` means the route caches but missed this time, and `CONFIG_NOCACHE` means caching is switched off on the route serving that URL — Front Door is in the path, but not storing HTML. The probe always sends a browser User-Agent, never a bot one — a bot-UA probe would push the very Markdown response this feature exists to keep out of shared caches into them.
+
+The first two tiers can only see the environment they run in — which matters, because this setting is usually decided from a local copy of the site, where the local URL says nothing about production. The probe is how you cross that gap: it defaults to the current site's URL, but **point it at your production URL and it reads the live edge from wherever you are**, since all of its evidence comes from the probed server's response headers. Even without a cache hit, a `CF-Cache-Status`, `Server: cloudflare` or `Via` on the response proves a proxy fronts that site. The probe also spots page-cache evidence the passive tiers can't see remotely: Blitz announces itself in the probed site's `X-Powered-By` header, an `X-Page-Cache` header reveals an nginx-style page cache, and a `Cache-Control: s-maxage` directive means the site is built to have a shared cache storing its HTML.
+
+Results are stored per `CRAFT_ENVIRONMENT` (in the database, never project config — this is environment-specific state that must not sync), so the settings page in dev also shows what the last passive check found in production, and vice versa. On production, where `allowAdminChanges` is typically off and plugin settings are hidden, open the utility instead: viewing it is what records that environment's result.
+
+**The check's one hard limit: absence of evidence is not absence of a cache.** An nginx `proxy_cache`, or a Varnish configured not to announce itself, is invisible to every tier. A positive detection is confident; a negative one only ever says "nothing detected". If you know a cache sits in front of your site, trust that knowledge over the check.
+
+## Craft CMS 6
+
+LLM Ready runs on Craft CMS 6 (beta) as well as Craft 5, from the same release, through Craft's [Yii2 adapter](https://craftcms.com/docs/6.x/extend/adapter.html). Everything works the same way; a few things live in different places:
+
+| | Craft 5 | Craft 6 |
+|---|---|---|
+| Requirements | Craft 5.9.18+, PHP 8.2+ | Craft 6, PHP 8.5+, `craftcms/yii2-adapter` |
+| Config file | `config/llm-ready.php` | `config/craft/llm-ready.php` |
+| Install | `./craft plugin/install llm-ready` | `php artisan craft:plugin:install llm-ready` |
+| CLI commands | `./craft llm-ready/indexes/regenerate` | `php artisan craft:llm-ready:indexes:regenerate` |
+| Clear data caches | `./craft clear-caches/data` | `php artisan craft:clear-caches:data` |
+
+Wherever this guide says `config/llm-ready.php`, use `config/craft/llm-ready.php` on Craft 6. The plugin suggests `craftcms/yii2-adapter` rather than requiring it, so Craft 5 projects are unaffected; the Plugin Store and Craft's upgrade tool add the adapter for you, and with Composer you require it yourself.
+
+On Craft 6, content negotiation and user-agent detection on canonical URLs, and the `Link` header on HTML pages, are handled by Laravel middleware, because Craft 6 serves pages from Laravel routes rather than Yii actions. The responses are the same as on Craft 5.
+
+## Quick start
+
+After installation, test it immediately:
+
+```bash
+# Append .md to any entry URL
+curl https://your-site.test/blog/my-post.md
+
+# Or use content negotiation
+curl -H "Accept: text/markdown" https://your-site.test/blog/my-post
+
+# View the auto-generated site index
+curl https://your-site.test/llms.txt
+```
+
+## Preview targets
+
+You can preview the Markdown version of an entry directly from the Craft control panel by adding an **LLM version** preview target to your sections.
+
+1. Go to **Settings > Sections** and edit the section you want to configure.
+2. In the **Preview Targets** table, click **+ Add a row**.
+3. Set the **Label** to `LLM version` (or any name you prefer).
+4. Set the **URL Format** to `{url}.md`.
+5. Enable **Auto-refresh** if you want the preview to update as you edit.
+
+This gives content authors a side-by-side view of the HTML page and its Markdown equivalent, making it easy to verify how the content will appear to AI crawlers and LLMs.
+
+## Markdown conversion
+
+LLM Ready converts your HTML pages to Markdown in two ways:
+
+### Default: automatic HTML-to-Markdown conversion
+
+When no dedicated LLM template is configured for a section, LLM Ready renders the entry's normal Twig template, then:
+
+1. Extracts the main content area using configurable CSS selectors (defaults to `main, article, [role="main"], .content, #content`).
+2. Removes non-content elements — by default `<script>`, `<style>`, `<nav>`, `<footer>`, `<header>`, `<audio>`, `<video>`, `<iframe>`, `<form>`, `<svg>` — as listed in the **Excluded Elements** setting (see [Choosing which elements are removed](#choosing-which-elements-are-removed)).
+3. Rewrites links that wrap a whole card as one line, unless **Flatten Card Links** is off (see [Links that wrap a whole card](#links-that-wrap-a-whole-card)).
+4. Converts the remaining HTML to Markdown using the [league/html-to-markdown](https://github.com/thephpleague/html-to-markdown) library, and decodes the HTML entities it leaves in text (`&amp;`, `&quot;`). `&lt;` and `&gt;` stay encoded, so literal text such as `&lt;div&gt;` doesn't become a tag, and code is left as written.
+5. Prepends YAML front matter with entry metadata.
+
+If the template fails to render (e.g., a missing template or a Twig error), LLM Ready falls back to extracting content directly from common entry field handles (`body`, `content`, `text`, `description`, `summary`).
+
+### Choosing which elements are removed
+
+Two settings decide what never reaches the Markdown, and they work at different levels:
+
+- **Exclude Selector** removes anything matching a CSS selector from the whole rendered page *before* the main content is extracted. It is empty by default and takes classes, IDs and attributes as well as tag names, custom elements included: `.carousel, [data-nosnippet], aside, newsletter-signup`.
+- **Excluded Elements** is a comma-separated list of HTML tag names removed, with everything inside them, *during* the conversion of the extracted content. It ships as `script, style, nav, footer, header, audio, video, iframe, form, svg`, which is what the plugin has always removed.
+
+Edit Excluded Elements when the default list is wrong for your markup. The usual case is an article that uses `<header>` for its title block or `<footer>` for a byline and reading list: take those two out and they convert like anything else.
+
+```
+script, style, nav, audio, video, iframe, form, svg
+```
+
+Tag names are matched case-insensitively (spaces work as separators too, since that is the converter's own format). You can add elements too (`aside`, `dialog`, a custom element such as `newsletter-signup`), and an empty field removes nothing at all. Anything that is not a plain tag name is rejected on save with a message pointing you to Exclude Selector. The same setting is `excludeElements` in `config/llm-ready.php`:
+
+```php
+'excludeElements' => 'script, style, nav, audio, video, iframe, form, svg',
+```
+
+The conversion itself is done by [league/html-to-markdown](https://github.com/thephpleague/html-to-markdown), and the rest of its options are reachable from the config file through `htmlConverterOptions`. The array is merged over the plugin's own options (`strip_tags` on, `header_style` `atx`, and `remove_nodes` from Excluded Elements), so a key you set wins — including `remove_nodes`, which then replaces the control panel list and disables that field:
+
+```php
+'htmlConverterOptions' => [
+    'list_item_style' => '*',   // bullets as * instead of -
+    'hard_break' => true,       // <br> becomes "\n" instead of "  \n"
+    'use_autolinks' => false,   // always [text](url), never <url>
+],
+```
+
+### Links that wrap a whole card
+
+Listing pages often wrap each card (an image, a heading, a date) in a single link. Converted as it is, that becomes a multi-line Markdown link with a heading and an image inside it, which many renderers show as broken text:
+
+```markdown
+1. [![Activates 715+ Hours …](data:image/svg+xml,%3Csvg…)#### Activates 715+ Hours of Programming on Pluto TV
+
+    06.22.2026](https://example.com/news/activates-715-hours)
+```
+
+With **Flatten Card Links** on (the default), each such link becomes one line before conversion: the first heading inside it as the link text, and the card's other text, such as a date or a category, as plain text after it.
+
+```markdown
+1. [Activates 715+ Hours of Programming on Pluto TV](https://example.com/news/activates-715-hours) 06.22.2026
+```
+
+- A link counts as a card when it contains a heading, `p`, `div`, `figure`, `picture`, `ul`, `ol`, `section` or `article`.
+- Images, `picture`, `figure`, `svg` and `video` inside the card are dropped, along with any text in them, such as a placeholder label.
+- With no heading, the card's whole text becomes the link text.
+- A link with only inline content, such as a link in a sentence, converts as before. So does a link whose only content is an image, however the image is wrapped: a logo or a poster stays `[![alt](src)](href)`.
+
+Turn it off to keep the converter's own output, or set it in `config/llm-ready.php`:
+
+```php
+'flattenCardLinks' => false,
+```
+
+Settings saved in the control panel take effect immediately. A change to `config/llm-ready.php` is picked up on the next request, but Markdown already cached is served until it expires or the data cache is cleared (`php craft clear-caches/data`).
+
+### Dedicated LLM templates
+
+For full control over the Markdown output, you can assign a dedicated Twig template to any section. This template outputs raw Markdown directly — no HTML conversion is performed.
+
+Configure LLM templates in the plugin settings page under **Section Settings**. Enter the template path relative to your `templates/` directory (e.g., `_llm/blog`).
+
+The template receives the `entry` variable, just like a normal entry template:
+
+```twig
+# {{ entry.title }}
+
+{{ entry.postDate|date('F j, Y') }}
+
+{{ entry.body }}
+
+{% if entry.relatedEntries|length %}
+## Related
+
+{% for related in entry.relatedEntries.all() %}
+- [{{ related.title }}]({{ related.url }})
+{% endfor %}
+{% endif %}
+```
+
+### Working with CKEditor fields
+
+CKEditor fields in Craft CMS 5 store content as a collection of typed chunks. When building dedicated LLM templates, you need to handle these chunks correctly to preserve formatting.
+
+**Markup chunks** (`craft\ckeditor\data\Markup`) contain HTML content. To convert this HTML into properly formatted Markdown, use the `getMarkdown()` method:
+
+```twig
+{% for chunk in entry.myCkeditorField %}
+  {% if chunk.type == 'markup' %}
+    {{ chunk.getMarkdown()|raw }}
+  {% elseif chunk.type == 'entry' %}
+    {# Handle nested entry blocks (images, videos, etc.) #}
+    {% set block = craft.app.entries.getEntryById(chunk.entryId) %}
+    {# ... render block based on type ... #}
+  {% endif %}
+{% endfor %}
+```
+
+**Do not use** `{{ chunk }}`, `{{ chunk|striptags }}`, or `{{ chunk|raw }}` for markup chunks. These all produce plain text with no paragraph breaks, headings, links, or other formatting — resulting in a single wall of unreadable text.
+
+The `getMarkdown()` method is available since CKEditor plugin version 4.8.0. It converts the chunk's HTML into Markdown using `league/html-to-markdown`, preserving:
+
+- Paragraph breaks
+- Headings
+- Links
+- Lists (ordered and unordered)
+- Images (with alt text)
+- Bold, italic, and other inline formatting
+- Code blocks
+
+You can optionally pass an array of `HtmlConverter` configuration options: `{{ chunk.getMarkdown({hard_break: true})|raw }}`.
+
+## YAML front matter
+
+All Markdown responses include YAML front matter with entry metadata:
+
+```yaml
+---
+title: "My Blog Post"
+date: 2026-03-21T10:00:00-07:00
+author: "John Morton"
+canonical_url: "https://example.com/blog/my-post"
+section: "Blog"
+---
+```
+
+On a Craft 5 entry with more than one author, `author:` lists all of them: `author: "John Morton, Jane Doe"`.
+
+### Customizing the title and author
+
+Two settings under **Front Matter** control the `title:` and `author:` values. Each accepts a plain value or a Craft object template — the same `{{ ... }}` syntax as an entry type's Title Format or a section's URI format.
+
+**Title Field** — blank uses the entry's native title. A field handle or path (`longTitle`, `seo.title`, `metaData.getTitle()`, `seomatic:title`) resolves that field, with the same syntax as Description Field. A value containing `{` is rendered as an object template. Either way, an empty result falls back to the entry's native title, so every response has one.
+
+```twig
+{# Title: prefer a longer marketing title when it's filled in #}
+{{ entry.longTitle ?: entry.title }}
+```
+
+**Author Override** — blank uses each entry's own authors: every author set on the entry, comma-separated, in the order they appear in the control panel (`Jane Doe, Bob Smith`). A fixed name (`Acme Editorial Team`) is written to every entry. A value containing `{` is rendered as an object template per entry; when it renders to nothing, the `author:` line is omitted.
+
+Inside a template the entry is available as `entry` (and as Craft's usual `object`). Some examples:
+
+```twig
+{# Show authors only in the blog and news sections. Inside those sections this
+   mirrors the default: every author, comma-separated, falling back to the
+   username for users who haven't entered a name #}
+{% if entry.section.handle in ['blog', 'news'] %}{{ entry.authors|map(a => a.fullName ?: a.username)|join(', ') }}{% endif %}
+
+{# A plain-text "external authors" field, falling back to related author entries #}
+{{ entry.externalAuthors ?: entry.entryAuthors.all()|map(a => a.title)|join(', ') }}
+
+{# Omit the author line on every entry #}
+{{ '' }}
+```
+
+The result is reduced to plain text (tags stripped, entities decoded, whitespace collapsed) and escaped for YAML by the plugin, so the template outputs only the value — not the `author:` key, and no quoting. A template that throws logs a warning and is treated as empty, so a typo in a setting can't break every Markdown response. Object templates come from plugin settings, which need an admin (or `config/llm-ready.php`) to change — the same trust boundary as Craft's own title and URI formats.
+
+### Extending the front matter from a module
+
+For anything beyond a single value — extra keys, a YAML list of authors, per-section rules written in PHP — listen for `MarkdownService::EVENT_DEFINE_FRONT_MATTER`. The event carries the entry, the site and the plugin's resolved keys in output order; handlers can add, change or remove any of them.
+
+```php
+use johnfmorton\llmready\events\DefineFrontMatterEvent;
+use johnfmorton\llmready\services\MarkdownService;
+use yii\base\Event;
+
+Event::on(
+    MarkdownService::class,
+    MarkdownService::EVENT_DEFINE_FRONT_MATTER,
+    function(DefineFrontMatterEvent $event) {
+        $entry = $event->entry;
+
+        // Replace the scalar author with a YAML list of related author entries
+        $authors = $entry->entryAuthors->collect()->pluck('title')->all();
+        if ($authors) {
+            unset($event->frontMatter['author']);
+            $event->frontMatter['authors'] = $authors;
+        }
+
+        // Add a key of your own
+        $event->frontMatter['reading_time'] = $entry->readingTime . ' min';
+    }
+);
+```
+
+A string value becomes a scalar, a list of strings becomes a sequence, and `null` or an empty value drops the key. Values are escaped by the plugin, so pass plain text. Keys must match `[A-Za-z_][A-Za-z0-9_-]*`; anything else is skipped with a warning. The output is cached for **Cache TTL** seconds like the rest of the Markdown, so a change to something a handler reads from outside the entry itself (a related author's title, say) shows up when the cache expires or the entry is resaved.
+
+## /llms.txt
+
+LLM Ready auto-generates a `/llms.txt` file following the [llms.txt specification](https://llmstxt.org/). This file serves as a site index for LLMs, listing all enabled sections with links to each entry's Markdown version.
+
+The generated file includes:
+
+- **H1**: Your site name, or a custom title (configured in plugin settings, or handed to editors through a field on a Single or a global set — see [Letting editors manage the site title and description](#letting-editors-manage-the-site-title-and-description))
+- **Blockquote**: An optional site description (configured the same way)
+- **H2 sections**: One per enabled Craft section, listing its most recent live entries — 50 by default, set by **Entries per Section** (`0` lists every entry)
+
+Example output:
+
+```markdown
+# My Website
+
+> A blog about web development and Craft CMS.
+
+## Blog
+
+- [My First Post](https://example.com/blog/my-first-post.md)
+- [Another Post](https://example.com/blog/another-post.md)
+
+## News
+
+- [Big Announcement](https://example.com/news/big-announcement.md)
+```
+
+### Letting editors manage the site title and description
+
+The **Site Title** and **Site Description** settings are plugin settings, so they are stored in project config and can only be changed by an admin, and not at all in production when `allowAdminChanges` is off. If content editors should own that text, point either setting at content instead: a value containing `{` is rendered as a Craft object template, the same `{{ ... }}` syntax **Title Field** and **Author Override** accept, with the site available as `site` (and as Craft's usual `object`). Both settings work the same way, so the examples below show them side by side.
+
+Either of Craft's homes for site-wide content works. Add a Plain Text field such as `llmTitle` and a Plain Text or rich-text field such as `llmDescription` to a Single or a global set that editors can edit, then point each setting at its field. You can hand over just one of them — leave the other setting as plain text, or blank.
+
+**A Single** (the [entrification](https://craftcms.com/blog/entrification) route, and what `craft entrify/global-set` produces from a former global set) — query it by section handle. Site Title:
+
+```twig
+{{ craft.entries.section('siteInfo').site(site).one().llmTitle ?? '' }}
+```
+
+Site Description:
+
+```twig
+{{ craft.entries.section('siteInfo').site(site).one().llmDescription ?? '' }}
+```
+
+The `?? ''` keeps the setting quiet if the Single has no live entry for the site: the blockquote is omitted and the H1 falls back to the site's name. A field on the home page Single works the same way with `section('home')`.
+
+Because the setting is a full Twig expression, the fallback can be as long as your site structure needs. A multi-site install that keeps one settings Single per site, both sharing an entry type, can chain them and end with a literal default:
+
+```twig
+{{ craft.entries.section('globalSettingsSite1').site(site).one().llmDescription
+   ?? craft.entries.section('globalSettingsSite2').site(site).one().llmDescription
+   ?? 'This is the default description.' }}
+```
+
+Each step resolves to `null` when it has nothing to offer, and `??` moves on to the next: `.site(site)` limits each query to the site being served, so a Single that isn't enabled for that site returns no entry; a Single whose field the editor left blank returns `null` too, since Craft normalizes an empty Plain Text field to `null`; and the closing string is what every site gets until someone fills the field in. Use `??` rather than `?:` for these guards — Craft's Twig runs in strict mode, and `??` is what lets `.one().llmDescription` on a missing entry resolve quietly instead of throwing. When the Singles share an entry type, the same chain collapses to one query by type:
+
+```twig
+{{ craft.entries.type('globalSettings').site(site).one().llmDescription ?? 'This is the default description.' }}
+```
+
+The same chain works for the title with `llmTitle` in place of `llmDescription`. End it with `?? site.name` to make the fallback explicit, or `?? ''`, which the plugin turns into the site's name anyway.
+
+**A global set** — available by handle exactly as in a site template. Site Title:
+
+```twig
+{{ siteInfo.llmTitle }}
+```
+
+Site Description:
+
+```twig
+{{ siteInfo.llmDescription }}
+```
+
+Either way the value editors enter is content, not project config, so it deploys with the database and can differ per site. That per-site point is the main reason to template the title: the default H1 is the site's name, which already differs per site, while a fixed Site Title replaces it on every site.
+
+Rich-text output is reduced to plain text: tags are stripped, entities decoded, and each paragraph or line break becomes its own line of the blockquote, so a two-paragraph description stays two paragraphs. The title is collapsed to a single line instead, since a line break would end the heading. A template that renders to nothing omits the blockquote, or falls back to the site's name for the H1; one that throws logs a warning and does the same, so a typo in a setting can't take down `/llms.txt`. The cached file is dropped whenever an entry or a global set is saved, so an editor's change is live on the next request. Object templates come from plugin settings, which need an admin (or `config/llm-ready.php`) to change — the same trust boundary as Craft's own title and URI formats.
+
+## Listing pages
+
+Append `.md` to a section's base URL to get a Markdown list of all entries in that section:
+
+```bash
+curl https://your-site.test/blog.md
+```
+
+This returns a Markdown document with the section name as a heading and a bulleted list of links to the section's most recent entries — 100 by default, set by **Entries per Listing Page** (`0` lists every entry) — pointing to their `.md` URLs. Like `/llms.txt`, it is rebuilt in the background when the section's content changes — see [How /llms.txt and listing pages are cached](#how-llmstxt-and-listing-pages-are-cached).
+
+## Discovery
+
+LLM Ready auto-injects a `<link>` tag into the `<head>` of your HTML pages so AI crawlers can discover the Markdown version:
+
+```html
+<link rel="alternate" type="text/markdown" href="https://example.com/blog/my-post.md">
+```
+
+This tag is added automatically to all pages in enabled sections. You can disable it in the plugin settings.
+
+**Note:** Your page templates must include a `<head>` element for the discovery tag to be rendered. Craft automatically injects registered head tags before the closing `</head>` tag.
+
+### HTTP `Link` header
+
+In addition to (or instead of) the HTML tag, LLM Ready can advertise the Markdown alternate via an HTTP `Link` response header (RFC 8288), which crawlers can read without parsing HTML:
+
+```
+Link: <https://example.com/blog/my-post.md>; rel="alternate"; type="text/markdown"
+```
+
+This is controlled by the **Auto-inject Link Header** setting (on by default). It is emitted on both `GET` and `HEAD` requests, so header-only clients (uptime monitors, link checkers, `curl -I`) can discover the alternate too.
+
+## Respecting SEO `noindex`
+
+`noindex` is an explicit "don't surface this URL" signal, so LLM Ready honours it the same way a search engine would. If an entry is marked `noindex`, then:
+
+- it is dropped from `/llms.txt` and from listing pages;
+- its `.md` URL returns a 404;
+- its canonical URL stops serving Markdown to AI bots and to `Accept: text/markdown` requests, falling through to the normal HTML response;
+- its HTML page stops advertising a Markdown alternate, in both the `<link rel="alternate">` tag and the `Link` header — there is no point pointing crawlers at a URL that 404s.
+
+This is always on and has no setting. It is useful for redirect stubs, utility pages, and anything else you already keep out of search results. To exclude an entry by a rule of your own, see [Excluding individual entries](#excluding-individual-entries).
+
+Live preview is exempt, so authors can still check the Markdown version of a `noindex` entry from the control panel.
+
+### Supported plugins
+
+| SEO plugin | How robots is read |
+|---|---|
+| [SEOmatic](https://github.com/nystudio107/craft-seomatic) | Through SEOmatic's own resolver, so an entry that inherits `noindex` from its section or global meta bundle counts, not just one with a per-entry override |
+| [Ether SEO](https://github.com/ethercreative/seo) | From the SEO field's `advanced.robots` value. The field is located by type, so there is nothing to configure |
+
+Both the `noindex` and `none` directives count as `noindex` — `none` is shorthand for `noindex, nofollow`. `nofollow`, `noarchive` and `nosnippet` on their own do not, since they don't say "don't index this".
+
+Other SEO plugins have no per-entry robots concept that maps cleanly onto this, so they are not consulted. If neither plugin is installed, nothing changes and no lookups run.
+
+### Performance note
+
+For SEOmatic sites, building `/llms.txt` runs SEOmatic's meta-container resolution once per listed entry (up to **Entries per Section** per section) so that inherited `noindex` is caught; with Description Field set to `seomatic:description`, the description reuses the same resolution. On a large site that build can take longer than a gateway will wait, which is why `/llms.txt` and listing pages are built in a queue job rather than by the request — see [How /llms.txt and listing pages are cached](#how-llmstxt-and-listing-pages-are-cached). Ether SEO is a plain field read and costs effectively nothing.
+
+## Excluding individual entries
+
+To decide per entry whether it gets a Markdown version, listen for `MarkdownService::EVENT_INCLUDE_ENTRY` in a module and set `$event->include` to `false`. An excluded entry is treated exactly like a `noindex` one, as [described above](#respecting-seo-noindex): no `/llms.txt` or listing page line, a 404 at its `.md` URL, HTML at its canonical URL, and no Markdown alternate advertised. Live preview is exempt.
+
+Two common uses are a lightswitch field that lets editors choose, and pages whose `noindex` is set in a template (`seomatic.meta.robots('noindex')`), which the plugin can't see without rendering the page:
+
+```php
+use johnfmorton\llmready\events\IncludeEntryEvent;
+use johnfmorton\llmready\services\MarkdownService;
+use yii\base\Event;
+
+Event::on(
+    MarkdownService::class,
+    MarkdownService::EVENT_INCLUDE_ENTRY,
+    function(IncludeEntryEvent $event) {
+        $entry = $event->entry;
+
+        // A page the templates mark noindex
+        if ($entry->section?->handle === 'login') {
+            $event->include = false;
+            return;
+        }
+
+        // A "Hide from AI" lightswitch field, where the entry type has one
+        if ($entry->getFieldLayout()?->getFieldByHandle('hideFromAi') && $entry->hideFromAi) {
+            $event->include = false;
+        }
+    }
+);
+```
+
+On Craft 5 the handler goes in a module's `init()`; there is a [complete example module](#example-a-module-with-a-hide-from-ai-lightswitch) below. On Craft 6, register the same handler in the `boot()` method of a service provider, such as `app/Providers/AppServiceProvider.php`.
+
+The event carries the entry and the site (`$event->site`), so a rule can differ per site. Things to know:
+
+- **Handlers can only exclude.** The event runs before the `noindex` check, which still applies to every entry a handler leaves included.
+- **Keep handlers cheap.** The event runs once per listed entry while `/llms.txt` and listing pages are built, so read a field on the entry rather than run a query. An entry a handler excludes skips the SEOmatic lookup, so excluding entries makes those builds faster, not slower.
+- **When a change shows up.** A `.md` URL follows the handler on the next request. `/llms.txt` and listing pages follow it when they're next rebuilt: saving the entry queues that rebuild, so a field on the entry takes effect within moments, while a rule that reads something else (a global set, a config value, new handler code) takes effect when **Cache TTL** expires or after `llm-ready/indexes/regenerate`. See [How /llms.txt and listing pages are cached](#how-llmstxt-and-listing-pages-are-cached).
+
+### Example: a module with a "Hide from AI" lightswitch
+
+A complete module for a Craft 5 site with no module of its own yet. It gives editors a lightswitch on the entry; turning it on and saving removes the entry's Markdown version.
+
+**1. Add the field.** Create a Lightswitch field with the handle `hideFromAi`, off by default, and add it to the field layout of each entry type editors should be able to hide. Entry types without the field are left alone.
+
+**2. Create `modules/Module.php`:**
+
+```php
+<?php
+
+namespace modules;
+
+use Craft;
+use johnfmorton\llmready\events\IncludeEntryEvent;
+use johnfmorton\llmready\services\MarkdownService;
+use yii\base\Event;
+use yii\base\Module as BaseModule;
+
+/**
+ * Site module: keeps entries whose "Hide from AI" lightswitch is on out of
+ * LLM Ready's Markdown output.
+ */
+class Module extends BaseModule
+{
+    public function init(): void
+    {
+        Craft::setAlias('@modules', __DIR__);
+
+        parent::init();
+
+        // LLM Ready 1.15.0 added the event; do nothing without it.
+        if (!class_exists(IncludeEntryEvent::class)) {
+            return;
+        }
+
+        Event::on(
+            MarkdownService::class,
+            MarkdownService::EVENT_INCLUDE_ENTRY,
+            function(IncludeEntryEvent $event) {
+                $entry = $event->entry;
+
+                // Only entry types that have the field are affected.
+                $hasField = $entry->getFieldLayout()?->getFieldByHandle('hideFromAi') !== null;
+
+                if ($hasField && $entry->hideFromAi) {
+                    $event->include = false;
+                }
+            }
+        );
+    }
+}
+```
+
+**3. Load it on every request**, in `config/app.php`:
+
+```php
+return [
+    'modules' => [
+        'site-module' => \modules\Module::class,
+    ],
+    'bootstrap' => ['site-module'],
+];
+```
+
+**4. Make the class autoloadable.** Craft's starter project already has this in `composer.json`; add it if yours doesn't, then run `composer dump-autoload`:
+
+```json
+"autoload": {
+    "psr-4": {
+        "modules\\": "modules/"
+    }
+}
+```
+
+**5. Check it.** Turn the lightswitch on for an entry and save. Its `.md` URL now returns a 404 and its HTML page no longer has the `<link rel="alternate" type="text/markdown">` tag. Its line leaves `/llms.txt` and the section's listing page once the queued rebuild has run.
+
+If the site already has a module, add the `Event::on()` call to its `init()` instead. `craft make module` (from [craftcms/generator](https://github.com/craftcms/generator)) scaffolds steps 2 to 4 for you. On Craft 6 there is no module: put the same `Event::on()` call in the `boot()` method of `app/Providers/AppServiceProvider.php`.
+
+## Response headers
+
+Markdown responses include the following headers:
+
+| Header | Value | Purpose |
+|--------|-------|---------|
+| `Content-Type` | `text/markdown; charset=utf-8` | Correct MIME type per RFC 7763 with explicit charset to prevent encoding issues |
+| `X-Robots-Tag` | `noindex` | Prevents search engines from indexing Markdown pages (configurable) |
+| `Link` | `<url>; rel="canonical"` | Points to the HTML version of the page |
+
+## Plugin settings
+
+Configure LLM Ready from **Settings > Plugins > LLM Ready** in the Craft control panel.
+
+### Global settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Enabled | `true` | Master switch for the entire plugin |
+| Content Negotiation | `true` | Serve Markdown for `Accept: text/markdown` requests |
+| AI Bot User-Agent Detection | `false` | Serve Markdown to known AI crawlers **on the canonical URL**. Off by default because the response then varies by `User-Agent`, which shared caches don't key on. Safe to enable for origin-only sites — see [Why User-Agent detection is off by default](#why-user-agent-detection-is-off-by-default) |
+| Additional Bot User-Agents | `[]` | Custom user-agent strings to detect as AI bots |
+| Content Selector | `main, article, [role="main"], .content, #content` | CSS selectors for extracting main content from HTML |
+| Exclude Selector | `""` | CSS selectors for elements to remove before Markdown conversion (e.g. `.carousel, [data-nosnippet]`) |
+| Flatten Card Links | `true` | Rewrite links that wrap a whole card (image, heading, date) into one line: the heading as the link, the rest as plain text after it. See [Links that wrap a whole card](#links-that-wrap-a-whole-card) |
+| Excluded Elements | `script, style, nav, footer, header, audio, video, iframe, form, svg` | HTML tag names removed, with their contents, during Markdown conversion (comma-separated; empty removes nothing). `excludeElements` in the config file, where `htmlConverterOptions` also exposes the converter's other options. See [Choosing which elements are removed](#choosing-which-elements-are-removed) |
+| X-Robots-Tag: noindex | `true` | Add `noindex` header to Markdown responses |
+| Auto-inject Discovery Tag | `true` | Inject `<link rel="alternate">` into HTML pages |
+| Auto-inject Link Header | `true` | Add an HTTP `Link` response header (RFC 8288) pointing at the Markdown alternate. Useful for crawlers that inspect headers without parsing HTML |
+| Cache TTL (seconds) | `3600` | How long to cache Markdown output (`0` to disable). `/llms.txt` and listing pages are rebuilt in the background once their copy is this old — see [How /llms.txt and listing pages are cached](#how-llmstxt-and-listing-pages-are-cached) |
+| Enable llms.txt | `true` | Serve `/llms.txt` and `/.well-known/llms.txt`. Turn off to 404 the route — and stop the home page advertising it — while leaving `.md` URLs, content negotiation and discovery tags working |
+| Site Title | `""` | Title used for the `/llms.txt` H1 heading. Falls back to the site's name when blank. A value containing `{` is rendered as a Craft object template with the site as `site`, so it can read a field on a Single (`{{ craft.entries.section('siteInfo').site(site).one().llmTitle ?? '' }}`) or a global set (`{{ siteInfo.llmTitle }}`) that content editors manage outside project config, and stay per site where a fixed title applies to every site. Collapsed to one line. See [Letting editors manage the site title and description](#letting-editors-manage-the-site-title-and-description). |
+| Site Description | `""` | Introduction text for the `/llms.txt` blockquote. A value containing `{` is rendered as a Craft object template with the site as `site`, so it can read a field on a Single (`{{ craft.entries.section('siteInfo').site(site).one().llmDescription ?? '' }}`) or a global set (`{{ siteInfo.llmDescription }}`) that content editors manage outside project config. See [Letting editors manage the site title and description](#letting-editors-manage-the-site-title-and-description). |
+| Entries per Section | `50` | How many of each section's most recent entries `/llms.txt` lists. `0` lists every entry. `llmsTxtEntryLimit` in the config file |
+| Entries per Listing Page | `100` | How many of a section's most recent entries its listing page (e.g. `/blog.md`) lists. `0` lists every entry. `listingPageEntryLimit` in the config file |
+| Description Field | `""` | Field handle to use for entry descriptions in `/llms.txt` and listing pages. Supports dot notation (e.g. `seo.seoDescription`), `()` method-call syntax (e.g. `metaData.getMetaDescription()`), Generated Field handles, and a native SEOmatic resolver via `seomatic:description`. See [SEO-PLUGINS.md](SEO-PLUGINS.md) for SEOmatic / Ether SEO / SEOmate / SEO Fields recipes. When set, the configured field is authoritative — no auto-extract fallback runs if it resolves to nothing. |
+| Title Field | `""` | Optional field handle for the front-matter `title:` value. Supports the same syntax as Description Field (dot notation, `()` method calls, Generated Field handles, `seomatic:title`), or a Craft object template such as `{{ entry.longTitle ?: entry.title }}`. Falls back to the entry's native title when blank or unresolved. See [Customizing the title and author](#customizing-the-title-and-author). |
+| Author Override | `""` | Author written to each entry's front matter. A fixed name (a team or company, say) replaces individual editor names on every entry. A Craft object template such as `{% if entry.section.handle == 'blog' %}{{ entry.authors\|map(a => a.fullName ?: a.username)\|join(', ') }}{% endif %}` is rendered per entry, and the `author:` line is omitted when it renders to nothing. Blank uses each entry's own authors, comma-separated on multi-author entries. See [Customizing the title and author](#customizing-the-title-and-author). |
+
+#### Setting AI Bot User-Agent Detection per environment
+
+Whether this setting is safe depends on what sits in front of the site, which usually differs between a local copy (served straight from its origin) and production (behind a CDN or page cache). Rather than toggling it by hand, let it follow the environment from `config/llm-ready.php`. A value there overrides the control panel.
+
+Read it from `.env`:
+
+```php
+// config/llm-ready.php
+use craft\helpers\App;
+
+return [
+    'enableUserAgentDetection' => App::parseBooleanEnv('$LLM_READY_UA_DETECTION') ?? false,
+];
+```
+
+```
+# .env (dev only)
+LLM_READY_UA_DETECTION=true
+```
+
+Or key the file on `CRAFT_ENVIRONMENT` with a [multi-environment config](https://craftcms.com/docs/5.x/config/#multi-environment-configs):
+
+```php
+// config/llm-ready.php
+return [
+    '*' => [
+        'enableUserAgentDetection' => false,
+    ],
+    'dev' => [
+        'enableUserAgentDetection' => true,
+    ],
+];
+```
+
+Any setting present in `config/llm-ready.php` is flagged on the settings page with a "This is being overridden by the `…` setting in config/llm-ready.php" note, and its input is disabled.
+
+### Section settings
+
+Below the global settings, a per-section configuration table lists all sections that have URLs. For each section and site combination, you can configure:
+
+| Column | Description |
+|--------|-------------|
+| Enabled | Toggle Markdown output on/off for this section. When disabled, `.md` requests return 404. |
+| LLM Template | Optional path to a Twig template that outputs raw Markdown (e.g., `_llm/blog`). Leave blank to use automatic HTML-to-Markdown conversion. |
+| Label | Optional name for the section in `/llms.txt` (its `##` heading), the section's listing page H1, and each entry's `section:` front matter. Leave blank to use the section's name. Use it when the name is written for content authors ("User Created Pages") and shouldn't be public. The control panel keeps showing the section's own name. |
+
+Section settings live in project config, so they reach other environments with `project-config/apply`. A change that arrives that way, such as a section switched off or a new label, drops the section's cached entry Markdown and queues a rebuild of `/llms.txt` and the listing page, as saving the settings page does.
+
+## Known AI bot user-agents
+
+LLM Ready detects the following AI crawler user-agents by default:
+
+- `GPTBot` (OpenAI — training)
+- `ChatGPT-User` (OpenAI — user-requested fetch)
+- `OAI-SearchBot` (OpenAI — search)
+- `ClaudeBot` (Anthropic — training)
+- `Claude-SearchBot` (Anthropic — search)
+- `Claude-User` (Anthropic — user-requested fetch)
+- `PerplexityBot` (Perplexity — answer index)
+- `Perplexity-User` (Perplexity — user-requested fetch)
+- `Meta-ExternalAgent` (Meta — AI training and indexing)
+- `Meta-ExternalFetcher` (Meta — user-requested fetch)
+- `Meta-WebIndexer` (Meta — web discovery index)
+- `Amazonbot` (Amazon)
+- `Bytespider` (ByteDance)
+- `CCBot` (Common Crawl)
+- `cohere-ai` (Cohere)
+
+Matching is case-insensitive against any substring of the request's `User-Agent` header.
+
+> **Note:** `Google-Extended` and `Applebot-Extended` are intentionally **not** in this list. They are robots.txt opt-out tokens for AI training, not request user-agents — they never appear in a `User-Agent` header, so detecting them would have no effect. Use them in `robots.txt`, not here.
+
+### Customizing the detected bots
+
+| Setting | Where | Effect |
+|---------|-------|--------|
+| `additionalBotUserAgents` | Control panel or config | **Appended** to the default list. Use for custom or internal crawlers. |
+| `botUserAgents` | Config file only | **Replaces** the default list entirely. `additionalBotUserAgents` is still appended on top. |
+| `excludeBotUserAgents` | Config file only | **Removes** entries from the effective list — drop a single default without re-listing the others. |
+
+The effective list is computed as: `(botUserAgents or the defaults) + additionalBotUserAgents − excludeBotUserAgents`. Set the config-only options in `config/llm-ready.php` (see [`src/config.php`](src/config.php) for the template). For example, to keep the defaults but stop detecting `Bytespider`:
+
+```php
+// config/llm-ready.php
+return [
+    'excludeBotUserAgents' => ['Bytespider'],
+];
+```
+
+### Blocking specific bots
+
+LLM Ready does not manage which bots can access your site — it only detects known AI crawlers so it can serve them Markdown. To block a specific bot from crawling your site entirely, configure your `robots.txt` file. Most Craft CMS SEO plugins (e.g., SEOmatic, Sprout SEO) provide a `robots.txt` editor where you can add rules like:
+
+```
+User-agent: GPTBot
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+```
+
+This tells the bot not to crawl any pages on your site. Note that `robots.txt` is a voluntary standard — well-behaved crawlers respect it, but it is not an access control mechanism. If you need to enforce a hard block, use server-level rules (e.g., in your web server or `.htaccess` configuration).
+
+## Analytics
+
+LLM Ready includes an opt-in analytics dashboard that tracks AI bot requests to your site. Enable it in the plugin settings under **Enable Analytics**.
+
+Once enabled, a **LLM Ready** section appears in the control panel navigation with a dashboard showing requests over time, bot breakdown, most accessed pages, and request type breakdown.
+
+### Permissions
+
+Access to the analytics data is gated behind two user permissions under **LLM Ready** (set per user group, or per user, in **Settings > Users**):
+
+- **View the analytics dashboard** — required to open the dashboard, its JSON data endpoint, and the dashboard widget.
+- **Purge analytics data** (nested under the above) — required to manually purge analytics records.
+
+Admins have both by default. Non-admin users have no access until granted.
+
+### Dashboard widget
+
+A compact **LLM Ready Analytics** widget is available from the Craft CP dashboard's **+ Add widget** menu. It shows the last 30 days of activity for the current site — total requests, top bot, top page — with a click-through to the full dashboard. The widget only appears in the picker when analytics are enabled and the current user has the **View the analytics dashboard** permission.
+
+### Filtering by bot or request type
+
+Switch the chart to the **By Bot** or **By Type** view using the toggle buttons, then click any legend item to filter the entire dashboard to that bot or type. When a filter is active:
+
+- The chart shows only the selected item.
+- The stats cards (Total Requests, Unique Bots, Content Types Served) update to reflect the filtered data.
+- The bot breakdown, request types, and most accessed pages tables all update to show only data matching the filter.
+- A **Filtered: [name]** indicator appears with a **Clear** button to remove the filter.
+
+Click the same legend item again or press **Clear** to restore the full (unfiltered) view. Switching chart views or changing the date range also clears any active filter.
+
+### Request types
+
+The analytics dashboard groups requests into four types:
+
+| Type | Meaning |
+|------|---------|
+| **entry** | A direct request for a specific entry's Markdown version via the `.md` URL suffix (e.g., `/blog/my-post.md`). This is the most common request type. |
+| **listing** | A request for a section's listing page via the `.md` suffix (e.g., `/blog.md`), which returns a Markdown list of all entries in that section. |
+| **llmstxt** | A request for the `/llms.txt` site index file. |
+| **negotiated** | A request for a normal URL where the client sent an `Accept: text/markdown` HTTP header, and the plugin responded with Markdown instead of HTML. Some AI tools use this approach rather than appending `.md` to URLs. |
+
+### What `direct` means
+
+The bot breakdown labels a request `direct` when the `User-Agent` header that reached Craft was either empty or contained none of the strings in the effective bot list (see [Known AI bot user-agents](#known-ai-bot-user-agents)). It is a catch-all for "not a bot we recognise", not "a person typed the URL into a browser". Monitoring tools, scrapers and newer AI fetchers that aren't in the list all land here. If `direct` dominates your dashboard, your web server's access log filtered to `.md` and `llms.txt` requests shows the real user-agents, and any you want named can be added with `additionalBotUserAgents`.
+
+One user-agent gets its own label. Requests that arrive as `Amazon CloudFront` are logged under that name rather than `direct`, because that value means CloudFront replaced the real user-agent before the request reached your origin. The dashboard shows a warning whenever the selected date range contains them. See [Every request is labeled `direct`, or the dashboard shows `Amazon CloudFront`](#every-request-is-labeled-direct-or-the-dashboard-shows-amazon-cloudfront) under Troubleshooting for the fix.
+
+### Data retention
+
+Analytics data is retained for a configurable number of days (default 90). You can purge old data manually from the dashboard or automatically via the console command:
+
+```bash
+./craft llm-ready/analytics/purge
+```
+
+## Caching
+
+Markdown output is cached using Craft's cache component (Redis, database, or file-based depending on your configuration). The cache is automatically invalidated when:
+
+- An entry is saved
+- An entry is deleted
+- A global set is saved (the `/llms.txt` cache only, since its Site Title and Site Description can read one)
+
+The cache TTL is configurable in the plugin settings. Set to `0` to disable caching entirely.
+
+### How /llms.txt and listing pages are cached
+
+`/llms.txt` and the section listing pages (`/blog.md`) are index files: each lists many entries, and with SEOmatic every listed entry needs its meta resolved. On a large site, building one can take longer than a gateway or load balancer will wait, so requests don't build them when a copy exists:
+
+- The last built copy is served for as long as it exists. Once it is older than **Cache TTL**, or the content it lists has changed since it was built, the request still gets that copy straight away and a **Regenerating llms.txt and listing pages** queue job builds its replacement. A burst of saves queues one job, not one per save.
+- What counts as a change: saving or deleting an entry makes `/llms.txt` and that entry's section listing out of date; saving a global set makes `/llms.txt` out of date, since its Site Title and Site Description can read one. Drafts and revisions don't count.
+- An entry that stops being live — disabled, expired, or deleted — is removed from the stored copies at once, not at the rebuild, so a pulled entry's title and description aren't left listed while the queue catches up.
+- A copy that has been served stale for ten minutes without being replaced — the queue isn't running, or the job couldn't be pushed — stops being served, and the next request rebuilds it as below.
+- With no copy at all — the first request after installing, deploying, or clearing data caches — one request builds it while any others wait up to five seconds for it, then get a `503` with `Retry-After: 30` rather than piling up behind the build.
+- The job rebuilds only copies that are out of date, and only listing pages that have been requested, so unused sections cost nothing.
+
+Three things follow:
+
+- **A queue runner is expected.** Craft's default (`runQueueAutomatically`) or a `craft queue/listen` worker both work. Without one, content changes reach index files only through the ten-minute fallback, and a request pays for each rebuild.
+- **Build the files after deploys and cache clears**, so no visitor waits on a cold build:
+
+  ```bash
+  php craft llm-ready/indexes/regenerate              # every site
+  php craft llm-ready/indexes/regenerate --site=en    # one site, by handle
+  ```
+
+- **A long-running `queue/listen` worker picks up LLM Ready setting changes on its own** — the job rereads the plugin's settings and section settings from the database each time it runs. Changes to Craft itself, such as a new section, still need the worker restarted, as for any plugin.
+
+Setting **Cache TTL** to `0` turns all of this off and builds index files on every request, as before — fine on a small site, not recommended on a large one.
+
+You can also clear the cache manually via **Utilities > Clear Caches > Data caches** in the control panel or by running:
+
+```bash
+./craft clear-caches/data
+```
+
+## Permissions and access control
+
+LLM Ready respects Craft's content access rules:
+
+- **Draft and disabled entries** are never served as Markdown.
+- **Entries without URLs** are not available as Markdown (there's no URL to append `.md` to).
+- Only entries with a `live` status are served.
+
+## Multi-site support
+
+LLM Ready supports Craft's multi-site feature. Each section can be independently enabled or disabled per site, and each site can have its own dedicated LLM template and label, so a section's public name can be translated. The `/llms.txt` file is generated per-site, listing only entries belonging to the current site; a Site Title or Site Description sourced from a Single or global set field is per-site too.
+
+## FAQ
+
+Short answers to the questions that come up while setting the plugin up, each pointing at the fuller explanation.
+
+### Can I set Content Selector to `body` and exclude everything I don't want?
+
+Yes. `body` is what the plugin falls back to when no selector matches, so naming it just makes that the first choice. Exclude Selector then removes anything you list before extraction, and Excluded Elements removes tag names during conversion. It works, with three things to know:
+
+- **It is an opt-out model, and layouts grow.** Every cookie banner, breadcrumb trail, related-posts block or comment thread added later reaches the Markdown until someone excludes it. A wrapper around the article (`main`, `article`, `.article-body`) is opt-in and stays right as the layout changes, which is why the default list tries those first.
+- **Invisible text is still text.** The converter knows nothing about CSS, so screen-reader-only labels, "Skip to content" links and collapsed panels come through unless excluded. `.sr-only`, `[hidden]` and `[aria-hidden="true"]` are all valid Exclude Selector entries.
+- **Selectors are simple, one per comma:** a tag, `.class`, `#id`, `[attr]`, `[attr="value"]`, `tag.class` or `tag#id`. There are no descendant combinators, chained classes or `:not()`, so you exclude the sidebar, not "everything in the sidebar except links".
+
+A durable middle path is to keep `body`, mark site chrome in your templates with `data-nosnippet`, and put `[data-nosnippet]` in Exclude Selector. The decision then lives next to the element it describes, and Google honours the same attribute for search snippets.
+
+### What is the difference between Exclude Selector and Excluded Elements?
+
+Both remove content before it reaches the Markdown. Exclude Selector takes CSS selectors and runs on the whole page before the main content is extracted; it is empty by default. Excluded Elements takes plain tag names and runs on the extracted content during conversion; it ships with the list the plugin has always removed. For a bare tag name the two are interchangeable, so use whichever field reads naturally. The one practical difference: Excluded Elements also applies when template rendering fails and the plugin falls back to converting field values directly. See [Choosing which elements are removed](#choosing-which-elements-are-removed).
+
+### My article's title block or byline is missing from the Markdown. Why?
+
+The template probably wraps them in `<header>` or `<footer>`, which are on the default Excluded Elements list because on most pages they hold site chrome. Take those two names out of the list and they convert like anything else. See [Markdown output is missing an article's header or footer](#markdown-output-is-missing-an-articles-header-or-footer).
+
+### Should I use automatic conversion or a dedicated LLM template?
+
+Start with automatic conversion and tune the three Content Extraction settings; most sites need nothing more. Reach for a dedicated template when the Markdown should differ structurally from the HTML page: a different field order, content pulled from related entries, or Matrix and CKEditor blocks that need hand-written rendering. See [Dedicated LLM templates](#dedicated-llm-templates).
+
+## Troubleshooting
+
+### `.md` URLs return 404
+
+- Verify the plugin is installed and enabled: **Settings > Plugins > LLM Ready**.
+- Check that the section is enabled in the plugin's section settings.
+- Ensure the entry is published (status `live`) and has a URL.
+
+### Markdown output includes navigation or footer content
+
+Adjust the **Content Selector** in plugin settings to match your template's main content area. For example, if your content is in `<div class="article-body">`, set the selector to `.article-body`.
+
+### Markdown output is missing an article's header or footer
+
+`<header>` and `<footer>` are on the default **Excluded Elements** list because on most pages they hold site chrome. If your article template uses them for the title block or a byline, remove those two tag names from the list (the rest keeps working), and they convert like any other element. See [Choosing which elements are removed](#choosing-which-elements-are-removed).
+
+### Markdown output includes decorative or repeated text
+
+If a region inside your main content area is purely decorative (e.g. a marquee, a logo carousel, or alt-less imagery), add a selector for it to **Exclude Selector**. Matching nodes are removed from the HTML before Markdown conversion, so they never reach the output. Selectors marked with the standard `[data-nosnippet]` attribute can also be excluded with `[data-nosnippet]`.
+
+### Markdown output is empty or minimal
+
+If the entry's template fails to render, LLM Ready falls back to extracting content from common field handles. For best results, either fix the template or configure a dedicated LLM template for that section.
+
+### Cache not clearing
+
+LLM Ready invalidates cache automatically on entry save. If you see stale content, clear the data cache manually:
+
+```bash
+./craft clear-caches/data
+```
+
+`/llms.txt` and listing pages are the exception: an entry save queues a rebuild, and the previous copy is served until it finishes. If one stays out of date, check that the **Regenerating llms.txt and listing pages** job is running (**Utilities > Queue Manager**), or rebuild them directly with `php craft llm-ready/indexes/regenerate`.
+
+### `/llms.txt` or a listing page returns `503` or times out
+
+A `503` with `Retry-After` means the file had no cached copy and another request was already building it; it is served as soon as that build finishes. To avoid the cold build altogether, run `php craft llm-ready/indexes/regenerate` after each deploy or cache clear — see [How /llms.txt and listing pages are cached](#how-llmstxt-and-listing-pages-are-cached). If a gateway timeout persists, check that **Cache TTL** isn't `0`, which builds the file on every request, and consider a lower **Entries per Section** or **Entries per Listing Page**.
+
+### Every request is labeled `direct`, or the dashboard shows `Amazon CloudFront`
+
+`direct` means the `User-Agent` that reached Craft matched nothing in the bot list (see [What `direct` means](#what-direct-means)). When *every* request is `direct`, or a bot called `Amazon CloudFront` appears in the breakdown, something between the visitor and Craft is replacing the header and the plugin never sees the real one.
+
+**Amazon CloudFront** is the usual cause. Unless a cache behavior is told to forward `User-Agent`, CloudFront removes the viewer's header and sends `User-Agent: Amazon CloudFront` to the origin ([AWS docs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/RequestAndResponseBehaviorCustomOrigin.html#request-custom-user-agent-header)). LLM Ready logs those requests under the name `Amazon CloudFront` and shows a warning on the dashboard. The fix is to forward the header in the distribution's **origin request policy**, not its cache policy:
+
+1. In the CloudFront console open your distribution, go to **Behaviors** and edit each behavior that serves the site.
+2. Under **Cache key and origin requests**, choose **Cache policy and origin request policy** rather than **Legacy cache settings**.
+3. Set **Origin request policy** to the managed **UserAgentRefererHeaders** policy (ID `acba4595-bd28-49b8-b9fe-13317c0390fa`), which forwards only `User-Agent` and `Referer`. **AllViewer** (`216adef6-5c7f-47e4-b989-5492eafa07d3`) also works if you already forward everything. See [managed origin request policies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html).
+4. Leave `User-Agent` out of the **cache policy**. There it becomes part of the cache key and every user-agent gets its own cached copy. An origin request policy forwards the header without that.
+
+Legacy cache settings have no separate origin request policy. Whitelisting `User-Agent` there does put it in the cache key, so migrate to the policy pair instead.
+
+To confirm the fix, send a request with a bot user-agent and a throwaway query string so it passes the CDN and any page cache, then reload the dashboard with a range that includes today:
+
+```bash
+curl -s -o /dev/null -A "GPTBot/1.0" "https://example.com/some-entry.md?llmready=$(date +%s)"
+```
+
+It should appear as `GPTBot`. Before the fix the same request appears as `Amazon CloudFront`, and your origin's access log shows that literal value in the user-agent column.
+
+Two related points for CloudFront sites:
+
+- CloudFront also strips the `Accept` header by default, so `Accept: text/markdown` content negotiation never reaches Craft. Don't fix that by forwarding `Accept`. CloudFront keys its cache only on the cache policy and ignores the plugin's `Vary` header, so negotiated Markdown for a canonical URL would be cached at the edge and served to browsers. Behind CloudFront, rely on the `.md` URLs and `/llms.txt`, which have their own cache keys.
+- Bots that hit a `.md` URL already cached at the edge never reach Craft, so the dashboard counts origin fetches, not total bot traffic.
+
+**Other proxies.** Any reverse proxy or WAF that sets its own `User-Agent` (an nginx `proxy_set_header User-Agent ...` rule, for example) has the same effect. The access log on the Craft server shows what actually arrives.
+
+**Blitz.** If Blitz's `cacheNonHtmlResponses` setting is on, its cache generator regenerates `.md` URLs itself. The Local Generator sends no user-agent and the HTTP Generator sends `amphp/http-client`, so both are logged as `direct`. The default (`false`) avoids this.

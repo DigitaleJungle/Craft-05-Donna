@@ -1,0 +1,257 @@
+<?php
+namespace verbb\formie\integrations\miscellaneous;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Miscellaneous;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\RichTextHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\Json;
+
+use Throwable;
+
+use League\HTMLToMarkdown\HtmlConverter;
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\providers\Trello as TrelloProvider;
+
+class Trello extends Miscellaneous implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return TrelloProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'Trello';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[FormIntegrationSetting]
+    public ?string $boardId = null;
+
+    #[FormIntegrationSetting]
+    public ?string $listId = null;
+
+    #[FormIntegrationSetting]
+    public ?string $cardName = null;
+
+    #[FormIntegrationSetting]
+    public ?string $cardDescription = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getAuthorizationUrlOptions(): array
+    {
+        $options = parent::getAuthorizationUrlOptions();
+
+        $options['scope'] = [
+            'read',
+            'write',
+            'account',
+        ];
+
+        return $options;
+    }
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to Trello.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            $allBoards = $this->request('GET', 'members/me/boards', [
+                'query' => [
+                    'filter' => 'open,members,organization,public',
+                    'fields' => 'id,name',
+                ],
+            ]);
+            $boards = [];
+
+            foreach ($allBoards as $key => $board) {
+                $lists = [];
+
+                $allLists = $this->request('GET', "boards/{$board['id']}/lists");
+
+                foreach ($allLists as $list) {
+                    $lists[] = [
+                        'id' => $list['id'],
+                        'name' => (string)$list['name'],
+                    ];
+                }
+
+                $boards[$board['id']] = [
+                    'id' => $board['id'],
+                    'name' => (string)$board['name'],
+                    'lists' => $lists,
+                ];
+            }
+
+            $settings = [
+                'boards' => $boards,
+            ];
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $payload = [
+                'name' => $this->cardName,
+                'desc' => $this->_renderMessage($submission),
+                'pos' => 'bottom',
+                'idList' => $this->listId,
+            ];
+
+            $response = $this->deliverPayload($submission, 'cards', $payload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+
+            $cardId = $response['id'] ?? '';
+
+            if (!$cardId) {
+                Integration::error($this, Craft::t('formie', 'Missing return “cardId” {response}', [
+                    'response' => Json::encode($response),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        // Validate the following when saving form settings
+        $rules[] = [['boardId', 'listId', 'cardName', 'cardDescription'], 'required', 'on' => [Integration::SCENARIO_FORM]];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $selectedBoardId = (string)($this->boardId ?? '');
+
+        if ($selectedBoardId === '') {
+            $selectedBoardId = $this->_getFirstBoardId();
+        }
+
+        $schema[] = SchemaHelper::comboboxField([
+            'name' => 'boardId',
+            'label' => Craft::t('formie', 'Board'),
+            'instructions' => Craft::t('formie', 'Select which {name} board to add a card to.', ['name' => $this->displayName()]),
+            'required' => true,
+            'placeholder' => Craft::t('formie', 'Select an option'),
+            'options' => $this->_getBoardOptions(),
+        ]);
+        $schema[] = SchemaHelper::comboboxField([
+            'name' => 'listId',
+            'label' => Craft::t('formie', 'List'),
+            'instructions' => Craft::t('formie', 'Select which {name} list to add a card to.', ['name' => $this->displayName()]),
+            'required' => true,
+            'placeholder' => Craft::t('formie', 'Select an option'),
+            'options' => $this->_getListOptions($selectedBoardId),
+        ]);
+        $schema[] = SchemaHelper::textField([
+            'name' => 'cardName',
+            'label' => Craft::t('formie', 'Card Name'),
+            'instructions' => Craft::t('formie', 'This text will be sent to {name}.', ['name' => $this->displayName()]),
+            'required' => true,
+        ]);
+        $schema[] = SchemaHelper::richTextField([
+            'name' => 'cardDescription',
+            'label' => Craft::t('formie', 'Card Description'),
+            'instructions' => Craft::t('formie', 'This text will be sent to {name}.', ['name' => $this->displayName()]),
+            'required' => true,
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _renderMessage($submission): array|string
+    {
+        $html = RichTextHelper::getHtmlContent($this->cardDescription, $submission, false);
+
+        $converter = new HtmlConverter(['strip_tags' => true]);
+        $markdown = $converter->convert($html);
+
+        // Some extra work to get it to play with Slack's mrkdwn
+        return str_replace(['*', '__'], ['_', '*'], $markdown);
+    }
+
+    private function _getBoardOptions(): array
+    {
+        $options = [];
+
+        foreach ($this->getConfigValue('boards') as $board) {
+            $options[] = ['label' => $board['name'], 'value' => $board['id']];
+        }
+
+        return $options;
+    }
+
+    private function _getFirstBoardId(): string
+    {
+        return $this->_getBoardOptions()[0]['value'] ?? '';
+    }
+
+    private function _getListOptions(string $boardId): array
+    {
+        $options = [];
+        $board = ArrayHelper::firstWhere($this->getConfigValue('boards'), 'id', $boardId);
+
+        foreach ($board['lists'] ?? [] as $list) {
+            $options[] = ['label' => $list['name'], 'value' => $list['id']];
+        }
+
+        return $options;
+    }
+}

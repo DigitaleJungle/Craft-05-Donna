@@ -1,0 +1,508 @@
+<?php
+
+/**
+ * League.Uri (https://uri.thephpleague.com)
+ *
+ * (c) Ignace Nyamagana Butera <nyamsprod@gmail.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
+
+namespace Uri\WhatWg;
+
+use Exception;
+use League\Uri\Polyfill\UrlValidationErrorCollector;
+use ReflectionClass;
+use ReflectionProperty;
+use Rowbot\Idna\Idna;
+use Rowbot\URL\BasicURLParser;
+use Rowbot\URL\Component\Host\NullHost;
+use Rowbot\URL\Component\Host\StringHost;
+use Rowbot\URL\ParserState;
+use Rowbot\URL\URL as WhatWgURL;
+use Rowbot\URL\URLRecord;
+use SensitiveParameter;
+use Uri\UriComparisonMode;
+use ValueError;
+
+use function array_filter;
+use function array_is_list;
+use function in_array;
+use function is_string;
+use function preg_match;
+use function substr;
+
+use const PHP_VERSION_ID;
+
+if (PHP_VERSION_ID < 80500) {
+    /**
+     * This is a user-land polyfill to the native Uri\WhatWg\Url class included in PHP8.5.
+     *
+     * @see https://wiki.php.net/rfc/url_parsing_api
+     *
+     * @phpstan-import-type UriSerializedShape from UriComparisonMode
+     * @phpstan-import-type UriDebugShape from UriComparisonMode
+     */
+    final class Url
+    {
+        private const PORT_RANGE_MIN = 0;
+        private const PORT_RANGE_MAX = 65535;
+        private const REGEXP_IDNA_PATTERN = '/[^\x20-\x7f]/';
+
+        private WhatWgURL $url;
+
+        private ?string $unicodeHost = null;
+        private bool $unicodeHostInitialized = false;
+        private ?string $urlUnicodeString = null;
+
+        private ?string $asciiHost = null;
+        private bool $asciiHostInitialized = false;
+        private ?string $urlAsciiString = null;
+
+        /**
+         * @param list<UrlValidationError>|null $softErrors
+         * @param-out list<UrlValidationError> $softErrors
+         */
+        public static function parse(string $uri, ?self $baseUrl = null, array|null &$softErrors = []): ?self
+        {
+            if (null === $softErrors) {
+                $softErrors = [];
+            }
+
+            try {
+                return new self($uri, $baseUrl, $softErrors);
+            } catch (InvalidUrlException $exception) {
+                $softErrors = $exception->errors;
+
+                return null;
+            }
+        }
+
+        /**
+         * @param-out list<UrlValidationError> $softErrors
+         *
+         * @throws InvalidUrlException
+         */
+        public function __construct(string $uri, ?self $baseUrl = null, array|null &$softErrors = [])
+        {
+            if (null === $softErrors) {
+                $softErrors = [];
+            }
+            $filter = static fn (mixed $error): bool => $error instanceof UrlValidationError;
+            (array_is_list($softErrors) && $softErrors === array_filter($softErrors, $filter)) || throw new ValueError('the error argument must be a list containing only '.UrlValidationError::class);
+
+            $collector = new UrlValidationErrorCollector();
+            try {
+                $this->url = new WhatWgURL($uri, $baseUrl?->url->href, ['logger' => $collector]);
+                $softErrors = $collector->recoverableErrors($baseUrl?->url->href, $softErrors);
+            } catch (Exception $exception) {
+                $errors = $collector->errors($softErrors);
+                $softErrors = [];
+                throw new InvalidUrlException('The specified URL is malformed', $errors, previous: $exception);
+            }
+        }
+
+        private function copy(): self
+        {
+            $newInstance = (new ReflectionClass(self::class))->newInstanceWithoutConstructor();
+            $newInstance->url = clone $this->url;
+
+            return $newInstance;
+        }
+
+        public function getScheme(): string
+        {
+            return substr($this->url->protocol, 0, -1);
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withScheme(?string $scheme): self
+        {
+            $scheme = strtolower((string) $scheme);
+            if ($scheme === $this->getScheme() || $scheme === $this->url->protocol) {
+                return $this;
+            }
+
+            static $regexp = ',^(?<scheme>[a-zA-Z][a-zA-Z0-9+\-.]*)(:(?://?)?)?$,';
+
+            ('' !== $scheme && 1 === preg_match($regexp, $scheme, $matches)) || throw new InvalidUrlException('The specified scheme is malformed');
+
+            $copy = $this->copy();
+            $copy->url->protocol = $matches['scheme'];
+
+            return $copy;
+        }
+
+        public function getUsername(): ?string
+        {
+            return ('' !== $this->url->username || '' !== $this->url->password)
+                ? $this->url->username
+                : null;
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withUsername(?string $username): self
+        {
+            if ($username === $this->getUsername() || $username === $this->url->username) {
+                return $this;
+            }
+
+            $copy = $this->copy();
+            $copy->url->username = (string) $username;
+
+            return $copy;
+        }
+
+        public function getPassword(): ?string
+        {
+            return ('' !== $this->url->username || '' !== $this->url->password)
+                ? $this->url->password
+                : null;
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withPassword(#[SensitiveParameter] ?string $password): self
+        {
+            if ($password === $this->getPassword() || $password === $this->url->password) {
+                return $this;
+            }
+
+            $copy = $this->copy();
+            $copy->url->password = (string) $password;
+
+            return $copy;
+        }
+
+        public function getAsciiHost(): ?string
+        {
+            if ($this->asciiHostInitialized) {
+                return $this->asciiHost;
+            }
+
+            $this->asciiHost = $this->setAsciiHost();
+            $this->asciiHostInitialized = true;
+
+            return $this->asciiHost;
+        }
+
+        public function getUnicodeHost(): ?string
+        {
+            if ($this->unicodeHostInitialized) {
+                return $this->unicodeHost;
+            }
+
+            $this->unicodeHost = $this->setUnicodeHost();
+            $this->unicodeHostInitialized = true;
+
+            return $this->unicodeHost;
+        }
+
+        /**
+         * Set the domain to its Unicode value according to the WHATWG URL spec.
+         *
+         * @see https://url.spec.whatwg.org/#concept-domain-to-unicode
+         */
+        private function setUnicodeHost(): ?string
+        {
+            $host = $this->getAsciiHost();
+            if ('' === $host || null === $host) {
+                return $host;
+            }
+
+            $result = Idna::toUnicode($host, [
+                'CheckHyphens' => false,
+                'CheckBidi' => true,
+                'CheckJoiners' => true,
+                'UseSTD3ASCIIRules' => false,
+                'Transitional_Processing' => false,
+                'IgnoreInvalidPunycode' => false,
+            ]);
+
+            if ($result->hasErrors()) {
+                return $host;
+            }
+
+            return $result->getDomain();
+        }
+
+        private function setAsciiHost(): ?string
+        {
+            $host = self::urlRecord($this)->host;
+            if ($host instanceof NullHost) {
+                return null;
+            }
+
+            $host = $this->url->hostname;
+            if ('' === $host || 1 !== preg_match(self::REGEXP_IDNA_PATTERN, $host)) {
+                return $host;
+            }
+
+            $result = Idna::toAscii($host, [
+                'CheckHyphens' => false,
+                'CheckBidi' => true,
+                'CheckJoiners' => true,
+                'UseSTD3ASCIIRules' => false,
+                'Transitional_Processing' => false,
+                'IgnoreInvalidPunycode' => false,
+            ]);
+
+            return $result->hasErrors() ? $host : $result->getDomain();
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withHost(?string $host): self
+        {
+            // 1 - the submitted host is equal to the current host
+            if (in_array($host, [$this->url->hostname, $this->getAsciiHost(), $this->getUnicodeHost()], true)) {
+                return $this;
+            }
+
+            // 2 - the path is Opaque, it must be a noop, as per the WHATWG URL Standard.
+            if (self::urlRecord($this)->path->isOpaque()) {
+                return $this;
+            }
+
+            // we do not parse the host
+            // instead, we quickly check if a port
+            // is potentially attached to it
+            // if an IPv4 or IPv6 is malformed
+            // the underlying parser will catch
+            // the error a throw anyway
+            if (
+                is_string($host) &&
+                str_contains($host, ':') &&
+                (!str_contains($host, '[') || str_contains($host, ']:'))
+            ) {
+                throw new InvalidUrlException('The specified host is malformed');
+            }
+
+            $copy = $this->copy();
+            $urlRecord = self::urlRecord($copy);
+
+            // 3 - validated the new host in the context of the new URL
+            $collector = new UrlValidationErrorCollector();
+            $parser = new BasicUrlParser($collector);
+            $result = $parser->parse(
+                input: new StringHost((string) $host),
+                url: $urlRecord,
+                stateOverride: ParserState::HOST
+            );
+
+            false !== $result || throw new InvalidUrlException('The specified host is malformed', $collector->errors());
+
+            return $copy;
+        }
+
+        public function getPort(): ?int
+        {
+            return '' === $this->url->port ? null : (int) $this->url->port;
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withPort(?int $port): self
+        {
+            if ($port === $this->getPort()) {
+                return $this;
+            }
+
+            // No host present, it must be a noop, as per the WHATWG URL Standard.
+            if (self::urlRecord($this)->host->isNull()) {
+                return $this;
+            }
+
+            null === $port || (self::PORT_RANGE_MIN <= $port && self::PORT_RANGE_MAX >= $port) || throw new InvalidUrlException('The specified port is malformed.');
+
+            $copy = $this->copy();
+            $copy->url->port = (string) $port;
+
+            return $copy;
+        }
+
+        public function getPath(): string
+        {
+            return $this->url->pathname;
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withPath(string $path): self
+        {
+            if ($path === $this->url->pathname) {
+                return $this;
+            }
+
+            $copy = $this->copy();
+            $copy->url->pathname = $path;
+
+            return $copy;
+        }
+
+        public function getQuery(): ?string
+        {
+            return self::urlRecord($this)->query;
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withQuery(?string $query): self
+        {
+            if ($query === $this->url->search || $query === $this->getQuery()) {
+                return $this;
+            }
+
+            $copy = $this->copy();
+            $copy->url->search = (string) $query;
+
+            return $copy;
+        }
+
+        public function getFragment(): ?string
+        {
+            return self::urlRecord($this)->fragment;
+        }
+
+        /**
+         * @throws InvalidUrlException
+         */
+        public function withFragment(?string $fragment): self
+        {
+            if ($fragment === self::urlRecord($this)->fragment) {
+                return $this;
+            }
+
+            $copy = $this->copy();
+            $copy->url->hash = (string) $fragment;
+
+            return $copy;
+        }
+
+        public function equals(self $url, UriComparisonMode $comparisonMode = UriComparisonMode::ExcludeFragment): bool
+        {
+            return match (true) {
+                $this->url->hash === $url->url->hash,
+                UriComparisonMode::IncludeFragment === $comparisonMode => $this->url->href === $url->url->href,
+                default => self::urlRecord($this)->isEqual(self::urlRecord($url), true),
+            };
+        }
+
+        /**
+         * Retrieve the WHATWG URL object URLRecord property.
+         *
+         * The URLRecord is an internal representation;
+         * therefore, we use reflection to access it
+         */
+        private static function urlRecord(self $url): URLRecord
+        {
+            /** @var ?ReflectionProperty $property */
+            static $property = null;
+            $property ??= (new ReflectionClass(WhatWgURL::class))->getProperty('url');
+
+            /** @var URLRecord $urlRecord */
+            $urlRecord = $property->getValue($url->url);
+
+            return $urlRecord;
+        }
+
+        public function toAsciiString(): string
+        {
+            if (null !== $this->urlAsciiString) {
+                return $this->urlAsciiString;
+            }
+
+            $asciiHost = $this->getAsciiHost();
+            if (null === $asciiHost || $this->getUnicodeHost() === $asciiHost) {
+                $this->urlAsciiString = $this->url->href;
+
+                return $this->urlAsciiString;
+            }
+
+            $urlRecord = self::urlRecord($this);
+            $urlRecord->host = new StringHost($asciiHost);
+            $this->urlAsciiString = $urlRecord->serializeURL();
+
+            return $this->urlAsciiString;
+        }
+
+        public function toUnicodeString(): string
+        {
+            if (null !== $this->urlUnicodeString) {
+                return $this->urlUnicodeString;
+            }
+
+            $unicodeHost = $this->getUnicodeHost();
+            if (null === $unicodeHost || $this->getAsciiHost() === $unicodeHost) {
+                $this->urlUnicodeString = $this->url->href;
+
+                return $this->urlUnicodeString;
+            }
+
+            $urlRecord = self::urlRecord($this);
+            $urlRecord->host = new StringHost($unicodeHost);
+            $this->urlUnicodeString = $urlRecord->serializeURL();
+
+            return $this->urlUnicodeString;
+        }
+
+        /**
+         * @param list<UrlValidationError> $softErrors
+         *
+         * @throws InvalidUrlException
+         */
+        public function resolve(string $uri, array|null &$softErrors = []): self
+        {
+            return new self($uri, $this, $softErrors);
+        }
+
+        /**
+         * @return UriSerializedShape
+         */
+        public function __serialize(): array
+        {
+            return [['uri' => $this->url->href], []];
+        }
+
+        /**
+         * @param UriSerializedShape $data
+         *
+         * @throws Exception|InvalidUrlException
+         */
+        public function __unserialize(array $data): void
+        {
+            [$properties] = $data;
+            $uri = new self($properties['uri'] ?? throw new Exception('The `uri` property is missing from the serialized object.'));
+            $this->url = $uri->url;
+        }
+
+        /**
+         * @return UriDebugShape
+         */
+        public function __debugInfo(): array
+        {
+            return [
+                'scheme' => $this->getScheme(),
+                'username' => $this->getUsername(),
+                'password' => $this->getPassword(),
+                'host' => $this->getAsciiHost(),
+                'port' => $this->getPort(),
+                'path' => $this->getPath(),
+                'query' => $this->getQuery(),
+                'fragment' => $this->getFragment(),
+            ];
+        }
+    }
+}

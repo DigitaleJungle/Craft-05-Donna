@@ -1,0 +1,27 @@
+{# Allow passing in a set list of options #}
+{% set fieldOptions = fieldOptions ?? field.getFieldOptions() %}
+
+{% fieldtag 'fieldOptions' %}
+    {% for option in fieldOptions %}
+        {% if option.isOther is defined and option.isOther %}
+            {# Rendered by _other-option.html #}
+        {% else %}
+        {# Ensure we cast as strings to compare #}
+        {% set selected = option.value is defined and ('' ~ option.value) == ('' ~ value) %}
+
+        {% fieldtag 'fieldOption' %}
+            {{ fieldtag('fieldInput', {
+                value: option.value ?? false,
+                checked: selected,
+                disabled: option.disabled ?? false,
+            }) }}
+
+            {% fieldtag 'fieldOptionLabel' %}
+                {{- option.label | purify | md(inlineOnly=true) | raw -}}
+            {% endfieldtag %}
+        {% endfieldtag %}
+        {% endif %}
+    {% endfor %}
+
+    {% include 'formie/_special/form-template/fields/_other-option.html' %}
+{% endfieldtag %}

@@ -1,0 +1,2668 @@
+<?php
+namespace verbb\formie\base;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\compatibility\integrations\IntegrationResultCompatibility;
+use verbb\formie\compatibility\integrations\LegacyIntegrationApiTrait;
+use verbb\formie\compatibility\integrations\LegacyIntegrationConfigTrait;
+use verbb\formie\compatibility\integrations\LegacyIntegrationDeliveryTrait;
+use verbb\formie\compatibility\integrations\LegacyIntegrationPolicyTrait;
+use verbb\formie\elements\Form;
+use verbb\formie\elements\Submission;
+use verbb\formie\errors\IntegrationException;
+use verbb\formie\errors\IntegrationStepException;
+use verbb\formie\events\IntegrationConfigEvent;
+use verbb\formie\events\IntegrationConnectionEvent;
+use verbb\formie\events\IntegrationFormSettingsEvent;
+use verbb\formie\events\ModifyFieldIntegrationValueEvent;
+use verbb\formie\events\ModifyFieldIntegrationValuesEvent;
+use verbb\formie\events\ModifyIntegrationFormSettingsSchemaEvent;
+use verbb\formie\events\ModifyIntegrationSlotTagEvent;
+use verbb\formie\events\SendIntegrationPayloadEvent;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\ConditionsHelper;
+use verbb\formie\helpers\DeliveryAttempt;
+use verbb\formie\helpers\DeliveryDiagnostics;
+use verbb\formie\helpers\IntegrationApiErrors;
+use verbb\formie\helpers\IntegrationHelper;
+use verbb\formie\helpers\IntegrationRerunPolicies;
+use verbb\formie\helpers\IntegrationSecrets;
+use verbb\formie\helpers\IntegrationTriggerEvents;
+use verbb\formie\helpers\LogPrivacy;
+use verbb\formie\helpers\References;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\helpers\Table;
+use verbb\formie\helpers\Variables;
+use verbb\formie\models\BrowserModule;
+use verbb\formie\models\BrowserModuleContext;
+use verbb\formie\models\FormIntegration;
+use verbb\formie\models\IntegrationCollection;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationDeliveryState;
+use verbb\formie\models\IntegrationExecutionContext;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationFormSettings;
+use verbb\formie\models\IntegrationResult;
+use verbb\formie\models\IntegrationRunContext;
+use verbb\formie\models\IntegrationSettingsContext;
+use verbb\formie\models\SlotTag;
+use verbb\formie\options\IntegrationOptionSourceHelper;
+use verbb\formie\options\OptionList;
+use verbb\formie\records\Integration as IntegrationRecord;
+use verbb\formie\references\ReferenceContext;
+use verbb\formie\references\ReferenceException;
+use verbb\formie\references\ReferenceOutputContext;
+use verbb\formie\references\ReferenceSlot;
+use verbb\formie\references\ReferenceSlotKind;
+use verbb\formie\references\ReferenceUsage;
+use verbb\formie\references\ResolvedReference;
+use verbb\formie\services\Integrations as IntegrationsService;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+use craft\base\SavableComponent;
+use craft\helpers\App;
+use craft\helpers\Db;
+use craft\helpers\Json;
+use craft\helpers\UrlHelper;
+use craft\queue\JobInterface;
+use craft\validators\HandleValidator;
+use craft\validators\UniqueValidator;
+use craft\web\Response;
+
+use yii\helpers\IpHelper;
+
+use Error;
+use Exception;
+use ReflectionClass;
+use ReflectionProperty;
+use Throwable;
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Handler\CurlHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Uri;
+use GuzzleHttp\Psr7\UriResolver;
+use Psr\Http\Message\ResponseInterface;
+use verbb\auth\Auth;
+use verbb\auth\base\OAuthProviderTrait;
+use verbb\auth\models\Token;
+
+abstract class Integration extends SavableComponent implements IntegrationInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    /** @deprecated Preserves the historical short name. Use ::class for identity or getShortClassName() for display. */
+    public static function className(): string
+    {
+        return static::getShortClassName();
+    }
+
+    public static function getShortClassName(): string
+    {
+        return (new ReflectionClass(static::class))->getShortName();
+    }
+
+    /** @deprecated Use getClassHandle() for the integration implementation handle. */
+    public static function kebabClassName(): string
+    {
+        return StringHelper::toKebabCase(static::className());
+    }
+
+    public static function isSelectable(): bool
+    {
+        return false;
+    }
+
+    public static function supportsConnection(): bool
+    {
+        return true;
+    }
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return false;
+    }
+
+    public static function supportsPayloadSending(): bool
+    {
+        return is_a(static::class, DispatchableIntegrationInterface::class, true) || static::hasLegacyPayloadOverride();
+    }
+
+    public static function hasFormSettings(): bool
+    {
+        return true;
+    }
+
+    public static function getOptionSourceDefinitions(): array
+    {
+        $definitions = [];
+
+        foreach (static::defineOptionSources() as $definition) {
+            if (!is_array($definition)) {
+                continue;
+            }
+
+            $handle = trim((string)($definition['handle'] ?? ''));
+            $label = trim((string)($definition['label'] ?? ''));
+
+            if ($handle === '' || $label === '') {
+                continue;
+            }
+
+            $publicDefinition = [
+                'handle' => $handle,
+                'label' => $label,
+            ];
+
+            if (isset($definition['optionSourceUsages'])) {
+                $publicDefinition['optionSourceUsages'] = (array)$definition['optionSourceUsages'];
+            }
+
+            $definitions[] = $publicDefinition;
+        }
+
+        return $definitions;
+    }
+
+    public static function getRequiredPlugins(): array
+    {
+        return [];
+    }
+
+    public static function info(IntegrationInterface $integration, string $message, bool $throwError = false): void
+    {
+        $message = self::_prepareLogMessage($integration, $message);
+        Formie::info($integration->name . ': ' . $message);
+
+        if ($throwError) {
+            throw new IntegrationException($message);
+        }
+    }
+
+    public static function warning(IntegrationInterface $integration, string $message, bool $throwError = false): void
+    {
+        $message = self::_prepareLogMessage($integration, $message);
+        Formie::warning($integration->name . ': ' . $message);
+
+        if ($throwError) {
+            throw new IntegrationException($message);
+        }
+    }
+
+    public static function error(IntegrationInterface $integration, string $message, bool $throwError = false): void
+    {
+        $message = self::_prepareLogMessage($integration, $message);
+        Formie::error($integration->name . ': ' . $message);
+
+        if ($throwError) {
+            throw new IntegrationException($message);
+        }
+    }
+
+    public static function apiError(IntegrationInterface $integration, Error|Exception $exception, bool $throwError = true, ?Submission $submission = null): void
+    {
+        if ($integration instanceof self) {
+            $integration->_deliveryState->error = $exception instanceof IntegrationStepException
+                ? $exception->result : IntegrationResult::fromException($exception);
+
+            if ($integration->_deliveryAttemptUid) {
+                Formie::$plugin->getDeliveryAttempts()->checkpoint($integration->_deliveryAttemptUid, 'provider-error', [
+                    'type' => get_class($exception), 'error' => self::getExceptionLogMessage($exception),
+                    'exception' => DeliveryDiagnostics::exception($exception),
+                ], $integration->getDiagnosticSecrets());
+            }
+        }
+
+        $messageText = self::_prepareLogMessage($integration, self::getExceptionLogMessage($exception));
+
+        $message = Craft::t('formie', 'API error: “{message}” {file}:{line}', [
+            'message' => $messageText,
+            'file' => $exception->getFile(),
+            'line' => $exception->getLine(),
+        ]);
+
+        $context = self::formatSubmissionLogContext($submission);
+
+        if ($context !== '') {
+            $message .= ' ' . $context;
+        }
+
+        $message = DeliveryDiagnostics::redact($message, $integration instanceof self ? $integration->getDiagnosticSecrets() : []);
+        Formie::error($integration->name . ': ' . $message);
+
+        if ($throwError) {
+            throw new IntegrationException($message, 0, $exception);
+        }
+    }
+
+    public static function formatSubmissionLogContext(?Submission $submission): string
+    {
+        if (!$submission) {
+            return '';
+        }
+
+        $form = $submission->getForm();
+
+        if (!$form) {
+            return Craft::t('formie', '[Submission #{submissionId}]', [
+                'submissionId' => $submission->id,
+            ]);
+        }
+
+        return Craft::t('formie', '[Form “{handle}” (#{formId}) submission #{submissionId}]', [
+            'handle' => $form->handle,
+            'formId' => $form->id,
+            'submissionId' => $submission->id,
+        ]);
+    }
+
+    public static function getExceptionLogMessage(Throwable $exception): string
+    {
+        if ($exception instanceof RequestException && $exception->getResponse()) {
+            $response = $exception->getResponse();
+            $statusCode = $response->getStatusCode();
+            $reason = trim((string)$response->getReasonPhrase());
+            $body = trim((string)$response->getBody());
+
+            if (mb_strlen($body) > 2000) {
+                $body = mb_substr($body, 0, 2000) . '...';
+            }
+
+            return trim("HTTP {$statusCode}" . ($reason !== '' ? " {$reason}" : '') . ($body !== '' ? " ({$body})" : ''));
+        }
+
+        return $exception->getMessage();
+    }
+
+    public static function convertValueForIntegration(mixed $value, IntegrationField $integrationField): mixed
+    {
+        return IntegrationHelper::convertValueForIntegration($value, $integrationField);
+    }
+
+    protected static function defineOptionSources(): array
+    {
+        return [];
+    }
+
+    private static function _prepareLogMessage(IntegrationInterface $integration, string $message): string
+    {
+        $self = $integration instanceof self ? $integration : null;
+        // Masked before redaction, which shortens long messages and would leave invalid JSON behind.
+        $message = LogPrivacy::maskIntegrationMessage($message, $self?->_deliveryContext?->formId ?? $self?->_logFormId);
+
+        return DeliveryDiagnostics::redact($message, $self?->getDiagnosticSecrets() ?? []);
+    }
+
+    private static function _isEmpty($value): bool
+    {
+        return $value === '' || $value === [] || $value === null;
+    }
+
+    private static function _getOptionSourceDefinition(string $provider): ?array
+    {
+        foreach (static::defineOptionSources() as $definition) {
+            if (!is_array($definition) || (string)($definition['handle'] ?? '') !== $provider) {
+                continue;
+            }
+
+            return $definition;
+        }
+
+        return null;
+    }
+
+    private static function _sanitizeQueueHeaders(mixed $headers): mixed
+    {
+        if (!is_array($headers)) {
+            return $headers;
+        }
+
+        foreach ($headers as $key => $value) {
+            if (in_array(mb_strtolower((string)$key), ['authorization', 'x-api-key', 'api-key'], true)) {
+                $headers[$key] = '[redacted]';
+            }
+        }
+
+        return $headers;
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_BEFORE_SEND_PAYLOAD = 'beforeSendPayload';
+    public const EVENT_AFTER_SEND_PAYLOAD = 'afterSendPayload';
+    public const EVENT_BEFORE_CHECK_CONNECTION = 'beforeCheckConnection';
+    public const EVENT_AFTER_CHECK_CONNECTION = 'afterCheckConnection';
+    public const EVENT_BEFORE_FETCH_CONFIG = 'beforeFetchConfig';
+    public const EVENT_AFTER_FETCH_CONFIG = 'afterFetchConfig';
+    public const EVENT_BEFORE_FETCH_FORM_SETTINGS = 'beforeFetchFormSettings';
+    public const EVENT_AFTER_FETCH_FORM_SETTINGS = 'afterFetchFormSettings';
+    public const EVENT_MODIFY_FIELD_MAPPING_VALUES = 'modifyFieldMappingValues';
+    public const EVENT_MODIFY_FIELD_MAPPING_VALUE = 'modifyFieldMappingValue';
+    public const EVENT_MODIFY_INTEGRATION_FORM_SETTINGS_SCHEMA = 'modifyIntegrationFormSettingsSchema';
+    public const EVENT_MODIFY_SLOT_TAG = 'modifySlotTag';
+
+    public const TYPE_ADDRESS_PROVIDER = 'addressProvider';
+    public const TYPE_CAPTCHA = 'captcha';
+    public const TYPE_ELEMENT = 'element';
+    public const TYPE_EMAIL_MARKETING = 'emailMarketing';
+    public const TYPE_CRM = 'crm';
+    public const TYPE_HELP_DESK = 'helpDesk';
+    public const TYPE_MESSAGING = 'messaging';
+    public const TYPE_PAYMENT = 'payment';
+    public const TYPE_AUTOMATION = 'automation';
+    public const TYPE_MISC = 'miscellaneous';
+    public const TYPE_CUSTOM = 'custom';
+
+    public const CATEGORY_ADDRESS_PROVIDERS = 'addressProviders';
+    public const CATEGORY_CAPTCHAS = 'captchas';
+    public const CATEGORY_ELEMENTS = 'elements';
+    public const CATEGORY_EMAIL_MARKETING = 'emailMarketing';
+    public const CATEGORY_CRM = 'crm';
+    public const CATEGORY_HELP_DESK = 'helpDesk';
+    public const CATEGORY_MESSAGING = 'messaging';
+    public const CATEGORY_PAYMENTS = 'payments';
+    public const CATEGORY_AUTOMATIONS = 'automations';
+    public const CATEGORY_MISC = 'miscellaneous';
+    public const CATEGORY_CUSTOM = 'custom';
+
+    public const SCENARIO_FORM = 'form';
+
+    public const CONNECT_SUCCESS = 'success';
+    public const CONNECT_FAIL = 'fail';
+    public const OAUTH_CALLBACK_ACTION = 'formie/integrations/callback';
+
+    // Documentation page names that differ from the lowercased class name.
+    private const DOCUMENTATION_PAGES = [
+        \verbb\formie\integrations\addressproviders\Google::class => 'google-places',
+        \verbb\formie\integrations\automations\WebRequest::class => 'web-request',
+        \verbb\formie\integrations\captchas\CaptchaEu::class => 'captcha-eu',
+        \verbb\formie\integrations\captchas\FriendlyCaptcha::class => 'friendly-captcha',
+        \verbb\formie\integrations\captchas\Turnstile::class => 'cloudflare-turnstile',
+        \verbb\formie\integrations\crm\Agile::class => 'agile-crm',
+        \verbb\formie\integrations\crm\IterableIntegration::class => 'iterable',
+        \verbb\formie\integrations\crm\Mercury::class => 'mercury-by-connective',
+        \verbb\formie\integrations\crm\MicrosoftDynamics365::class => 'microsoft-dynamics-365',
+        \verbb\formie\integrations\crm\OneCrm::class => '1crm',
+        \verbb\formie\integrations\elements\CalendarEvent::class => 'calendar-event',
+        \verbb\formie\integrations\elements\EventsEvent::class => 'events-event',
+        \verbb\formie\integrations\emailmarketing\Brevo::class => 'brevo-sendinblue',
+        \verbb\formie\integrations\emailmarketing\Campaign::class => 'campaign-plugin',
+        \verbb\formie\integrations\emailmarketing\CampaignMonitor::class => 'campaign-monitor',
+        \verbb\formie\integrations\emailmarketing\ConstantContact::class => 'constant-contact',
+        \verbb\formie\integrations\emailmarketing\CustomerIo::class => 'customer-io',
+        \verbb\formie\integrations\emailmarketing\IterableIntegration::class => 'iterable',
+        \verbb\formie\integrations\helpdesk\HelpScout::class => 'help-scout',
+        \verbb\formie\integrations\miscellaneous\GoogleSheets::class => 'google-sheets',
+        \verbb\formie\integrations\payments\PayWay::class => 'westpac-payway',
+    ];
+
+
+    // Traits
+    // =========================================================================
+
+    use OAuthProviderTrait {
+        request as protected sendOAuthRequest;
+    }
+    use LegacyIntegrationApiTrait;
+    use LegacyIntegrationConfigTrait;
+    use LegacyIntegrationDeliveryTrait;
+    use LegacyIntegrationPolicyTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $name = null;
+    public ?string $handle = null;
+    public ?string $scope = null;
+    public ?string $type = null;
+    public ?int $sortOrder = null;
+    public array $cache = [];
+    public ?string $uid = null;
+
+    #[Sensitive]
+    public ?string $clientSecret = null;
+
+    // Store extra context for when running the integration
+    public array $context = [];
+    // Store extra context when configuring the integration in the form builder
+    public IntegrationSettingsContext $settingsContext;
+
+    protected ?Client $_client = null;
+    protected IntegrationDeliveryState $_deliveryState;
+
+    private ?FormIntegration $_formIntegration = null;
+    private ?IntegrationRunContext $_runContext = null;
+    private ?Submission $_contextSubmission = null;
+    private ?array $_mappingSlot = null;
+    // Keep track of whether run in the context of a queue job
+    private ?JobInterface $_queueJob = null;
+    private ?IntegrationExecutionContext $_deliveryContext = null;
+    private ?int $_logFormId = null;
+    private ?string $_deliveryAttemptUid = null;
+    private array $_deliveryStepCounts = [];
+    private bool $_directDelivery = false;
+    private bool $_configRefreshCancelled = false;
+    private bool|string $_enabled = false;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct($config = [])
+    {
+        $this->_deliveryState = new IntegrationDeliveryState();
+
+        if (!isset($config['settingsContext'])) {
+            $config['settingsContext'] = new IntegrationSettingsContext();
+        }
+
+        parent::__construct($config);
+    }
+
+    public function isProjectScope(): bool
+    {
+        return $this->getScope() === IntegrationsService::SCOPE_PROJECT;
+    }
+
+    public function isSiteScope(): bool
+    {
+        return $this->getScope() === IntegrationsService::SCOPE_SITE;
+    }
+
+    public function getScope(): string
+    {
+        $scope = $this->scope ?? IntegrationsService::SCOPE_PROJECT;
+
+        return in_array($scope, [IntegrationsService::SCOPE_PROJECT, IntegrationsService::SCOPE_SITE], true)
+            ? $scope
+            : IntegrationsService::SCOPE_PROJECT;
+    }
+
+    public function getScopeLabel(): string
+    {
+        if ($this->isSiteScope()) {
+            return '';
+        }
+
+        return Craft::t('formie', 'Project');
+    }
+
+    public function canEdit(): bool
+    {
+        if ($this->isSiteScope()) {
+            return true;
+        }
+
+        return (bool)Craft::$app->getConfig()->getGeneral()->allowAdminChanges;
+    }
+
+    public function canDelete(): bool
+    {
+        return $this->canEdit();
+    }
+
+    public function scenarios(): array
+    {
+        $scenarios = parent::scenarios();
+
+        // Always have the form's scenario defined, but don't overwrite it
+        $scenarios[self::SCENARIO_FORM] = $scenarios[self::SCENARIO_FORM] ?? [];
+
+        return $scenarios;
+    }
+
+    public function settingsAttributes(): array
+    {
+        // These won't be picked up in a Trait
+        $attributes = parent::settingsAttributes();
+
+        if (static::supportsOAuthConnection()) {
+            $attributes[] = 'clientId';
+            $attributes[] = 'clientSecret';
+        }
+
+        return $attributes;
+    }
+
+    public function getFormSettingAttributes(): array
+    {
+        return array_merge(FormIntegration::POLICY_ATTRIBUTES, FormIntegration::settingAttributes($this));
+    }
+
+    public function getFormIntegration(): FormIntegration
+    {
+        return $this->_formIntegration ?? FormIntegration::fromSettings($this, ['enabled' => $this->getEnabled()] + $this->_legacyPolicyOverrides);
+    }
+
+    public function setFormIntegration(FormIntegration $binding): void
+    {
+        $this->_formIntegration = $binding;
+        $this->_legacyPolicyOverrides = [];
+    }
+
+    public function __clone(): void
+    {
+        // Cached connections are prototypes, never reusable executions or builder contexts.
+        $this->_client = null;
+        $this->_oauthProvider = null;
+        $this->_queueJob = null;
+        $this->_deliveryContext = null;
+        $this->_logFormId = null;
+        $this->_deliveryAttemptUid = null;
+        $this->_deliveryStepCounts = [];
+        $this->_directDelivery = false;
+        $this->_configRefreshCancelled = false;
+        $this->_deliveryState = new IntegrationDeliveryState();
+        $this->_runContext = null;
+        $this->_legacyApiCalls = [];
+        $this->context = [];
+        $this->settingsContext = clone $this->settingsContext;
+    }
+
+    /** @deprecated Providers no longer need to opt in. This has no effect. */
+    public function supportsDeliveryWriteTracking(): bool
+    {
+        return false;
+    }
+
+    public function supportsIntegrationApiErrorSeverity(): bool
+    {
+        return false;
+    }
+
+    public function classifyIntegrationApiError(Throwable $exception): ?string
+    {
+        return null;
+    }
+
+    public function handleSubmissionApiError(Throwable $exception, Submission $submission): bool
+    {
+        if (!$this->supportsIntegrationApiErrorSeverity()) {
+            throw new IntegrationException(Craft::t('formie', 'This integration does not support API error severity handling.'));
+        }
+
+        $severity = $this->classifyIntegrationApiError($exception) ?? IntegrationApiErrors::SEVERITY_FAILURE;
+
+        $handled = IntegrationApiErrors::applySubmissionErrorAction($this, $exception, $submission, $severity);
+        // The policy accepts skipping this delivery, not successful delivery to the provider.
+        // Use the same outcome throughout batching, failure alerts and success conditions.
+        $this->_deliveryState->error = IntegrationResult::skipped('api_error_' . $severity);
+        $this->_deliveryState->handledError = true;
+
+        return $handled;
+    }
+
+    // These established hooks intentionally allow untyped third-party overrides.
+    public function getDescription()
+    {
+        return '';
+    }
+
+    public function fetchConnection()
+    {
+        return static::supportsOAuthConnection() && $this->getToken() !== null;
+    }
+
+    public function getOptionSourceRefreshParams(string $provider)
+    {
+        return $this->getConfigRefreshParams();
+    }
+
+    /** @deprecated Override getOptionSourceRefreshParams() for each option source. */
+    public function getConfigRefreshParams()
+    {
+        return [];
+    }
+
+    public function getName(): string
+    {
+        return $this->name ?? '';
+    }
+
+    public function getHandle(): string
+    {
+        return $this->handle ?? '';
+    }
+
+    public function getType(): string
+    {
+        return self::TYPE_CUSTOM;
+    }
+
+    // No return type: stable third-party subclasses may declare this method without one.
+    public function getClassHandle()
+    {
+        return StringHelper::toKebabCase(static::getShortClassName());
+    }
+
+    public function getTypeHandle(): string
+    {
+        return StringHelper::toKebabCase($this->getType());
+    }
+
+    public function getCategory(): string
+    {
+        return '';
+    }
+
+    public function getCategoryHandle(): string
+    {
+        return StringHelper::toKebabCase($this->getCategory());
+    }
+
+    /**
+     * Returns the provider's setup guide, or null for integrations Formie doesn't document.
+     */
+    public function getDocumentationUrl(): ?string
+    {
+        // The docs have one page per provider and no category index, so third-party providers get no link.
+        if (!str_starts_with(static::class, 'verbb\\formie\\integrations\\') || str_contains(static::class, '@anonymous')) {
+            return null;
+        }
+
+        $category = trim((string)$this->getCategoryHandle());
+
+        if ($category === '') {
+            return null;
+        }
+
+        $page = self::DOCUMENTATION_PAGES[static::class] ?? strtolower(static::getShortClassName());
+
+        // Versioned so the link keeps pointing at Formie 4 docs after the next major release.
+        return "https://verbb.io/craft-plugins/formie/docs/v4/integrations/{$category}/{$page}";
+    }
+
+    public function getCpIconPath(): string
+    {
+        // External providers own their icon URLs, even when they extend a built-in category.
+        if (!str_starts_with(static::class, 'verbb\\formie\\integrations\\') || str_contains(static::class, '@anonymous')) {
+            return '';
+        }
+
+        $category = trim((string)$this->getCategoryHandle());
+        $category = $category === 'help-desk' ? 'helpdesk' : $category;
+        $handle = trim((string)$this->getClassHandle());
+
+        if ($category === '' || $handle === '') {
+            return '';
+        }
+
+        return "icons/{$category}/{$handle}.svg";
+    }
+
+    public function getCpIconUrl(?string $distBaseUrl = null): string
+    {
+        $path = $this->getCpIconPath();
+
+        if ($path === '') {
+            return $this->getIconUrl();
+        }
+
+        static $cachedDistBaseUrl = null;
+        $base = $distBaseUrl !== null ? rtrim((string)$distBaseUrl, '/') : '';
+
+        if ($base === '') {
+            if ($cachedDistBaseUrl === null) {
+                $resolved = (string)Craft::$app->getAssetManager()->getPublishedUrl('@verbb/formie/web/assets/cp/dist/', true);
+                $cachedDistBaseUrl = rtrim($resolved, '/');
+            }
+
+            $base = $cachedDistBaseUrl;
+        }
+
+        if ($base !== '') {
+            return "{$base}/{$path}";
+        }
+
+        // Fallback: should rarely happen, but keep behavior safe.
+        return (string)Craft::$app->getAssetManager()->getPublishedUrl('@verbb/formie/web/assets/cp/dist/', true, $path);
+    }
+
+    public function getEnabled(bool $parse = true): bool|string
+    {
+        if ($parse) {
+            return App::parseBooleanEnv($this->_enabled) ?? false;
+        }
+
+        return $this->_enabled;
+    }
+
+    public function setEnabled(bool|string $name): void
+    {
+        $this->_enabled = $name;
+    }
+
+    public function getEnabledMenuValue(): string
+    {
+        $raw = $this->getEnabled(false);
+
+        if (is_string($raw) && str_starts_with(trim($raw), '$')) {
+            return trim($raw);
+        }
+
+        return App::parseBooleanEnv($raw) ? '1' : '0';
+    }
+
+    public function getIconUrl(): string
+    {
+        return '';
+    }
+
+    public function getSettingsHtml(): ?string
+    {
+        return '';
+    }
+
+    public function getSettingsHtmlVariables(): array
+    {
+        return [
+            'integration' => $this,
+            'fieldVariables' => [
+                'plugin' => 'formie',
+                'name' => $this::displayName(),
+            ],
+        ];
+    }
+
+    public function renderSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        $tag = $this->defineSlotTag($key, $context);
+        $beforeAttributes = $tag?->attributes ?? [];
+        $event = new ModifyIntegrationSlotTagEvent([
+            'integration' => $this,
+            'tag' => $tag,
+            'key' => $key,
+            'context' => $context->toArray(),
+        ]);
+
+        $this->trigger(static::EVENT_MODIFY_SLOT_TAG, $event);
+
+        $event->tag?->captureTrustedEventResult($beforeAttributes);
+
+        return $event->tag;
+    }
+
+    public function createFieldMappingField(array $config = []): array
+    {
+        return $this->callLegacyIntegrationMethod('getIntegrationFieldMappingField', Integration::class, [$config], function() use ($config) {
+            $dataLabel = isset($config['dataLabel']) ? trim((string)$config['dataLabel']) : '';
+            $dataKey = isset($config['dataKey']) ? trim((string)$config['dataKey']) : '';
+
+            return SchemaHelper::integrationFieldMappingField(array_merge([
+                'label' => Craft::t('formie', '{name} Field Mapping', ['name' => $dataLabel]),
+                'instructions' => Craft::t('formie', 'Choose how your form fields should map to your {name} {label} fields.', ['name' => $this->displayName(), 'label' => $dataLabel]),
+                'integrationLabel' => Craft::t('formie', '{name} Field', ['name' => $dataLabel]),
+                'integrationFields' => $this->defineFieldMappingSchema($dataKey),
+            ], $config));
+        }, canonicalMethod: 'createFieldMappingField');
+    }
+
+    /** @deprecated Use createFieldMappingField(). */
+    public function getIntegrationFieldMappingField(array $config = []): array
+    {
+        return $this->callCanonicalIntegrationMethod('getIntegrationFieldMappingField', fn() => $this->createFieldMappingField($config));
+    }
+
+    public function getFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = $this->defineFormSettingsSchema($form);
+        $schema = SchemaHelper::schemaNode($schema);
+        $event = new ModifyIntegrationFormSettingsSchemaEvent([
+            'schema' => $schema,
+            'integration' => $this,
+            'form' => $form,
+        ]);
+        $this->trigger(self::EVENT_MODIFY_INTEGRATION_FORM_SETTINGS_SCHEMA, $event);
+
+        return $event->schema;
+    }
+
+    public function getBrowserModule(BrowserModuleContext $context): ?BrowserModule
+    {
+        return null;
+    }
+
+    public function hasValidSettings(): bool
+    {
+        return true;
+    }
+
+    public function supportsConfigRefresh(): bool
+    {
+        return false;
+    }
+
+    public function getQueueJob(): ?JobInterface
+    {
+        return $this->_queueJob;
+    }
+
+    public function setQueueJob(mixed $value): void
+    {
+        $this->_queueJob = $value;
+    }
+
+    public function setClient(mixed $value): void
+    {
+        $this->_client = $value;
+    }
+
+    public function getClient()
+    {
+        if ($this->_client) {
+            return $this->_client;
+        }
+
+        return $this->_client = $this->defineClient();
+    }
+
+    public function extraAttributes(): array
+    {
+        return [];
+    }
+
+    public function checkConnection(bool $useCache = true): bool
+    {
+        IntegrationSecrets::assertAvailable($this->getSettings());
+
+        if ($useCache && $status = $this->_getCache('connection')) {
+            if ($status === self::CONNECT_SUCCESS) {
+                return true;
+            }
+        }
+
+        // Fire a 'beforeCheckConnection' event
+        $event = new IntegrationConnectionEvent([
+            'integration' => $this,
+        ]);
+        $this->trigger(self::EVENT_BEFORE_CHECK_CONNECTION, $event);
+
+        if (!$event->isValid) {
+            Integration::info($this, 'Checking connection cancelled by event hook.');
+
+            return false;
+        }
+
+        $success = $this->fetchConnection() ? self::CONNECT_SUCCESS : self::CONNECT_FAIL;
+
+        // Fire a 'afterCheckConnection' event
+        $event = new IntegrationConnectionEvent([
+            'integration' => $this,
+            'success' => $success,
+        ]);
+        $this->trigger(self::EVENT_AFTER_CHECK_CONNECTION, $event);
+
+        // Update the cache
+        $this->_setCache(['connection' => $event->success]);
+
+        return $event->success === self::CONNECT_SUCCESS;
+    }
+
+    public function getIsConnected(): bool
+    {
+        if (static::supportsOAuthConnection()) {
+            return (bool)$this->getToken();
+        }
+
+        if (static::supportsConnection()) {
+            return $this->_getCache('connection') === self::CONNECT_SUCCESS;
+        }
+
+        return false;
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        return new IntegrationConfig();
+    }
+
+    public function getConfig(bool $useCache = true): IntegrationConfig
+    {
+        if (!$useCache) {
+            $this->_configRefreshCancelled = false;
+        }
+
+        return $this->callLegacyIntegrationMethod('getFormSettings', Integration::class, [$useCache], fn() => $this->resolveConfig($useCache), function($settings) {
+            if ($settings === false) {
+                $this->_configRefreshCancelled = true;
+
+                return $this->_getCachedConfig();
+            }
+
+            $cached = $this->_getCachedConfig();
+
+            return new IntegrationConfig(
+                $settings->getSettings(),
+                $cached->invalidationKey,
+                $cached->fetchedAt,
+            );
+        }, 'getConfig');
+    }
+
+    public function refreshConfig(): IntegrationConfig
+    {
+        return $this->getConfig(false);
+    }
+
+    /** @deprecated in 4.0.0. Use getConfig(). */
+    public function getFormSettings(bool $useCache = true): bool|IntegrationFormSettings
+    {
+        $config = $this->callCanonicalIntegrationMethod('getFormSettings', fn() => $this->getConfig($useCache));
+
+        if (!$useCache && $this->_configRefreshCancelled) {
+            return false;
+        }
+
+        return IntegrationFormSettings::fromConfig($config);
+    }
+
+    public function getIntegrationConfigKey(): string
+    {
+        // Identity changes invalidate metadata without persisting connection secrets.
+        return hash('sha256', static::class . ':' . ($this->uid ?: $this->id) . ':' . ($this->cache['configGeneration'] ?? 'initial'));
+    }
+
+    public function invalidateConfig(): void
+    {
+        unset($this->cache['settings'], $this->cache['config']);
+        $this->_setCache(['configGeneration' => StringHelper::UUID()]);
+    }
+
+    public function getConfigValue(string $key): mixed
+    {
+        return $this->callLegacyIntegrationMethod('getFormSettingValue', Integration::class, [$key], fn() => $this->getConfig()->get($key), canonicalMethod: 'getConfigValue');
+    }
+
+    /** @deprecated in 4.0.0. Use getConfigValue(). */
+    public function getFormSettingValue(string $key)
+    {
+        return $this->callCanonicalIntegrationMethod('getFormSettingValue', fn() => $this->getConfigValue($key));
+    }
+
+    public function validateFieldMapping(string $attribute, array $fields = []): void
+    {
+        $mapping = $this->$attribute;
+
+        if (!is_array($mapping)) {
+            $mapping = [];
+        }
+
+        foreach ($fields as $field) {
+            $rawValue = $mapping[$field->handle] ?? '';
+            $value = $this->normalizeFieldMappingValue($rawValue);
+
+            if ($field->required && $value === '') {
+                $this->addError($attribute, Craft::t('formie', '{name} must be mapped.', ['name' => $field->name]));
+
+                return;
+            }
+        }
+    }
+
+    public function getToken(): ?Token
+    {
+        if ($this->id) {
+            return Auth::getInstance()->getTokens()->getTokenByOwnerReference('formie', $this->id);
+        }
+
+        return null;
+    }
+
+    public function getRedirectUri(): ?string
+    {
+        $redirectUri = App::parseEnv(Formie::$plugin->getSettings()->redirectUri);
+
+        if (is_string($redirectUri) && $redirectUri !== '') {
+            return $redirectUri;
+        }
+
+        return UrlHelper::actionUrl(self::OAUTH_CALLBACK_ACTION);
+    }
+
+    /** @internal Sets the attempt prepared by the runner. */
+    public function setDeliveryContext(IntegrationExecutionContext $context, string $attemptUid): void
+    {
+        $this->_deliveryContext = $context;
+        $this->_deliveryAttemptUid = $attemptUid;
+        $this->_deliveryStepCounts = [];
+        $this->_deliveryState = new IntegrationDeliveryState();
+    }
+
+    /** Prepares provider execution; application callers enter through the trigger services. */
+    public function beginRun(IntegrationRunContext $context): void
+    {
+        if ($this->_runContext === $context) {
+            return;
+        }
+
+        $this->_runContext = $context;
+        $this->_deliveryContext = $context->execution;
+        $this->_deliveryAttemptUid = $context->attemptUid;
+        $this->_deliveryState = $context->state;
+        $this->_deliveryStepCounts = [];
+        $this->_directDelivery = $context->attemptUid === null;
+    }
+
+    public function getDeliveryAttemptUid(): ?string
+    {
+        return $this->_deliveryAttemptUid;
+    }
+
+    public function getDeliveryExecutionContext(): ?IntegrationExecutionContext
+    {
+        return $this->_deliveryContext;
+    }
+
+    /** @internal Identifies the form behind log messages written outside a delivery run, such as payments. */
+    public function setLogFormId(?int $formId): void
+    {
+        $this->_logFormId = $formId;
+    }
+
+    public function beginPayloadDelivery(Submission $submission): void
+    {
+        if (!$this->_deliveryContext) {
+            $this->_deliveryState = new IntegrationDeliveryState();
+            $this->_directDelivery = true;
+            $this->_deliveryContext = new IntegrationExecutionContext(
+                (int)$submission->id,
+                (int)$submission->formId,
+                (string)$this->handle,
+                DeliveryAttempt::workflowIdentity() ?? StringHelper::UUID(),
+                'synchronous',
+                'direct',
+            );
+        }
+    }
+
+    public function resultForPayload(mixed $value): IntegrationResult
+    {
+        // The provider's return value decides. An error it handled and carried on from doesn't
+        // fail the delivery, unless it's been marked as one that must, like a rejecting hook.
+        $errorResult = $value === false || $this->_deliveryState->handledError ? ($this->_deliveryState->error ?? null) : null;
+        $result = $errorResult ?? (!empty($this->_deliveryState->skipped) && empty($this->_deliveryState->writeAccepted)
+            ? IntegrationResult::skipped('event_or_opt_in')
+            : IntegrationResultCompatibility::normalize($value));
+
+        $result = $result->withOutputs($this->_deliveryState->outputs);
+
+        if ($this->_directDelivery) {
+            if ($this->_deliveryAttemptUid) {
+                Formie::$plugin->getDeliveryAttempts()->completeDirect($this->_deliveryAttemptUid, $result);
+            }
+
+            $this->_deliveryContext = null;
+            $this->_deliveryAttemptUid = null;
+            $this->_deliveryStepCounts = [];
+            $this->_directDelivery = false;
+        }
+
+        return $result;
+    }
+
+    public function resultForException(Throwable $error): IntegrationResult
+    {
+        if ($this->_deliveryAttemptUid) {
+            Formie::$plugin->getDeliveryAttempts()->checkpoint($this->_deliveryAttemptUid, 'exception', DeliveryDiagnostics::exception($error), $this->getDiagnosticSecrets());
+        }
+
+        $cause = $error;
+
+        do {
+            if ($cause instanceof IntegrationStepException) {
+                return $cause->result;
+            }
+        } while ($cause = $cause->getPrevious());
+
+        return IntegrationResult::fromException($error);
+    }
+
+    public function executeDeliveryWrite(string $method, string $uri, array $options, callable $send, bool $isSideEffect = false): mixed
+    {
+        // Explicit builder samples have no persisted submission or retry identity. Send once without creating invalid delivery records.
+        if (!$this->_deliveryContext || ($this->_deliveryContext->reason === 'test' && $this->_deliveryContext->submissionId === 0) || (!$isSideEffect && in_array(strtoupper($method), ['GET', 'HEAD', 'OPTIONS'], true))) {
+            return $send();
+        }
+
+        if (!$this->_deliveryAttemptUid) {
+            $this->_deliveryAttemptUid = Formie::$plugin->getDeliveryAttempts()->startDirect($this->_deliveryContext);
+        }
+
+        // The endpoint and occurrence identify a concrete provider operation, so a
+        // retry can skip the ones that already succeeded.
+        $key = strtoupper($method) . ':' . hash('sha256', $uri);
+        $ordinal = $this->_deliveryStepCounts[$key] = ($this->_deliveryStepCounts[$key] ?? 0) + 1;
+        $identityOptions = array_diff_key($options, array_flip(['handler', 'curl', 'proxy', 'verify', 'allow_redirects']));
+
+        return Formie::$plugin->getDeliveryAttempts()->write($this->_deliveryContext, $key . ':' . $ordinal, $this->_deliveryAttemptUid, $identityOptions, $send, ['method' => $method, 'endpoint' => $uri], $this->getDiagnosticSecrets());
+    }
+
+    public function requestWithProviderClient(Client $client, string $method, string $uri, array $options = []): mixed
+    {
+        IntegrationSecrets::assertAvailable($this->getSettings());
+
+        $origin = new Uri((string)$client->getConfig('base_uri'));
+        $target = UriResolver::resolve($origin, new Uri($uri));
+
+        if (!$origin->getHost() || strtolower($target->getHost()) !== strtolower($origin->getHost()) || $target->getScheme() !== $origin->getScheme() || $target->getPort() !== $origin->getPort() || $target->getUserInfo() !== '') {
+            throw new IntegrationStepException(IntegrationResult::failed('provider_origin_mismatch'));
+        }
+
+        $this->_applyPublicEndpointDnsPin($options, (string)$target);
+        $text = $this->executeDeliveryWrite($method, (string)$target, $options, fn() => $this->_readDeliveryResponse($client->request($method, (string)$target, $options)));
+
+        if (!in_array(strtoupper($method), ['GET', 'HEAD', 'OPTIONS'], true)) {
+            $this->_deliveryState->writeAccepted = true;
+        }
+
+        return Json::isJsonObject($text) ? Json::decode($text) : $text;
+    }
+
+    /** @deprecated Historical OAuth transport alias. Use request() for guarded integration delivery. */
+    public function OAuthRequest(string $method = 'GET', string $uri = '', array $options = [])
+    {
+        return $this->callCanonicalIntegrationMethod('OAuthRequest', fn() => $this->requestWithOAuthProvider($method, $uri, $options));
+    }
+
+    public function request(string $method, string $uri, array $options = []): mixed
+    {
+        IntegrationSecrets::assertAvailable($this->getSettings());
+
+        $options['allow_redirects'] = false;
+
+        if (isset($options['base_uri'])) {
+            throw new IntegrationException('A request cannot override the configured provider origin.');
+        }
+
+        if (!$this instanceof Automation && !$this instanceof Payment) {
+            $base = (string)($this->getClient()->getConfig('base_uri') ?: (static::supportsOAuthConnection() ? $this->getBaseApiUrl($this->getToken()) : ''));
+            $target = UriResolver::resolve(new Uri($base), new Uri($uri));
+            $origin = new Uri($base);
+
+            if (!$origin->getHost() || strtolower($target->getHost()) !== strtolower($origin->getHost()) || $target->getScheme() !== $origin->getScheme() || $target->getPort() !== $origin->getPort() || $target->getUserInfo() !== '') {
+                throw new IntegrationStepException(IntegrationResult::failed('provider_origin_mismatch'));
+            }
+
+            $this->_applyPublicEndpointDnsPin($options, (string)$target);
+        }
+
+        $writes = !in_array(strtoupper($method), ['GET', 'HEAD', 'OPTIONS'], true);
+
+        try {
+            // If an OAuth-based integration, use the Auth module's client to do the request
+            if (static::supportsOAuthConnection()) {
+                if (!$this instanceof Payment) {
+                    $this->_secureOAuthClient($base);
+                }
+
+                $result = $this->executeDeliveryWrite($method, $uri, $options, fn() => $this->requestWithOAuthProvider($method, $uri, $options));
+
+                if ($writes) {
+                    $this->_deliveryState->writeAccepted = true;
+                }
+
+                return $result;
+            }
+
+            $text = $this->executeDeliveryWrite($method, $uri, $options, fn() => $this->_readDeliveryResponse($this->getClient()->request($method, ltrim($uri, '/'), $options)));
+
+            if ($writes) {
+                $this->_deliveryState->writeAccepted = true;
+            }
+
+            if (Json::isJsonObject($text)) {
+                return Json::decode($text);
+            }
+
+            return $text;
+        } catch (Throwable $e) {
+            $this->_deliveryState->error = $this->resultForException($e);
+
+            throw $e;
+        }
+    }
+
+    public function requestPublicEndpoint(string $method, string $uri, array $options = []): mixed
+    {
+        IntegrationSecrets::assertAvailable($this->getSettings());
+
+        $writes = !in_array(strtoupper($method), ['GET', 'HEAD', 'OPTIONS'], true);
+
+        foreach (['proxy', 'curl', 'handler', 'base_uri', 'verify', 'cert', 'ssl_key', 'cookies'] as $option) {
+            if (array_key_exists($option, $options)) {
+                throw new IntegrationException('Unsupported public endpoint transport option.');
+            }
+        }
+
+        foreach (array_keys($options['headers'] ?? []) as $header) {
+            if (in_array(strtolower($header), ['host', 'proxy-authorization', 'cookie'], true)) {
+                throw new IntegrationException('Unsupported public endpoint header.');
+            }
+        }
+
+        $options['allow_redirects'] = false;
+        $options['verify'] = true;
+
+        if (!$this->isTrustedPublicEndpoint($uri)) {
+            $options['proxy'] = '';
+        }
+
+        try {
+            // Use a clean client so provider credentials cannot be forwarded to
+            // a form-configured endpoint on an unrelated public host.
+            $text = $this->executeDeliveryWrite($method, $uri, $options, fn() => $this->_readDeliveryResponse($this->createPublicEndpointClient($uri)->request($method, $uri, $options)));
+
+            if ($writes) {
+                $this->_deliveryState->writeAccepted = true;
+            }
+
+            if (Json::isJsonObject($text)) {
+                return Json::decode($text);
+            }
+
+            return $text;
+        } catch (Throwable $e) {
+            $this->_deliveryState->error = $this->resultForException($e);
+
+            throw $e;
+        }
+    }
+
+    public function deliverPayload(Submission $submission, string $endpoint, mixed $payload, string $method = 'POST', string $contentType = 'json'): mixed
+    {
+        // Allow events to cancel sending
+        if (!$this->beforeSendPayload($submission, $endpoint, $payload, $method, $contentType)) {
+            $this->_deliveryState->skipped = true;
+
+            return false;
+        }
+
+        // Return a JSON response from the provider
+        $response = $this->request($method, $endpoint, [
+            $contentType => $payload,
+        ]);
+
+        // Allow events to say the response is invalid
+        if (!$this->afterSendPayload($submission, $endpoint, $payload, $method, $response)) {
+            return false;
+        }
+
+        return $response;
+    }
+
+    public function deliverPayloadToPublicEndpoint(Submission $submission, string $endpoint, mixed $payload, string $method = 'POST', string $contentType = 'json'): mixed
+    {
+        if (!$this->beforeSendPayload($submission, $endpoint, $payload, $method, $contentType)) {
+            $this->_deliveryState->skipped = true;
+
+            return false;
+        }
+
+        $response = $this->requestPublicEndpoint($method, $endpoint, [
+            $contentType => $payload,
+        ]);
+
+        if (!$this->afterSendPayload($submission, $endpoint, $payload, $method, $response)) {
+            return false;
+        }
+
+        return $response;
+    }
+
+    public function getFieldMappingValues(Submission $submission, ?array $fieldMapping, mixed $fieldSettings = null)
+    {
+        $fieldValues = [];
+
+        if (!is_array($fieldMapping)) {
+            $fieldMapping = [];
+        }
+
+        foreach ($fieldMapping as $tag => $rawFieldKey) {
+            $fieldKey = $this->normalizeFieldMappingValue($rawFieldKey);
+
+            // Don't let in un-mapped fields
+            if ($fieldKey === '') {
+                continue;
+            }
+
+            // Treat an explicitly supplied destination schema as an allowlist. Calls without a schema
+            // retain their open mapping contract for integrations with dynamic payloads.
+            $integrationField = is_array($fieldSettings) ? ArrayHelper::firstWhere($fieldSettings, 'handle', $tag) : null;
+
+            if (is_array($fieldSettings) && !$integrationField) {
+                continue;
+            }
+
+            $integrationField ??= new IntegrationField(['handle' => (string)$tag]);
+
+            $fieldValues[$tag] = $this->resolveMappedFieldValue($rawFieldKey, $submission, $integrationField);
+        }
+
+        $event = new ModifyFieldIntegrationValuesEvent([
+            'fieldValues' => $fieldValues,
+            'submission' => $submission,
+            'fieldMapping' => $fieldMapping,
+            'fieldSettings' => $fieldSettings,
+            'integration' => $this,
+        ]);
+
+        $this->modifyFieldMappingValues($event);
+        $this->trigger(static::EVENT_MODIFY_FIELD_MAPPING_VALUES, $event);
+
+        return $event->fieldValues;
+    }
+
+    public function shouldTrigger(Submission $submission, array $context = []): bool
+    {
+        $form = $submission->getForm();
+
+        if ($form) {
+            $triggerEvent = (string)($context['triggerEvent'] ?? IntegrationTriggerEvents::SUBMIT);
+            $operatorInitiated = (bool)($context['operatorInitiated'] ?? false);
+
+            if (!IntegrationRerunPolicies::isEventAllowed($form, $this, $triggerEvent, $operatorInitiated)) {
+                return false;
+            }
+        }
+
+        if (!$this->enableConditions) {
+            return true;
+        }
+
+        $conditionSettings = $this->conditions ?? [];
+
+        return ConditionsHelper::evaluate($conditionSettings, $submission, 'integration')->permits(($conditionSettings['triggerRule'] ?? 'trigger') === 'trigger');
+    }
+
+    /** Builds submission/template variables; execution identity and earlier results are supplied by IntegrationRunContext. */
+    public function populateContext(): void
+    {
+        $this->context = Formie::$plugin->getSubmissionMetadata()->buildIntegrationContext($this->_contextSubmission);
+    }
+
+    public function populateSubmissionContext(Submission $submission): void
+    {
+        $previous = $this->_contextSubmission;
+        $this->_contextSubmission = $submission;
+
+        try {
+            $this->populateContext();
+        } finally {
+            $this->_contextSubmission = $previous;
+        }
+    }
+
+    public function recordDeliveryRequest(Submission $submission, string $endpoint, mixed $payload, string $method, string $contentType): void
+    {
+        $this->callLegacyIntegrationMethod('populateQueueJobContext', Integration::class, func_get_args(), fn() => $this->recordDeliveryRequestEvidence($submission, $endpoint, $payload, $method, $contentType), canonicalMethod: 'recordDeliveryRequest');
+    }
+
+    /** @deprecated Use recordDeliveryRequest(). */
+    public function populateQueueJobContext($submission, $endpoint, $payload, $method, $contentType): void
+    {
+        $this->callCanonicalIntegrationMethod('populateQueueJobContext', fn() => $this->recordDeliveryRequest($submission, $endpoint, $payload, $method, $contentType));
+    }
+
+    public function getDiagnosticSecrets(): array
+    {
+        $secrets = [];
+        $collect = function($value) use (&$collect, &$secrets): void {
+            if (is_array($value)) {
+                foreach ($value as $item) {
+                    $collect($item);
+                }
+            } elseif (is_string($value) && $value !== '') {
+                $secrets[] = $value;
+                $parsed = App::parseEnv($value);
+
+                if (is_string($parsed) && $parsed !== '') {
+                    $secrets[] = $parsed;
+                }
+            }
+        };
+        $attributes = $this->getAttributes();
+
+        // Built-in settings explicitly declare sensitivity; metadata and runtime state are not credentials.
+        foreach (IntegrationSecrets::sensitiveAttributes($this) as $attribute) {
+            $collect($attributes[$attribute] ?? null);
+        }
+
+        // Older add-ons may lack annotations. Recognize exact credential property names only,
+        // without searching their cache, context or unrelated settings for matching words.
+        foreach ((new ReflectionClass($this))->getProperties(ReflectionProperty::IS_PUBLIC) as $property) {
+            if ($property->isStatic() || str_starts_with($property->getDeclaringClass()->getName(), 'verbb\\formie\\')) {
+                continue;
+            }
+
+            $name = $property->getName();
+
+            if (preg_match('/^(?:clientSecret|apiKey|apiSecret|secretKey|password|apiPassword|accessToken|refreshToken|authToken|apiToken|token|credentials|authorization|httpAuth|headers|webhook|webhookUrl|webhookKey)$/i', $name)) {
+                $collect($attributes[$name] ?? null);
+            }
+        }
+
+        return array_values(array_unique($secrets));
+    }
+
+    public function beforeSendPayload(Submission $submission, string &$endpoint, mixed &$payload, string &$method, string $contentType = 'json'): bool
+    {
+        // Record request evidence against the durable delivery attempt, when present.
+        $this->recordDeliveryRequest($submission, $endpoint, $payload, $method, $contentType);
+
+        $event = new SendIntegrationPayloadEvent([
+            'submission' => $submission,
+            'payload' => $payload,
+            'endpoint' => $endpoint,
+            'method' => $method,
+            'integration' => $this,
+        ]);
+        $this->trigger(self::EVENT_BEFORE_SEND_PAYLOAD, $event);
+
+        if (!$event->isValid) {
+            $this->_deliveryState->skipped = true;
+            Integration::info($this, 'Sending payload cancelled by event hook.');
+        }
+
+        // Also, check for opt-in fields. This allows the above event to potentially alter things
+        if (!$this->enforceOptInField($submission)) {
+            $this->_deliveryState->skipped = true;
+            Integration::info($this, 'Sending payload cancelled by opt-in field.');
+
+            return false;
+        }
+
+        // Allow events to alter some props
+        $payload = $event->payload;
+        $endpoint = $event->endpoint;
+        $method = $event->method;
+
+        return $event->isValid;
+    }
+
+    public function afterSendPayload(Submission $submission, string $endpoint, mixed $payload, string $method, mixed $response): bool
+    {
+        $event = new SendIntegrationPayloadEvent([
+            'submission' => $submission,
+            'payload' => $payload,
+            'response' => $response,
+            'endpoint' => $endpoint,
+            'method' => $method,
+            'integration' => $this,
+        ]);
+        $this->trigger(self::EVENT_AFTER_SEND_PAYLOAD, $event);
+
+        if (!$event->isValid) {
+            // Providers read a false response as a cancelled send, so mark this as a failure regardless.
+            $this->_deliveryState->error = IntegrationResult::failed('response_rejected_by_hook');
+            $this->_deliveryState->handledError = true;
+            Integration::info($this, 'Payload marked as invalid by event hook.');
+        }
+
+        return $event->isValid;
+    }
+
+    public function enforceOptInField(Submission $submission): bool
+    {
+        if (in_array('optIn', $this->_deliveryContext?->overrides ?? [], true)) {
+            return true;
+        }
+
+        // Default is just always do it!
+        if (!$this->optInField) {
+            return true;
+        }
+
+        // Get the value of the mapped field (resolved via getFieldValue when field is found, else variables)
+        $optInField = $this->normalizeFieldMappingValue($this->optInField);
+        $resolved = Variables::getFieldAndValueForReference($optInField, $submission);
+        $field = $resolved['field'];
+        $rawValue = $resolved['value'];
+
+        if ($field === null && self::_isEmpty($rawValue)) {
+            Integration::info($this, Craft::t('formie', 'Unable to find field “{field}” for opt-in in submission.', [
+                'field' => $optInField,
+            ]));
+
+            return false;
+        }
+
+        if ($field !== null && $field->isValueEmpty($rawValue, $submission)) {
+            Integration::info($this, Craft::t('formie', 'Opting-out. Field “{field}” is empty.', [
+                'field' => $optInField,
+            ]));
+
+            return false;
+        }
+
+        $fieldValue = static::convertValueForIntegration($rawValue, new IntegrationField(['type' => IntegrationField::TYPE_BOOLEAN]));
+        $hasOptedIn = (bool)$fieldValue;
+
+        if (!$hasOptedIn) {
+            Integration::info($this, Craft::t('formie', 'Opting-out. Field “{field}” has value “{value}”.', [
+                'field' => $optInField,
+                'value' => $fieldValue,
+            ]));
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public function getMappedFieldValue(string $mappedFieldValue, Submission $submission, IntegrationField $integrationField): mixed
+    {
+        $slot = $this->_mappingSlot;
+        $value = $slot !== null && $slot[0] === $mappedFieldValue ? $slot[1] : $mappedFieldValue;
+
+        return $this->callCanonicalIntegrationMethod('getMappedFieldValue', fn() => $this->resolveMappedFieldValue($value, $submission, $integrationField));
+    }
+
+    public function resolveMappedFieldValue(mixed $fieldKey, Submission $submission, IntegrationField $integrationField): mixed
+    {
+        $previous = $this->_mappingSlot;
+
+        try {
+            $mappedFieldValue = $this->normalizeFieldMappingValue($fieldKey);
+            $this->_mappingSlot = [$mappedFieldValue, $fieldKey];
+
+            return $this->callLegacyIntegrationMethod('getMappedFieldValue', Integration::class, [$mappedFieldValue, $submission, $integrationField], fn() => $this->resolveMappingSlot($fieldKey, $submission, $integrationField), canonicalMethod: 'resolveMappedFieldValue');
+        } catch (Throwable $exception) {
+            throw new IntegrationException($this->_mappingErrorMessage($fieldKey, $integrationField, $exception), 0, $exception);
+        } finally {
+            $this->_mappingSlot = $previous;
+        }
+    }
+
+    public function allowedGqlSettings(): array
+    {
+        return [];
+    }
+
+    public function beforeSaveForm(array $settings): void
+    {
+
+    }
+
+    public function getOptionSourceBuilderConfig(string $provider): array
+    {
+        $definition = static::_getOptionSourceDefinition($provider);
+
+        if (!$definition) {
+            return [
+                'error' => Craft::t('formie', 'Unknown integration option provider.'),
+            ];
+        }
+
+        $config = $this->getConfig();
+
+        return $this->buildOptionSourceBuilderConfig($provider, $config, $definition);
+    }
+
+    public function resolveOptionSourceOptions(string $provider, array $params = []): OptionList
+    {
+        $definition = static::_getOptionSourceDefinition($provider);
+
+        if (!$definition) {
+            return OptionList::error(Craft::t('formie', 'Unknown integration option provider.'));
+        }
+
+        $collectionParam = (string)($definition['collectionParam'] ?? 'collectionId');
+        $remoteHandleParam = (string)($definition['remoteHandleParam'] ?? 'remoteHandle');
+        $collectionId = (string)($params[$collectionParam] ?? '');
+        $remoteHandle = (string)($params[$remoteHandleParam] ?? '');
+
+        if ($collectionId === '') {
+            return OptionList::error((string)($definition['collectionRequiredMessage'] ?? Craft::t('formie', 'Select a list.')));
+        }
+
+        if ($remoteHandle === '') {
+            return OptionList::error((string)($definition['remoteHandleRequiredMessage'] ?? Craft::t('formie', 'Select an option source.')));
+        }
+
+        try {
+            $config = $this->getConfig();
+
+            foreach ($this->getOptionSourceCollections($config, $definition) as $collection) {
+                if ((string)$collection['id'] !== $collectionId) {
+                    continue;
+                }
+
+                foreach ($collection['fields'] as $field) {
+                    if (!$field instanceof IntegrationField || $field->handle !== $remoteHandle) {
+                        continue;
+                    }
+
+                    return OptionList::fromRows(IntegrationOptionSourceHelper::flattenIntegrationFieldOptions($field->options));
+                }
+            }
+
+            return OptionList::error((string)($definition['notFoundMessage'] ?? Craft::t('formie', 'Option source not found. Refresh the integration data.')));
+        } catch (Throwable $e) {
+            Craft::error('Integration option source failed to resolve: ' . $e->getMessage(), __METHOD__);
+
+            return OptionList::error(Craft::t('formie', 'Unable to resolve integration options.'));
+        }
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function resolveConfig(bool $useCache): IntegrationConfig
+    {
+        if ($useCache && $this->shouldCacheConfig()) {
+            return $this->_getCachedConfig();
+        }
+
+        $this->_configRefreshCancelled = false;
+        $previous = $this->_getCachedConfig();
+        $event = new IntegrationConfigEvent([
+            'integration' => $this,
+        ]);
+        $this->trigger(self::EVENT_BEFORE_FETCH_CONFIG, $event);
+
+        if (!$event->isValid) {
+            $this->_configRefreshCancelled = true;
+            Integration::info($this, 'Refreshing integration config cancelled by event hook.');
+
+            return $previous;
+        }
+
+        // Stable Formie 3 events remain an adapter around the canonical event.
+        $legacyEvent = new IntegrationFormSettingsEvent([
+            'integration' => $this,
+        ]);
+        $this->trigger(self::EVENT_BEFORE_FETCH_FORM_SETTINGS, $legacyEvent);
+
+        if (!$legacyEvent->isValid) {
+            $this->_configRefreshCancelled = true;
+            Integration::info($this, 'Refreshing integration config cancelled by legacy event hook.');
+
+            return $previous;
+        }
+
+        if (static::supportsConnection() && !static::getIsConnected()) {
+            Integration::error($this, 'Connect to the integration provider first.', true);
+        }
+
+        $config = $this->fetchConfigWithCompatibility();
+
+        $event = new IntegrationConfigEvent([
+            'integration' => $this,
+            'config' => $config,
+        ]);
+        $this->trigger(self::EVENT_AFTER_FETCH_CONFIG, $event);
+        $config = $event->config ?? $config;
+
+        $legacyEvent = new IntegrationFormSettingsEvent([
+            'integration' => $this,
+            'config' => $config,
+            'settings' => IntegrationFormSettings::fromConfig($config),
+        ]);
+        $this->trigger(self::EVENT_AFTER_FETCH_FORM_SETTINGS, $legacyEvent);
+        $config = $legacyEvent->settings?->toConfig() ?? $legacyEvent->config ?? $config;
+
+        $config = new IntegrationConfig(
+            $this->shouldCacheConfig() ? array_merge($previous->all(), $config->all()) : $config->all(),
+            $this->getIntegrationConfigKey(),
+            time(),
+        );
+
+        if ($this->shouldCacheConfig()) {
+            $this->_setCache(['config' => $config->toStorage()]);
+        } else {
+            $this->cache['config'] = $config->toStorage();
+        }
+
+        return $config;
+    }
+
+    protected function resolveMappingSlot(mixed $fieldKey, Submission $submission, IntegrationField $integrationField): mixed
+    {
+        $slot = ReferenceSlot::fromStored($fieldKey);
+        $summaryOutputContext = $integrationField->acceptsSummaries() ? ($integrationField->acceptsHtml ? ReferenceOutputContext::Html : ReferenceOutputContext::PlainText) : null;
+        $context = ReferenceContext::forSubmission($submission, usage: ReferenceUsage::Integration, summaryOutputContext: $summaryOutputContext);
+        $field = null;
+        $resolved = null;
+
+        if ($slot->kind === ReferenceSlotKind::Exact) {
+            $resolved = References::resolveValue((string)$slot->value, $context);
+            $rawValue = $resolved->requireValue();
+            $field = $resolved->field;
+        } else {
+            $rawValue = $slot->resolve($context);
+        }
+
+        // The source is formatted in the site's time zone with no offset, which date conversions would read as UTC.
+        if ($slot->kind === ReferenceSlotKind::Exact && $slot->value === '{submission:date}') {
+            $rawValue = $submission->dateCreated;
+
+            if ($integrationField->getType() !== IntegrationField::TYPE_DATECLASS) {
+                $integrationField = clone $integrationField;
+                $integrationField->type = IntegrationField::TYPE_DATETIME;
+            }
+        }
+
+        $fieldValue = $this->_projectIntegrationMappingValue($resolved, $rawValue, $submission, $integrationField);
+
+        $event = new ModifyFieldIntegrationValueEvent([
+            'value' => $fieldValue,
+            'rawValue' => $rawValue,
+            'field' => $field,
+            'submission' => $submission,
+            'integrationField' => $integrationField,
+            'integration' => $this,
+        ]);
+        $this->modifyFieldMappingValue($event);
+        $this->trigger(static::EVENT_MODIFY_FIELD_MAPPING_VALUE, $event);
+
+        return $event->value;
+    }
+
+    protected function shouldCacheConfig(): bool
+    {
+        return true;
+    }
+
+    protected function requestWithOAuthProvider(string $method, string $uri, array $options = []): mixed
+    {
+        return $this->callLegacyIntegrationMethod('OAuthRequest', Integration::class, [$method, $uri, $options], fn() => $this->sendOAuthRequest($method, $uri, $options), canonicalMethod: 'requestWithOAuthProvider');
+    }
+
+    protected function recordDeliveryRequestEvidence(Submission $submission, string $endpoint, mixed $payload, string $method, string $contentType): void
+    {
+        if ($this->_deliveryAttemptUid) {
+            Formie::$plugin->getDeliveryAttempts()->checkpoint($this->_deliveryAttemptUid, 'request-prepared', [
+                'method' => $method, 'endpoint' => $endpoint, 'contentType' => $contentType,
+                'mapping' => $payload,
+            ], $this->getDiagnosticSecrets());
+        }
+    }
+
+    protected function modifyFieldMappingValue(ModifyFieldIntegrationValueEvent $event): void
+    {
+
+    }
+
+    protected function modifyFieldMappingValues(ModifyFieldIntegrationValuesEvent $event): void
+    {
+
+    }
+
+    protected function createDeliveryHttpHandler(): callable
+    {
+        return HandlerStack::create(new CurlHandler());
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+        $rules[] = [['id'], 'number', 'integerOnly' => true];
+        $rules[] = [['handle'], UniqueValidator::class, 'targetClass' => IntegrationRecord::class];
+        $rules[] = [['name', 'handle'], 'string', 'max' => 255];
+        $rules[] = [['name', 'handle'], 'required'];
+
+        $rules[] = [
+            ['handle'],
+            HandleValidator::class,
+            'reservedWords' => [
+                'id',
+                'dateCreated',
+                'dateUpdated',
+                'uid',
+                'title',
+            ],
+        ];
+
+        $requiredOAuthSettingAttributes = $this->defineRequiredOAuthSettingAttributes();
+
+        if (static::supportsOAuthConnection() && $requiredOAuthSettingAttributes) {
+            $rules[] = [
+                $requiredOAuthSettingAttributes, 'required', 'when' => function($model) {
+                    return $model->enabled;
+                },
+            ];
+        }
+
+        return $rules;
+    }
+
+    protected function defineRequiredOAuthSettingAttributes(): array
+    {
+        return ['clientId', 'clientSecret'];
+    }
+
+    protected function defineClient(): Client
+    {
+        $options = [];
+
+        // Disable SSL verification for local dev (devMode enabled) to save some heartache.
+        if (App::devMode()) {
+            $options['verify'] = false;
+        }
+
+        return Craft::createGuzzleClient($options);
+    }
+
+    protected function createPublicEndpointClient(string $endpoint, array $config = []): Client
+    {
+        $config['allow_redirects'] = false;
+        $config['verify'] = true;
+        $config['handler'] = $this->createDeliveryHttpHandler();
+
+        // Fixed provider URLs can use the site's proxy and its DNS resolver.
+        // Configurable destinations still require direct, pinned connections.
+        if (!$this->isTrustedPublicEndpoint($endpoint)) {
+            $this->_applyPublicEndpointDnsPin($config, $endpoint);
+        }
+
+        return Craft::createGuzzleClient($config);
+    }
+
+    protected function isTrustedPublicEndpoint(string $endpoint): bool
+    {
+        return false;
+    }
+
+    protected function requirePublicHttpEndpoint(string $url): string
+    {
+        if (!$this->isPublicHttpEndpoint($url)) {
+            throw new IntegrationException(Craft::t('formie', 'Outbound integration URL must use a public HTTP or HTTPS endpoint.'));
+        }
+
+        return $url;
+    }
+
+    protected function isPublicHttpEndpoint(string $url): bool
+    {
+        if ($url === '') {
+            return false;
+        }
+
+        $parts = parse_url($url);
+
+        if (!is_array($parts)) {
+            return false;
+        }
+
+        $scheme = strtolower((string)($parts['scheme'] ?? ''));
+        $host = $this->_normalizePublicEndpointHost((string)($parts['host'] ?? ''));
+
+        if (!in_array($scheme, ['http', 'https'], true) || $host === '') {
+            return false;
+        }
+
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            return false;
+        }
+
+        $ips = $this->_resolvePublicEndpointIps($host);
+
+        if (!$ips) {
+            return false;
+        }
+
+        foreach ($ips as $ip) {
+            if (!$this->_isAllowedEndpointIp($host, $ip)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    protected function defineFieldMappingSchema(string $settingsKey, ?string $selectedCollectionField = null): array
+    {
+        $integrationFields = $this->getConfigValue($settingsKey);
+
+        if ($selectedCollectionField) {
+            $selectedCollectionId = (string)($this->{$selectedCollectionField} ?? '');
+            $selectedFields = [];
+
+            if ($selectedCollectionId !== '' && is_array($integrationFields)) {
+                foreach ($integrationFields as $collection) {
+                    $id = is_array($collection) ? ($collection['id'] ?? null) : ($collection->id ?? null);
+
+                    if ((string)$id !== $selectedCollectionId) {
+                        continue;
+                    }
+
+                    $selectedFields = is_array($collection) ? ($collection['fields'] ?? []) : ($collection->fields ?? []);
+
+                    break;
+                }
+            }
+
+            $integrationFields = $selectedFields;
+        }
+
+        if (!is_array($integrationFields) || !$integrationFields) {
+            return [];
+        }
+
+        return $this->convertIntegrationFieldsToSchema($integrationFields);
+    }
+
+    protected function convertIntegrationFieldsToSchema(array $integrationFields): array
+    {
+        $fields = [];
+
+        foreach ($integrationFields as $integrationField) {
+            $handle = is_array($integrationField) ? ($integrationField['handle'] ?? null) : ($integrationField->handle ?? null);
+            $name = is_array($integrationField) ? ($integrationField['name'] ?? null) : ($integrationField->name ?? null);
+            $required = (bool)(is_array($integrationField) ? ($integrationField['required'] ?? false) : ($integrationField->required ?? false));
+            $options = is_array($integrationField) ? ($integrationField['options'] ?? null) : ($integrationField->options ?? null);
+
+            if (!$handle) {
+                continue;
+            }
+
+            $label = $name ?: (string)$handle;
+
+            $fieldMeta = [
+                'handle' => (string)$handle,
+                'name' => $label,
+                'required' => $required,
+            ];
+
+            $attributes = is_array($integrationField) ? $integrationField : get_object_vars($integrationField);
+            $definition = $integrationField instanceof IntegrationField ? $integrationField : new IntegrationField([
+                'type' => $attributes['type'] ?? null,
+                'options' => $options ?? [],
+            ]);
+            $fieldMeta['acceptsSummaries'] = $definition->acceptsSummaries();
+
+            if (!empty($options)) {
+                $fieldMeta['options'] = $options;
+            }
+
+            $fields[] = $fieldMeta;
+        }
+
+        return $fields;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        return [
+            SchemaHelper::lightswitchField([
+                'label' => Craft::t('formie', 'Enabled'),
+                'instructions' => Craft::t('formie', 'Whether the integration should be enabled.'),
+                'name' => 'enabled',
+            ]),
+            SchemaHelper::enableConditionsField([
+                'instructions' => Craft::t('formie', 'Whether to enable conditional logic to control when this integration is triggered.'),
+            ]),
+            [
+                '$field' => 'integrationConditions',
+                'name' => 'conditions',
+                'if' => 'enableConditions',
+                'fieldOptions' => ConditionsHelper::getConditionFieldOptions($this->getConditionFieldOptionConfig()),
+                'conditionOptions' => ConditionsHelper::getConditionOptions(),
+            ],
+        ];
+    }
+
+    protected function getConditionFieldOptionConfig(): array
+    {
+        return ConditionsHelper::getConditionFieldOptionConfig([
+            'includeSubmissionDate' => true,
+        ]);
+    }
+
+    protected function getOptionSourceCollections(IntegrationConfig $config, array $definition): array
+    {
+        $storage = (string)($definition['storage'] ?? 'collections');
+
+        if ($storage === 'objects') {
+            return $this->_getOptionSourceObjectCollections($config, $definition);
+        }
+
+        return $this->_getOptionSourceIntegrationCollections($config, $definition);
+    }
+
+    protected function buildOptionSourceBuilderConfig(string $provider, IntegrationConfig $config, array $definition): array
+    {
+        $collectionParam = (string)($definition['collectionParam'] ?? 'collectionId');
+        $remoteHandleParam = (string)($definition['remoteHandleParam'] ?? 'remoteHandle');
+        $collections = [];
+        $remoteHandles = [];
+        $remoteHandlesByCollection = [];
+
+        foreach ($this->getOptionSourceCollections($config, $definition) as $collection) {
+            $collectionRemoteHandles = [];
+
+            foreach ($collection['fields'] as $field) {
+                if (!$field instanceof IntegrationField) {
+                    continue;
+                }
+
+                $option = [
+                    'label' => (string)$field->name,
+                    'value' => (string)$field->handle,
+                ];
+
+                $collectionRemoteHandles[$field->handle] = $option;
+                $remoteHandles[$field->handle] = $option;
+            }
+
+            $collectionId = (string)$collection['id'];
+            $remoteHandlesByCollection[$collectionId] = array_values($collectionRemoteHandles);
+            $collections[] = [
+                'label' => (string)$collection['name'],
+                'value' => $collectionId,
+                'remoteHandleOptions' => array_values($collectionRemoteHandles),
+            ];
+        }
+
+        $remoteHandleOptions = array_values($remoteHandles);
+        $defaultCollectionId = null;
+        $defaultRemoteHandle = null;
+
+        foreach ($collections as $collection) {
+            $collectionRemoteHandleOptions = $collection['remoteHandleOptions'] ?? [];
+
+            if (!$collectionRemoteHandleOptions) {
+                continue;
+            }
+
+            $defaultCollectionId = $collection['value'];
+            $defaultRemoteHandle = $collectionRemoteHandleOptions[0]['value'] ?? null;
+
+            break;
+        }
+
+        return [
+            'collectionOptions' => $collections,
+            'remoteHandleOptions' => $remoteHandleOptions,
+            'sourceOptions' => $remoteHandleOptions,
+            'paramFields' => [
+                [
+                    'handle' => $collectionParam,
+                    'type' => 'select',
+                    'label' => (string)($definition['collectionLabel'] ?? Craft::t('formie', 'List')),
+                    'instructions' => (string)($definition['collectionInstructions'] ?? Craft::t('formie', 'Choose the integration list or collection.')),
+                    'placeholder' => (string)($definition['collectionPlaceholder'] ?? Craft::t('formie', 'Select a list')),
+                    'options' => $collections,
+                    'required' => true,
+                ],
+                [
+                    'handle' => $remoteHandleParam,
+                    'type' => 'select',
+                    'label' => (string)($definition['remoteHandleLabel'] ?? Craft::t('formie', 'Option Source')),
+                    'instructions' => (string)($definition['remoteHandleInstructions'] ?? Craft::t('formie', 'Choose which remote field supplies the options.')),
+                    'placeholder' => (string)($definition['remoteHandlePlaceholder'] ?? Craft::t('formie', 'Select an option source')),
+                    'dependsOn' => $collectionParam,
+                    'options' => $remoteHandleOptions,
+                    'optionsByParam' => [
+                        $collectionParam => $remoteHandlesByCollection,
+                    ],
+                    'required' => true,
+                ],
+            ],
+            'defaults' => [
+                $collectionParam => $defaultCollectionId,
+                $remoteHandleParam => $defaultRemoteHandle,
+            ],
+            'warning' => $collections === []
+                ? (string)($definition['emptyCollectionsWarning'] ?? Craft::t('formie', 'No lists available. Refresh the integration data first.'))
+                : ($remoteHandleOptions === []
+                    ? (string)($definition['emptySourcesWarning'] ?? Craft::t('formie', 'No option sources available. Refresh the integration data first.'))
+                    : null),
+        ];
+    }
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        return null;
+    }
+
+    protected function getOptInFieldSchema(): array
+    {
+        return SchemaHelper::fieldSelectField([
+            'label' => Craft::t('formie', 'Opt-In Field'),
+            'instructions' => Craft::t('formie', 'Choose a field to opt-in to {name}. For example, you might only wish to subscribe users if they provide a value for a field of your choice - commonly, an Agree field.', ['name' => $this::displayName()]),
+            'name' => 'optInField',
+            'placeholder' => Craft::t('formie', 'Always Opt-in'),
+            'emptyOptionLabel' => Craft::t('formie', 'Always Opt-in'),
+            'variableConfig' => [
+                'types' => [Variables::TYPE_BOOLEAN],
+            ],
+            'topLevelOnly' => true,
+        ]);
+    }
+
+    protected function generateSubmissionPayloadValues(Submission $submission): array
+    {
+        $user = $submission->getUser();
+        $submissionContent = $submission->getValuesAsData();
+        $formAttributes = Json::decode(Json::encode($submission->getForm()->getAttributes()));
+
+        $submissionAttributes = $submission->toArray([
+            'id',
+            'formId',
+            'status',
+            'userId',
+            'ipAddress',
+            'isIncomplete',
+            'isSpam',
+            'spamReason',
+            'title',
+            'dateCreated',
+            'dateUpdated',
+            'dateDeleted',
+            'trashed',
+        ]);
+
+        $submissionAttributes['user'] = $user ? [
+            'id' => $user->id,
+            'username' => $user->username,
+            'email' => $user->email,
+            'fullName' => $user->fullName,
+            'firstName' => $user->firstName,
+            'lastName' => $user->lastName,
+        ] : null;
+
+        // Trim the form settings a little
+        unset($formAttributes['settings']['integrations']);
+
+        return [
+            'submission' => array_merge($submissionAttributes, $submissionContent),
+            'form' => $formAttributes,
+        ];
+    }
+
+    protected function normalizeFieldMappingValue(mixed $value): string
+    {
+        if (is_array($value)) {
+            $mappingType = $value['type'] ?? null;
+
+            if ($mappingType === 'none') {
+                return '';
+            }
+
+            $mappingValue = $value['value'] ?? '';
+
+            return is_scalar($mappingValue) ? $this->replaceProviderOptionTokens((string)$mappingValue) : '';
+        }
+
+        if (is_object($value)) {
+            $mappingType = $value->type ?? null;
+
+            if ($mappingType === 'none') {
+                return '';
+            }
+
+            $mappingValue = $value->value ?? '';
+
+            return is_scalar($mappingValue) ? $this->replaceProviderOptionTokens((string)$mappingValue) : '';
+        }
+
+        return is_scalar($value) ? $this->replaceProviderOptionTokens((string)$value) : '';
+    }
+
+    protected function replaceProviderOptionTokens(string $value): string
+    {
+        return preg_replace_callback('/\{providerOption:([^}]+)\}/', function($matches) {
+            $encoded = $matches[1] ?? '';
+
+            if (!is_string($encoded) || $encoded === '') {
+                return '';
+            }
+
+            return rawurldecode($encoded);
+        }, $value) ?? $value;
+    }
+
+    protected function prepareCachedFormSettings(array $settings): array
+    {
+        return $settings;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _mappingErrorMessage(mixed $fieldKey, IntegrationField $integrationField, Throwable $exception): string
+    {
+        $destination = $integrationField->name ?: $integrationField->handle ?: Craft::t('formie', 'Unnamed field');
+
+        if ($integrationField->name && $integrationField->handle && $integrationField->name !== $integrationField->handle) {
+            $destination .= ' (' . $integrationField->handle . ')';
+        }
+
+        $reference = '';
+
+        try {
+            $slot = ReferenceSlot::fromStored($fieldKey);
+
+            if ($slot->kind === ReferenceSlotKind::Exact && is_string($slot->value)) {
+                $expression = References::parseReferenceExpression($slot->value);
+
+                // Only expose field identity, never literal text, defaults, transform arguments or other sources.
+                if ($expression->isValid && $expression->target === 'field' && preg_match('/^[a-zA-Z0-9_.:-]+$/D', $expression->identifier . $expression->selector)) {
+                    $reference = ' (' . References::field($expression->identifier, $expression->selector) . ')';
+                }
+            }
+        } catch (ReferenceException) {
+            // An invalid stored slot must not prevent reporting its destination and original failure.
+        }
+
+        return DeliveryDiagnostics::redact(Craft::t('formie', 'Could not resolve mapping for “{field}”{reference}: {message}', [
+            'field' => $destination,
+            'reference' => $reference,
+            'message' => self::getExceptionLogMessage($exception),
+        ]), $this->getDiagnosticSecrets());
+    }
+
+    private function _projectIntegrationMappingValue(?ResolvedReference $resolved, mixed $rawValue, Submission $submission, IntegrationField $integrationField): mixed
+    {
+        $field = $resolved?->field;
+        $expression = $resolved?->expression;
+        $isNativeFieldValue = $resolved !== null &&
+            $field !== null &&
+            $resolved->fieldProjection === 'value' &&
+            $expression->selector === '' &&
+            $expression->transformerId === '' &&
+            $expression->default === '' &&
+            $field->valueType()->accepts($rawValue);
+
+        if ($isNativeFieldValue) {
+            // Resolution already selected the owning field and value; no child path remains.
+            return $field->getValueForIntegration($rawValue, $integrationField, $this, $submission);
+        }
+
+        if (
+            $resolved !== null &&
+            $field !== null &&
+            $resolved->fieldProjection === 'collection' &&
+            $expression->transformerId === '' &&
+            $expression->default === '' &&
+            is_array($rawValue) &&
+            count(array_filter($rawValue, static fn(mixed $item): bool => $field->valueType()->accepts($item))) === count($rawValue)
+        ) {
+            return array_map(
+                fn(mixed $item): mixed => $field->getValueForIntegration($item, $integrationField, $this, $submission),
+                $rawValue,
+            );
+        }
+
+        return static::convertValueForIntegration($rawValue, $integrationField);
+    }
+
+    private function _getCachedConfig(): IntegrationConfig
+    {
+        $stored = $this->_getCache('config');
+
+        if (is_array($stored)) {
+            // The integration cache stores emoji as shortcodes for database
+            // compatibility; restore them before exposing config to callers.
+            $stored = Json::decode(StringHelper::shortcodesToEmoji((string)Json::encode($stored)));
+
+            // Read operational metadata unchanged; diagnostic redaction can invalidate keys and field handles.
+            $config = IntegrationConfig::fromStorage($stored, $this->getIntegrationConfigKey());
+        } else {
+            // Formie 3 stored the encoded metadata directly under `settings`.
+            $legacy = $this->_getCache('settings') ?: [];
+            $legacy = Json::decode(StringHelper::shortcodesToEmoji((string)Json::encode($legacy)));
+            $config = new IntegrationConfig(
+                IntegrationConfig::decode($legacy),
+                $this->getIntegrationConfigKey(),
+                0,
+            );
+        }
+
+        $settings = $this->prepareCachedFormSettings($config->all());
+
+        return $settings === $config->all() ? $config : new IntegrationConfig($settings, $config->invalidationKey, $config->fetchedAt);
+    }
+
+    private function _readDeliveryResponse(ResponseInterface $response): string
+    {
+        if ($response->getStatusCode() >= 300 && $response->getStatusCode() < 400) {
+            throw new RequestException('Integration redirects are not permitted.', new Request('POST', 'https://delivery.invalid'), $response);
+        }
+
+        return (string)$response->getBody();
+    }
+
+    private function _secureOAuthClient(string $base): void
+    {
+        $provider = $this->getOAuthProvider();
+        $origins = [$base];
+
+        if (method_exists($provider, 'getBaseAccessTokenUrl')) {
+            $origins[] = $provider->getBaseAccessTokenUrl([]);
+        }
+
+        $transport = $this->createDeliveryHttpHandler();
+        $config = $this->getClient()->getConfig();
+        $config['allow_redirects'] = false;
+        $config['proxy'] = '';
+        $config['verify'] = true;
+        // OAuth request factories discard transport options. Guard the actual
+        // HTTP handler, including token refresh, rather than the request builder.
+        $config['handler'] = function($request, $options) use ($transport, $origins) {
+            $target = $request->getUri();
+            $allowed = false;
+
+            foreach ($origins as $url) {
+                $origin = new Uri($url);
+
+                if ($target->getScheme() === $origin->getScheme() && strtolower($target->getHost()) === strtolower($origin->getHost()) && $target->getPort() === $origin->getPort() && $target->getUserInfo() === '') {
+                    $allowed = true;
+
+                    break;
+                }
+            }
+
+            if (!$allowed) {
+                throw new IntegrationStepException(IntegrationResult::failed('provider_origin_mismatch'));
+            }
+
+            $this->_applyPublicEndpointDnsPin($options, (string)$target);
+            unset($options['handler']);
+
+            return $transport($request, $options)->then(function($response) use ($request) {
+                if ($response->getStatusCode() >= 300 && $response->getStatusCode() < 400) {
+                    throw new RequestException('Integration redirects are not permitted.', $request, $response);
+                }
+
+                return $response;
+            });
+        };
+        $this->_client = new Client($config);
+        $provider->setHttpClient($this->_client);
+    }
+
+    private function _applyPublicEndpointDnsPin(array &$config, string $url): void
+    {
+        $parts = parse_url($url);
+
+        if (!is_array($parts)) {
+            throw new IntegrationException(Craft::t('formie', 'Outbound integration URL must use a public HTTP or HTTPS endpoint.'));
+        }
+
+        $scheme = strtolower((string)($parts['scheme'] ?? ''));
+        $host = $this->_normalizePublicEndpointHost((string)($parts['host'] ?? ''));
+
+        if (!in_array($scheme, ['http', 'https'], true) || $host === '' || isset($parts['user']) || isset($parts['pass'])) {
+            throw new IntegrationException(Craft::t('formie', 'Outbound integration URL must use a public HTTP or HTTPS endpoint.'));
+        }
+
+        $port = isset($parts['port']) ? (int)$parts['port'] : ($scheme === 'https' ? 443 : 80);
+
+        if (!in_array($port, [80, 443], true) || !extension_loaded('curl')) {
+            throw new IntegrationException('Public integration endpoints require HTTP(S) on ports 80 or 443 and the cURL transport.');
+        }
+
+        $config['allow_redirects'] = false;
+        $config['proxy'] = '';
+        $config['verify'] = true;
+        $config['curl'] = [];
+        $config['handler'] = $this->createDeliveryHttpHandler();
+
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            if (!$this->_isAllowedEndpointIp($host, $host)) {
+                throw new IntegrationException(Craft::t('formie', 'Outbound integration URL must use a public HTTP or HTTPS endpoint.'));
+            }
+
+            return;
+        }
+
+        $ips = $this->_resolvePublicEndpointIps($host);
+
+        if (!$ips) {
+            throw new IntegrationException(Craft::t('formie', 'Outbound integration URL must use a public HTTP or HTTPS endpoint.'));
+        }
+
+        foreach ($ips as $ip) {
+            if (!$this->_isAllowedEndpointIp($host, $ip)) {
+                throw new IntegrationException(Craft::t('formie', 'Outbound integration URL must use a public HTTP or HTTPS endpoint.'));
+            }
+        }
+
+        $ip = $ips[0];
+        $port = isset($parts['port']) ? (int)$parts['port'] : ($scheme === 'https' ? 443 : 80);
+        $resolve = $config['curl'][CURLOPT_RESOLVE] ?? [];
+
+        if (!is_array($resolve)) {
+            $resolve = [];
+        }
+
+        $resolveIp = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? '[' . $ip . ']' : $ip;
+        $resolve[] = sprintf('%s:%d:%s', $host, $port, $resolveIp);
+        $config['curl'][CURLOPT_RESOLVE] = array_values(array_unique($resolve));
+    }
+
+    private function _normalizePublicEndpointHost(string $host): string
+    {
+        $host = trim($host);
+
+        if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
+            return substr($host, 1, -1);
+        }
+
+        return $host;
+    }
+
+    private function _resolvePublicEndpointIps(string $host): array
+    {
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            return [$host];
+        }
+
+        $ips = gethostbynamel($host) ?: [];
+
+        if (function_exists('dns_get_record')) {
+            foreach (dns_get_record($host, DNS_AAAA) ?: [] as $record) {
+                if (isset($record['ipv6'])) {
+                    $ips[] = $record['ipv6'];
+                }
+            }
+        }
+
+        return array_values(array_unique(array_filter($ips, 'is_string')));
+    }
+
+    private function _isPublicEndpointIp(string $ip): bool
+    {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_GLOBAL_RANGE) === false) {
+            return false;
+        }
+
+        foreach (['224.0.0.0/4', 'ff00::/8', '64:ff9b::/96', '2002::/16', '2001::/32'] as $range) {
+            if (IpHelper::inRange($ip, $range)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function _isAllowedEndpointIp(string $host, string $ip): bool
+    {
+        if ($this->_isPublicEndpointIp($ip)) {
+            return true;
+        }
+
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            return false;
+        }
+
+        // Only ordinary private networks can be trusted. Local, metadata,
+        // reserved and IPv4 transition addresses must remain unreachable.
+        $private = false;
+
+        foreach (['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fc00::/7'] as $range) {
+            if (IpHelper::inRange($ip, $range)) {
+                $private = true;
+
+                break;
+            }
+        }
+
+        if (!$private) {
+            return false;
+        }
+
+        // AWS places instance metadata and other host services inside ULA space.
+        if (IpHelper::inRange($ip, 'fd00:ec2::/32')) {
+            return false;
+        }
+
+        // Trust must come from deployment configuration, never saved CP settings.
+        $config = Craft::$app->getConfig()->getConfigFromFile('formie');
+        $entries = is_array($config) ? ($config['allowedPrivateIntegrationHosts'] ?? []) : [];
+
+        if (!is_array($entries)) {
+            return false;
+        }
+
+        foreach ($entries as $entry) {
+            if (!is_string($entry) || ($entry = trim($entry)) === '') {
+                continue;
+            }
+
+            if (strcasecmp(rtrim($host, '.'), rtrim($entry, '.')) === 0) {
+                return true;
+            }
+
+            $entry = $this->_normalizePublicEndpointHost($entry);
+            $parts = explode('/', $entry);
+            $network = $parts[0];
+
+            if (count($parts) > 2 || filter_var($network, FILTER_VALIDATE_IP) === false) {
+                continue;
+            }
+
+            if (isset($parts[1]) && (!ctype_digit($parts[1]) || (int)$parts[1] > (str_contains($network, ':') ? 128 : 32))) {
+                continue;
+            }
+
+            if (IpHelper::inRange($ip, $entry)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function _getOptionSourceIntegrationCollections(IntegrationConfig $config, array $definition): array
+    {
+        $collectionKey = (string)($definition['collectionKey'] ?? 'lists');
+        $collections = [];
+
+        foreach ($config->get($collectionKey) as $collection) {
+            if (!$collection instanceof IntegrationCollection) {
+                continue;
+            }
+
+            $fields = $this->_filterOptionSourceFields($collection->fields, $definition);
+
+            if (!$fields) {
+                continue;
+            }
+
+            $collections[] = [
+                'id' => (string)$collection->id,
+                'name' => (string)$collection->name,
+                'fields' => $fields,
+            ];
+        }
+
+        return $collections;
+    }
+
+    private function _getOptionSourceObjectCollections(IntegrationConfig $config, array $definition): array
+    {
+        $objectKeys = (array)($definition['objectKeys'] ?? []);
+        $objectLabels = (array)($definition['objectLabels'] ?? []);
+        $collections = [];
+
+        foreach ($objectKeys as $objectKey) {
+            $objectKey = (string)$objectKey;
+            $fields = $config->get($objectKey);
+
+            if (!is_array($fields) || !$fields) {
+                continue;
+            }
+
+            $filteredFields = $this->_filterOptionSourceFields($fields, $definition);
+
+            if (!$filteredFields) {
+                continue;
+            }
+
+            $collections[] = [
+                'id' => $objectKey,
+                'name' => (string)($objectLabels[$objectKey] ?? ucwords(str_replace(['_', '-'], ' ', $objectKey))),
+                'fields' => $filteredFields,
+            ];
+        }
+
+        return $collections;
+    }
+
+    private function _filterOptionSourceFields(array $fields, array $definition): array
+    {
+        $sourceTypes = (array)($definition['optionSourceTypes'] ?? []);
+        $filtered = [];
+
+        foreach ($fields as $field) {
+            if (!$field instanceof IntegrationField || empty($field->options)) {
+                continue;
+            }
+
+            if ($sourceTypes !== [] && !in_array((string)$field->sourceType, $sourceTypes, true)) {
+                continue;
+            }
+
+            $filtered[] = $field;
+        }
+
+        return $filtered;
+    }
+
+    private function _setCache(array $values): void
+    {
+        if ($this->cache === null) {
+            $this->cache = [];
+        }
+
+        // Extract any settings now to prevent accidental merge issues
+        $oldSettings = ArrayHelper::remove($this->cache, 'settings') ?? [];
+        $newSettings = ArrayHelper::remove($values, 'settings') ?? [];
+
+        // Shallow-merge the top-level items (connection status, etc)
+        $this->cache = array_merge($this->cache, $values);
+
+        // Merge stored and new settings (so they work across forms)
+        $this->cache['settings'] = array_merge($oldSettings, $newSettings);
+
+        // Add support for emoji in cached content
+        $data = Json::encode($this->cache);
+        $data = StringHelper::emojiToShortcodes((string)$data);
+
+        // Direct DB update to keep it out of PC, plus speed
+        Db::update(Table::FORMIE_INTEGRATIONS, ['cache' => $data], ['id' => $this->id]);
+    }
+
+    private function _getCache(string $key): mixed
+    {
+        if ($this->cache === null) {
+            $this->cache = [];
+        }
+
+        return $this->cache[$key] ?? null;
+    }
+}

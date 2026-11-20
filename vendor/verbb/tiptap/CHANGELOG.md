@@ -1,0 +1,45 @@
+# Changelog
+
+## 1.0.6 - 2026-11-01
+
+### Fixed
+- Fixed a moderate-severity cross-site scripting vulnerability. (GHSA-544h-97wp-pvhx)
+
+## 1.0.5 - 2026-10-16
+
+### Fixed
+- Fixed unclosed paragraph tags when rendering aligned paragraphs with `nl2br` enabled. ([#1](https://github.com/verbb/tiptap/issues/1))
+
+## 1.0.4 - 2026-10-10
+
+### Fixed
+- Fixed a high-severity input validation vulnerability. ([GHSA-4595-7fjw-r3jh](https://github.com/advisories/GHSA-4595-7fjw-r3jh))
+
+## 1.0.3 - 2026-10-08
+
+### Fixed
+- Fixed variable transform parameters being omitted from HTML output.
+
+## 1.0.2 - 2026-09-15
+
+### Added
+- Add Plugin Kit-compatible TextStyle parsing/rendering for font family, font size, text color, background color, line height, and Small caps.
+
+## 1.0.1 - 2026-08-18
+
+### Fixed
+- Variable tag HTML output no longer duplicates tokens by rendering attrs (`value`, `label`, etc.) onto the `<span>` in addition to `renderText()` content. Fixes duplicated `{allFields}` (and similar) resolution in Formie notification emails. [#2928](https://github.com/verbb/formie/issues/2928).
+
+## 1.0.0 - 2026-07-10
+
+### Added
+- Initial release.
+- `RichText` value object for normalizing, serializing, and rendering Tiptap content.
+- `Normalizer` for project config / database value normalization.
+- `EditorFactory` with extensions aligned to `@verbb/plugin-kit-tiptap-core`.
+- `VariableTag` extension for token rendering.
+- `CraftLink` extension with Craft ref-tag parsing and internal/external `rel` handling.
+- `TokenSerializer` for single-line TiptapInput token strings.
+- Twig filters: `tiptapHtml`, `tiptapPlain`, `tiptapJson`, `tiptapToken`.
+- Feed Me `ContentParser` helper.
+- Optional Yii module bootstrap for Twig filters.

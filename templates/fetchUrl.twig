@@ -1,0 +1,3 @@
+{% set url = 'https://example.com' %}
+    {% set content = craft.app.getModule('fetchurl').fetchUrlContents(url) %}
+{{ content }}

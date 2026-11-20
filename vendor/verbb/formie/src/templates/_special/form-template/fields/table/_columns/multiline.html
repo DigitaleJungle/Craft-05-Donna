@@ -1,0 +1,6 @@
+{% fieldtag 'tableMultilineInput' with {
+    id: rowId,
+    name: field.getHtmlName("#{index}[#{colId}]"),
+} %}
+    {{- row[colId] ?? '' -}}
+{% endfieldtag %}

@@ -1,0 +1,64 @@
+{
+    "name": "studioespresso/craft-splashingimages",
+    "description": "unsplash.com integration for Craft CMS",
+    "type": "craft-plugin",
+    "version": "5.0.4",
+    "keywords": [
+        "craft",
+        "cms",
+        "craftcms",
+        "craft-plugin",
+        "splashing images"
+    ],
+    "support": {
+        "docs": "https://github.com/studioespresso/craft3-unsplash/blob/develop/README.md",
+        "issues": "https://github.com/studioespresso/craft3-unsplashs/issues"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Studio Espresso",
+            "homepage": "https://www.studioespresso.co"
+        }
+    ],
+    "require": {
+        "craftcms/cms": "^5.0.0-alpha",
+        "unsplash/unsplash": "^3.0.0"
+    },
+    "require-dev": {
+        "craftcms/ecs": "dev-main",
+        "craftcms/phpstan": "dev-main"
+    },
+    "scripts": {
+        "check-cs": "ecs check --ansi",
+        "fix-cs": "ecs check --ansi --fix",
+        "phpstan": "phpstan --memory-limit=1G",
+        "ci": "ecs check --ansi --fix && phpstan --memory-limit=1G"
+    },
+    "autoload": {
+        "psr-4": {
+          "studioespresso\\splashingimages\\": "src/"
+        }
+    },
+    "extra": {
+        "name": "Splashing Images",
+        "handle": "splashing-images",
+        "hasCpSettings": true,
+        "hasCpSection": true,
+        "schemaVersion": "1.2.0",
+        "changelogUrl": "https://github.com/studioespresso/craft3-unsplash/blob/develop/CHANGELOG.md",
+        "class": "studioespresso\\splashingimages\\SplashingImages"
+    },
+    "funding": [
+        {
+            "type": "github",
+            "url": "https://github.com/sponsors/janhenckens"
+        }
+    ],
+    "config": {
+        "allow-plugins": {
+            "yiisoft/yii2-composer": true,
+            "craftcms/plugin-installer": true
+        }
+    }
+}

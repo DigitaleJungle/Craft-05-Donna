@@ -1,0 +1,333 @@
+<?php
+namespace verbb\formie\services;
+
+use verbb\formie\Formie;
+use verbb\formie\elements\Form;
+use verbb\formie\helpers\ReportDateBoundHelper;
+use verbb\formie\helpers\Table;
+use verbb\formie\helpers\Variables;
+use verbb\formie\models\Report;
+use verbb\formie\models\ReportSettings;
+
+use Craft;
+use craft\base\Component;
+use craft\db\Query;
+use craft\elements\User;
+use craft\helpers\DateTimeHelper;
+use craft\helpers\UrlHelper;
+
+class ReportEditor extends Component
+{
+    // Public Methods
+    // =========================================================================
+
+    public function getEditorConfig(Report $report): array
+    {
+        $user = Craft::$app->getUser()->getIdentity();
+        $scheduledReports = $report->id
+            ? Formie::$plugin->getScheduledReports()->getScheduledReportsForReport((int)$report->id)
+            : [];
+
+        return array_merge([
+            'mode' => 'editor',
+            'payloadInputId' => 'formie-report-settings',
+            'values' => $this->getEditorValues($report),
+            'formOptions' => $this->_formOptions($user),
+            'statusOptions' => $this->_statusOptions(),
+            'attributeColumns' => Formie::$plugin->getReportColumns()->getDefaultAttributeColumns(),
+            'fieldColumnsUrl' => UrlHelper::cpUrl('formie/reports/field-columns'),
+            'scheduledReports' => array_map(fn($scheduledReport) => [
+                'id' => (int)$scheduledReport->id,
+                'name' => $scheduledReport->name,
+                'enabled' => (bool)$scheduledReport->enabled,
+                'editUrl' => $scheduledReport->getCpEditUrl(),
+                'lastSentAt' => $scheduledReport->lastSentAt?->format('c'),
+                'frequency' => $scheduledReport->getDeliveryModel()->frequency,
+            ], $scheduledReports),
+            'canManageScheduled' => Formie::$plugin->getPermissions()->canManageScheduledReports($user),
+            'scheduledReportsNewUrl' => $report->id
+                ? UrlHelper::cpUrl('formie/settings/scheduled-reports/new', ['reportId' => $report->id])
+                : null,
+            'canEdit' => Formie::$plugin->getPermissions()->canEditReport($user, $report),
+            'hasMissingForms' => $report->id && Formie::$plugin->getReportQuery()->hasMissingForms($report),
+            'viewUrl' => $report->id ? $report->getCpRunUrl() : null,
+            'dashboardUrl' => $report->id ? $report->getCpRunUrl() : null,
+            'exportUrl' => $report->id && Formie::$plugin->getPermissions()->canExportSubmissions($user)
+                ? UrlHelper::cpUrl('formie/reports/export/' . $report->id)
+                : null,
+        ], Variables::getReportExportFilenameVariableConfig());
+    }
+
+    public function getEditorValues(Report $report): array
+    {
+        $settings = $report->getSettingsModel();
+        $display = $settings->display;
+        $display['fieldColumnsMode'] = Formie::$plugin->getReportColumns()->inferFieldColumnsMode(
+            $settings->columns,
+            $display,
+        );
+        $display['fieldOrder'] = Formie::$plugin->getReportColumns()->inferFieldOrder($settings->columns, $display);
+
+        return [
+            'name' => $report->name,
+            'handle' => $report->handle,
+            'filters' => ReportDateBoundHelper::migrateLegacyFilters($settings->filters),
+            'columns' => Formie::$plugin->getReportColumns()->compactColumnsForStorage(
+                $settings->columns,
+                $display['fieldColumnsMode'],
+                $settings->display['fieldOrder'] ?? null,
+            ),
+            'display' => $display,
+            'chart' => $settings->chart,
+            'export' => $settings->export,
+        ];
+    }
+
+    public function applyPayload(Report $report, array $payload): bool
+    {
+        $report->name = trim((string)($payload['name'] ?? $report->name));
+        $report->handle = trim((string)($payload['handle'] ?? $report->handle));
+        $display = $this->_normalizeDisplay($payload['display'] ?? []);
+        $display['fieldOrder'] = Formie::$plugin->getReportColumns()->inferFieldOrder($payload['columns'] ?? [], $display);
+
+        $settings = ReportSettings::fromArray([
+            'filters' => $this->_normalizeFilters($payload['filters'] ?? []),
+            'columns' => Formie::$plugin->getReportColumns()->compactColumnsForStorage(
+                $payload['columns'] ?? [],
+                Formie::$plugin->getReportColumns()->normalizeFieldColumnsMode(
+                    $payload['display']['fieldColumnsMode'] ?? null,
+                ),
+                $display['fieldOrder'],
+            ),
+            'display' => $display,
+            'chart' => $this->_normalizeChart($payload['chart'] ?? []),
+            'export' => $this->_normalizeExport($payload['export'] ?? []),
+        ]);
+
+        $report->setSettingsModel($settings);
+
+        return true;
+    }
+
+    /**
+     * Keeps someone's form choices to what they can view, without losing forms a report
+     * already has that are hidden from them. Their picker can't show those to keep.
+     */
+    public function resolveEditableFormIds(mixed $requestedFormIds, mixed $existingFormIds, ?User $user): mixed
+    {
+        if ($user?->admin || $user?->can(Permissions::PERM_VIEW_SUBMISSIONS) || $requestedFormIds === '*') {
+            return $requestedFormIds;
+        }
+
+        $viewableFormIds = array_map('intval', array_column($this->getFormOptions($user), 'value'));
+        $hiddenFormIds = is_array($existingFormIds) ? array_diff(array_map('intval', $existingFormIds), $viewableFormIds) : [];
+
+        return array_values(array_unique([
+            ...array_intersect(array_map('intval', (array)$requestedFormIds), $viewableFormIds),
+            ...$hiddenFormIds,
+        ]));
+    }
+
+    public function getDefaultAttributeColumns(): array
+    {
+        return Formie::$plugin->getReportColumns()->getDefaultAttributeColumns();
+    }
+
+    public function getFormOptions(?User $user = null): array
+    {
+        return $this->_formOptions($user);
+    }
+
+    public function normalizeFilterDateTime(mixed $value, bool $isEndDate): ?string
+    {
+        return $this->_normalizeFilterDateTime($value, $isEndDate);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _formOptions(?User $user): array
+    {
+        $permissions = Formie::$plugin->getPermissions();
+        $includeAll = $user?->admin || $user?->can(Permissions::PERM_VIEW_SUBMISSIONS);
+        $formsByGroupId = [];
+        $ungrouped = [];
+
+        foreach ($this->_queryFormOptionRows() as $row) {
+            if (!$includeAll) {
+                $form = Form::find()->withoutCpIndexScope()->site('*')->unique()->id((int)$row['id'])->status(null)->one();
+
+                if (!$form || !$permissions->canViewSubmissions($user, $form)) {
+                    continue;
+                }
+            }
+
+            $item = [
+                'label' => (string)$row['title'],
+                'value' => (string)$row['id'],
+                'handle' => (string)$row['handle'],
+                'groupId' => $row['groupId'] ? (int)$row['groupId'] : null,
+                'groupName' => null,
+            ];
+
+            if ($row['groupId']) {
+                $formsByGroupId[(int)$row['groupId']][] = $item;
+            } else {
+                $ungrouped[] = $item;
+            }
+        }
+
+        $options = [];
+
+        foreach (Formie::$plugin->getFormGroups()->getAllGroups() as $group) {
+            $groupForms = $formsByGroupId[(int)$group->id] ?? [];
+
+            foreach ($groupForms as &$groupForm) {
+                $groupForm['groupName'] = $group->name;
+            }
+
+            unset($groupForm);
+
+            array_push($options, ...$groupForms);
+        }
+
+        array_push($options, ...$ungrouped);
+
+        return $options;
+    }
+
+    private function _queryFormOptionRows(): array
+    {
+        $siteId = (int)Craft::$app->getSites()->getPrimarySite()->id;
+
+        return (new Query())
+            ->select([
+                'id' => 'elements.id',
+                'title' => 'elements_sites.title',
+                'handle' => 'forms.handle',
+                'groupId' => 'forms.groupId',
+            ])
+            ->from(['forms' => Table::FORMIE_FORMS])
+            ->innerJoin(['elements' => Table::ELEMENTS], '[[elements.id]] = [[forms.id]]')
+            ->innerJoin(
+                ['elements_sites' => Table::ELEMENTS_SITES],
+                '[[elements_sites.elementId]] = [[forms.id]] AND [[elements_sites.siteId]] = COALESCE([[forms.sourceSiteId]], :siteId)',
+                [':siteId' => $siteId],
+            )
+            ->where([
+                'elements.dateDeleted' => null,
+                'elements.draftId' => null,
+                'elements.revisionId' => null,
+            ])
+            ->orderBy(['elements_sites.title' => SORT_ASC])
+            ->all();
+    }
+
+    private function _statusOptions(): array
+    {
+        $options = [];
+
+        foreach (Formie::$plugin->getSubmissionStatuses()->getAllStatuses() as $status) {
+            $options[] = [
+                'label' => $status->name,
+                'value' => (string)$status->id,
+            ];
+        }
+
+        return $options;
+    }
+
+    private function _normalizeFilters(array $filters): array
+    {
+        $defaults = ReportSettings::defaultFilters();
+
+        if (array_key_exists('startDate', $filters) || array_key_exists('endDate', $filters)) {
+            $filters = ReportDateBoundHelper::migrateLegacyFilters($filters);
+        }
+
+        $normalized = array_merge($defaults, $filters);
+
+        $formIds = $normalized['formIds'] ?? '*';
+
+        if ($formIds === '*' || $formIds === ['*']) {
+            $normalized['formIds'] = '*';
+        } elseif ($formIds === null || $formIds === []) {
+            $normalized['formIds'] = [];
+        } else {
+            $normalized['formIds'] = array_values(array_map('intval', (array)$formIds));
+        }
+
+        $normalized['includeComplete'] = (bool)($normalized['includeComplete'] ?? true);
+        $normalized['includeIncomplete'] = (bool)($normalized['includeIncomplete'] ?? true);
+        $normalized['includeSpam'] = (bool)($normalized['includeSpam'] ?? false);
+        $normalized['statusIds'] = array_values(array_map('intval', (array)($normalized['statusIds'] ?? [])));
+
+        $normalized = ReportDateBoundHelper::migrateLegacyFilters($normalized);
+        $normalized['startBound'] = ReportDateBoundHelper::normalizeBound($normalized['startBound'] ?? null, false);
+        $normalized['endBound'] = ReportDateBoundHelper::normalizeBound($normalized['endBound'] ?? null, true);
+
+        return $normalized;
+    }
+
+    private function _normalizeFilterDateTime(mixed $value, bool $isEndDate): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        $stringValue = trim((string)$value);
+
+        if ($stringValue === '') {
+            return null;
+        }
+
+        // Dates without a time zone are the site's wall-clock time, as the date pickers send them.
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $stringValue)) {
+            $date = DateTimeHelper::toDateTime($stringValue, true);
+
+            if (!$date) {
+                return null;
+            }
+
+            $date->setTime(
+                $isEndDate ? 23 : 0,
+                $isEndDate ? 59 : 0,
+                $isEndDate ? 59 : 0,
+            );
+
+            return $date->format('Y-m-d H:i:s');
+        }
+
+        $date = DateTimeHelper::toDateTime($stringValue, true);
+
+        return $date ? $date->format('Y-m-d H:i:s') : null;
+    }
+
+    private function _normalizeDisplay(array $display): array
+    {
+        $normalized = array_merge(ReportSettings::defaultDisplay(), $display);
+        $normalized['fieldColumnsMode'] = Formie::$plugin->getReportColumns()->normalizeFieldColumnsMode(
+            $normalized['fieldColumnsMode'] ?? null,
+        );
+
+        $normalized['compoundFieldColumns'] = Formie::$plugin->getReportColumns()->normalizeCompoundFieldColumns(
+            $normalized['compoundFieldColumns'] ?? null,
+        );
+
+        return $normalized;
+    }
+
+    private function _normalizeChart(array $chart): array
+    {
+        return array_merge(ReportSettings::defaultChart(), $chart);
+    }
+
+    private function _normalizeExport(array $export): array
+    {
+        $normalized = array_merge(ReportSettings::defaultExport(), $export);
+        $normalized['filename'] = trim((string)($normalized['filename'] ?? ''));
+
+        return $normalized;
+    }
+}

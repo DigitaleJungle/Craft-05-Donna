@@ -1,0 +1,125 @@
+<?php
+namespace verbb\formie\helpers;
+
+use verbb\formie\Formie;
+use verbb\formie\base\ElementField;
+use verbb\formie\fields\Dropdown;
+use verbb\formie\fields\Phone;
+
+use Craft;
+
+class FieldBuilderPolicy
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function settingsKeys(): array
+    {
+        return [
+            'allowPublicVolumes',
+            'allowMultiSelectDropdowns',
+            'allowPhoneCountrySelector',
+            'allowHiddenFieldTemplates',
+            'allowHtmlFieldTwig',
+            'allowHtmlFieldTemplateIncludes',
+            'requireHtmlPurification',
+        ];
+    }
+
+    public static function legacyTemplateSettings(): array
+    {
+        return [
+            'allowHiddenFieldTemplates' => true,
+            'allowHtmlFieldTwig' => true,
+            'allowHtmlFieldTemplateIncludes' => true,
+            'requireHtmlPurification' => false,
+        ];
+    }
+
+    public static function templateSettingsForSchema(?string $schemaVersion): array
+    {
+        return $schemaVersion !== null && version_compare($schemaVersion, '4.0.82', '<')
+            ? self::legacyTemplateSettings()
+            : [];
+    }
+
+    public static function allowHiddenFieldTemplates(): bool
+    {
+        return Formie::$plugin?->getSettings()->allowHiddenFieldTemplates ?? false;
+    }
+
+    public static function allowHtmlFieldTwig(): bool
+    {
+        return Formie::$plugin?->getSettings()->allowHtmlFieldTwig ?? false;
+    }
+
+    public static function allowHtmlFieldTemplateIncludes(): bool
+    {
+        return self::allowHtmlFieldTwig() && (Formie::$plugin?->getSettings()->allowHtmlFieldTemplateIncludes ?? false);
+    }
+
+    public static function requireHtmlPurification(): bool
+    {
+        return Formie::$plugin?->getSettings()->requireHtmlPurification ?? true;
+    }
+
+    public static function allowPublicVolumes(): bool
+    {
+        return (bool)(Formie::$plugin?->getSettings()->allowPublicVolumes ?? true);
+    }
+
+    public static function allowMultiSelectDropdowns(): bool
+    {
+        return (bool)(Formie::$plugin?->getSettings()->allowMultiSelectDropdowns ?? true);
+    }
+
+    public static function allowPhoneCountrySelector(): bool
+    {
+        return (bool)(Formie::$plugin?->getSettings()->allowPhoneCountrySelector ?? true);
+    }
+
+    public static function applyToFieldConfig(array &$config, string $fieldClass): void
+    {
+        if ($fieldClass === Phone::class && !self::allowPhoneCountrySelector()) {
+            $config['countryEnabled'] = false;
+        }
+
+        if (self::allowMultiSelectDropdowns()) {
+            return;
+        }
+
+        if ($fieldClass === Dropdown::class || is_subclass_of($fieldClass, ElementField::class)) {
+            $config['multi'] = false;
+        }
+    }
+
+    public static function multiSelectDropdownSchema(array $config = []): array
+    {
+        if (!self::allowMultiSelectDropdowns()) {
+            return [];
+        }
+
+        return [
+            SchemaHelper::lightswitchField(array_merge([
+                'label' => Craft::t('formie', 'Allow Multiple'),
+                'instructions' => Craft::t('formie', 'Whether this field should allow multiple options to be selected.'),
+                'name' => 'multi',
+            ], $config)),
+        ];
+    }
+
+    public static function phoneCountrySelectorSchema(array $config = []): array
+    {
+        if (!self::allowPhoneCountrySelector()) {
+            return [];
+        }
+
+        return [
+            SchemaHelper::lightswitchField(array_merge([
+                'label' => Craft::t('formie', 'Country Enabled'),
+                'instructions' => Craft::t('formie', 'Whether to show the dial code on the country dropdown.'),
+                'name' => 'countryEnabled',
+            ], $config)),
+        ];
+    }
+}

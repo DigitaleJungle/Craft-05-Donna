@@ -1,0 +1,14 @@
+{% fieldtag 'subFieldRows' %}
+    {% for row in field.getEnabledRows() %}
+        {% fieldtag 'subFieldRow' %}
+            {% for field in row.getEnabledFields() %}
+                {# Only display one field - the first one enabled #}
+                {% if loop.first %}
+                    {{ craft.formie.renderField(form, field, {
+                        inputName: 'datetime',
+                    }) }}
+                {% endif %}
+            {% endfor %}
+        {% endfieldtag %}
+    {% endfor %}
+{% endfieldtag %}

@@ -1,0 +1,10 @@
+{% set currentPage = form.getCurrentPage() %}
+
+{% formtag 'page' %}
+    {% formtag 'pageContainer' %}
+        {{ formieInclude('page/header') }}
+        {{ formieInclude('page/body') }}
+    {% endformtag %}
+
+    {{ formieInclude('page/footer') }}
+{% endformtag %}

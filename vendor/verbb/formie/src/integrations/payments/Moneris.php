@@ -1,0 +1,341 @@
+<?php
+namespace verbb\formie\integrations\payments;
+
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Payment;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\ModifyPaymentPayloadEvent;
+use verbb\formie\fields;
+use verbb\formie\fields\Calculations;
+use verbb\formie\fields\Dropdown;
+use verbb\formie\fields\Hidden;
+use verbb\formie\fields\Number;
+use verbb\formie\fields\Radio;
+use verbb\formie\fields\SingleLineText;
+use verbb\formie\helpers\PaymentAttempt;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\BrowserModule;
+use verbb\formie\models\BrowserModuleContext;
+use verbb\formie\models\Payment as PaymentModel;
+use verbb\formie\models\PaymentDecision;
+use verbb\formie\models\PaymentMoney;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+use craft\web\Response;
+
+use yii\base\Event;
+
+use Exception;
+use SimpleXMLElement;
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Moneris extends Payment
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Moneris';
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_PAYLOAD = 'modifyPayload';
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $storeId = null;
+
+    #[Sensitive]
+    public ?string $apiToken = null;
+
+    public ?string $profileId = null;
+    public bool|string $useSandbox = false;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Provide payment capabilities for your forms with {name}.', ['name' => static::displayName()]);
+    }
+
+    public function hasValidSettings(): bool
+    {
+        return App::parseEnv($this->storeId) && App::parseEnv($this->apiToken);
+    }
+
+    public function getFieldHtmlVariables(): array
+    {
+        return [
+            'endpointUrl' => $this->getBaseUrl() . 'HPPtoken/index.php',
+            'profileId' => App::parseEnv($this->profileId),
+        ];
+    }
+
+    public function getBrowserModule(BrowserModuleContext $context): ?BrowserModule
+    {
+        if (!$this->hasValidSettings()) {
+            return null;
+        }
+
+        $this->setField($context->field);
+
+        return new BrowserModule([
+            'moduleId' => 'formie:moneris',
+            'surfaces' => [BrowserModule::SURFACE_SERVER_RENDERED, BrowserModule::SURFACE_CLIENT_RENDERED],
+            'config' => [
+                'endpointUrl' => $this->getBaseUrl() . 'HPPtoken/index.php',
+                'requiredInputSuffixes' => ['monerisTokenId'],
+                'waitForValueMs' => 2500,
+            ],
+        ]);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $storeId = htmlspecialchars(App::parseEnv($this->storeId) ?? '', ENT_XML1 | ENT_QUOTES, 'UTF-8');
+            $apiToken = htmlspecialchars(App::parseEnv($this->apiToken) ?? '', ENT_XML1 | ENT_QUOTES, 'UTF-8');
+
+            $xml = trim(<<<XML
+                <?xml version="1.0" encoding="UTF-8"?>
+                <request>
+                    <store_id>{$storeId}</store_id>
+                    <api_token>{$apiToken}</api_token>
+                    <res_get_expiring_data>
+                        <month>12</month>
+                        <year>2060</year>
+                    </res_get_expiring_data>
+                </request>
+            XML);
+
+            $this->getClient()->request('POST', 'gateway2/servlet/MpgRequest', [
+                'body' => $xml,
+            ]);
+
+            return true;
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+            return false;
+        }
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::comboboxField([
+                'label' => Craft::t('formie', 'Payment Currency'),
+                'instructions' => Craft::t('formie', 'Provide the currency to be used for the transaction.'),
+                'name' => 'currency',
+                'required' => true,
+                'placeholder' => Craft::t('formie', 'Select an option'),
+                'options' => static::getCurrencyOptions(),
+            ]),
+            SchemaHelper::fieldWrap([
+                'label' => Craft::t('formie', 'Payment Amount'),
+                'instructions' => Craft::t('formie', 'Provide an amount for the transaction. This can be either a fixed value, or derived from a field.'),
+                'required' => true,
+                'children' => [
+                    SchemaHelper::selectField([
+                        'name' => 'amountType',
+                        'required' => true,
+                        'options' => [
+                            ['label' => Craft::t('formie', 'Fixed Value'), 'value' => Payment::VALUE_TYPE_FIXED],
+                            ['label' => Craft::t('formie', 'Dynamic Value'), 'value' => Payment::VALUE_TYPE_DYNAMIC],
+                        ],
+                    ]),
+                    SchemaHelper::numberField([
+                        'name' => 'amountFixed',
+                        'required' => true,
+                        'size' => 6,
+                        'if' => 'amountType == "' . Payment::VALUE_TYPE_FIXED . '"',
+                    ]),
+                    SchemaHelper::fieldSelectField([
+                        'name' => 'amountVariable',
+                        'referenceContext' => 'client',
+                        'includeSelectors' => false,
+                        'topLevelOnly' => true,
+                        'required' => true,
+                        'fieldTypes' => [
+                            Calculations::class,
+                            Dropdown::class,
+                            Hidden::class,
+                            Number::class,
+                            Radio::class,
+                            SingleLineText::class,
+                        ],
+                        'if' => 'amountType == "' . Payment::VALUE_TYPE_DYNAMIC . '"',
+                    ]),
+                ],
+            ]),
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayment(Submission $submission): PaymentDecision
+    {
+
+        $currency = $this->getFieldSetting('currency');
+
+        return PaymentAttempt::run($this, $submission, $this->getPaymentAmount($submission), $currency, [
+            'storeId' => $this->storeId,
+            'apiToken' => $this->apiToken,
+            'useSandbox' => $this->useSandbox,
+        ], fn(PaymentModel $payment, PaymentAttempt $attempt) => $this->_processPayment($submission, $payment, $attempt));
+    }
+
+    protected function getPaymentAccountIdentity(): ?string
+    {
+        return App::parseEnv($this->storeId) ?: null;
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['storeId', 'apiToken', 'profileId'], 'required'];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        return Craft::createGuzzleClient([
+            'base_uri' => $this->getBaseUrl(),
+            'headers' => ['Content-Type' => 'text/xml'],
+        ]);
+    }
+
+    protected function definePaymentFieldSettingsDefaults(): array
+    {
+        $defaults = [
+            'amountType' => self::VALUE_TYPE_FIXED,
+        ];
+
+        return $defaults;
+    }
+
+    protected function getBaseUrl(): string
+    {
+        $useSandbox = App::parseBooleanEnv($this->useSandbox);
+
+        return $useSandbox ? 'https://esqa.moneris.com/' : 'https://www3.moneris.com/';
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _processPayment(Submission $submission, PaymentModel $payment, PaymentAttempt $attempt): PaymentDecision
+    {
+        $result = false;
+
+        // Get the amount from the field, which handles dynamic fields
+        $amount = $payment->amount;
+        $currency = $this->getFieldSetting('currency');
+
+        // Capture the authorized payment
+        $field = $this->getField();
+        $paymentPayload = $this->getPaymentFieldPayload($submission);
+        $monerisTokenId = $paymentPayload->string('monerisTokenId') ?? '';
+
+        if (!$monerisTokenId && !$attempt->hasReceipt()) {
+            throw new Exception("Missing `monerisTokenId` from payload: {$monerisTokenId}.");
+        }
+
+        if (!$amount) {
+            throw new Exception("Missing `amount` from payload: {$amount}.");
+        }
+
+        if (!$currency) {
+            throw new Exception("Missing `currency` from payload: {$currency}.");
+        }
+
+        $orderId = $attempt->merchantReference();
+        $formattedAmount = PaymentMoney::fromDecimal((string)$amount, $currency)->decimal();
+        $storeId = htmlspecialchars((string)App::parseEnv($this->storeId), ENT_XML1 | ENT_QUOTES, 'UTF-8');
+        $apiToken = htmlspecialchars((string)App::parseEnv($this->apiToken), ENT_XML1 | ENT_QUOTES, 'UTF-8');
+        // The token comes from the browser. Keep it inside its text node so
+        // it cannot introduce transaction parameters into the gateway XML.
+        $monerisTokenId = htmlspecialchars($monerisTokenId, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+        $payload = [
+            'xml' => trim(<<<XML
+                <?xml version="1.0" encoding="UTF-8"?>
+                <request>
+                    <store_id>{$storeId}</store_id>
+                    <api_token>{$apiToken}</api_token>
+                    <res_purchase_cc>
+                        <order_id>{$orderId}</order_id>
+                        <amount>{$formattedAmount}</amount>
+                        <data_key>{$monerisTokenId}</data_key>
+                        <crypt_type>7</crypt_type>
+                    </res_purchase_cc>
+                </request>
+            XML),
+        ];
+
+        // Raise a `modifySinglePayload` event
+        $event = new ModifyPaymentPayloadEvent([
+            'integration' => $this,
+            'submission' => $submission,
+            'payload' => $payload,
+        ]);
+        $this->trigger(self::EVENT_MODIFY_PAYLOAD, $event);
+
+        $response = $attempt->request($event->payload, function() use ($event): array {
+            $response = $this->getClient()->request('POST', 'gateway2/servlet/MpgRequest', ['body' => $event->payload['xml']]);
+            $xml = new SimpleXMLElement((string)$response->getBody());
+            return isset($xml->receipt) ? Json::decode(Json::encode($xml->receipt)) : [];
+        }, static fn(array $receipt) => $receipt['TransID'] ?? $receipt['TxnNumber'] ?? null);
+        $receipt = $response;
+
+        if (!$receipt) {
+            throw new Exception('Missing receipt in Moneris response.');
+        }
+
+        // Handle Moneris-specific casing
+        $responseCode = isset($receipt['ResponseCode']) && is_numeric((string)$receipt['ResponseCode'])
+            ? (int)$receipt['ResponseCode']
+            : 999;
+
+        $isComplete = strtolower((string)($receipt['Complete'] ?? 'false')) === 'true';
+        $message = (string)($receipt['Message'] ?? 'Unknown');
+        $transactionId = (string)($receipt['TransID'] ?? $receipt['TxnNumber'] ?? null);
+
+        $timedOut = strtolower((string)($receipt['TimedOut'] ?? 'false')) === 'true';
+
+        if ($isComplete && !$timedOut && $responseCode >= 50 && $responseCode < 900) {
+            $attempt->reject("Transaction declined: {$message}");
+        }
+
+        if (!$isComplete || $timedOut || $responseCode >= 50 || !$transactionId) {
+            throw new Exception('Moneris has not confirmed the payment.');
+        }
+
+        $payment->reference = $transactionId;
+        $payment->status = PaymentModel::STATUS_SUCCEEDED;
+        $payment->response = $receipt;
+
+        $attempt->save();
+
+        $result = true;
+
+
+        return $result ? PaymentDecision::succeeded($this->handle) : PaymentDecision::failed(null, $this->handle);
+    }
+}

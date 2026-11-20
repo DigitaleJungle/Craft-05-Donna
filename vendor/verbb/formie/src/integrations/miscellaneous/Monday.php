@@ -1,0 +1,473 @@
+<?php
+namespace verbb\formie\integrations\miscellaneous;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Miscellaneous;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\DateTimeHelper;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Monday extends Miscellaneous
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Monday';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    #[FormIntegrationSetting]
+    public ?string $boardId = null;
+
+    #[FormIntegrationSetting]
+    public ?array $fieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to Monday.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            $boards = $this->_getPaginated();
+            $boardOptions = [];
+
+            foreach ($boards as $board) {
+                $groups = $board['groups'] ?? [];
+                $columns = $board['columns'] ?? [];
+
+                foreach ($groups as $group) {
+                    $boardOptions[] = [
+                        'name' => $board['name'] . ': ' . $group['title'],
+                        'id' => $board['id'] . ':' . $group['id'],
+                        'fields' => $this->_getCustomFields($columns),
+                    ];
+                }
+            }
+
+            $settings = [
+                'boards' => $boardOptions,
+            ];
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('POST', '/', [
+                'json' => [
+                    'query' => '
+                        query {
+                            me {
+                                is_guest
+                                join_date
+                            }
+                        }
+                    ',
+                ],
+            ]);
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $fields = $this->_getBoardSettings()['fields'] ?? [];
+            $boardValues = $this->getFieldMappingValues($submission, $this->fieldMapping, $fields);
+
+            $boardIds = explode(':', $this->boardId);
+            $boardId = $boardIds[0] ?? '';
+            $groupId = $boardIds[1] ?? '';
+
+            if (!$boardId) {
+                Integration::error($this, Craft::t('formie', 'Missing mapped “boardId” {id}', [
+                    'id' => $this->boardId,
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+
+            if (!$groupId) {
+                Integration::error($this, Craft::t('formie', 'Missing mapped “groupId” {id}', [
+                    'id' => $this->boardId,
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+
+            $itemPayload = [
+                'query' => '
+                    mutation CreateItemMutation($boardId: ID!, $groupId: String, $itemName: String!, $columns: JSON) {
+                        create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $columns) {
+                            id
+                        }
+                    }
+                ',
+                'operationName' => 'CreateItemMutation',
+                'variables' => [
+                    'boardId' => (int)$boardId,
+                    'groupId' => $groupId,
+                    'itemName' => ArrayHelper::remove($boardValues, 'name:name'),
+                    'columns' => $this->_prepColumns($boardValues),
+                ],
+            ];
+
+            $response = $this->deliverPayload($submission, '/', $itemPayload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+
+            $itemId = $response['data']['create_item']['id'] ?? '';
+
+            if (!$itemId) {
+                Integration::error($this, Craft::t('formie', 'Missing return “itemId” {response}', [
+                    'response' => Json::encode($response),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey'], 'required'];
+
+        $fields = $this->_getBoardFields((string)($this->boardId ?? ''));
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['fieldMapping'], 'validateFieldMapping', 'params' => $fields, 'when' => function($model) {
+                return $model->enabled;
+            }, 'on' => [Integration::SCENARIO_FORM],
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        return Craft::createGuzzleClient([
+            'base_uri' => 'https://api.monday.com/v2/',
+            'headers' => [
+                'Authorization' => App::parseEnv($this->apiKey),
+                'Content-Type' => 'application/json',
+            ],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $selectedBoardId = (string)($this->boardId ?? '');
+
+        if ($selectedBoardId === '') {
+            $selectedBoardId = $this->_getFirstBoardId();
+        }
+
+        $schema[] = SchemaHelper::comboboxField([
+            'name' => 'boardId',
+            'label' => Craft::t('formie', 'Board'),
+            'instructions' => Craft::t('formie', 'Select your {name} board to manage content on.', ['name' => $this->displayName()]),
+            'required' => true,
+            'placeholder' => Craft::t('formie', 'Select an option'),
+            'options' => $this->_getBoardOptions(),
+        ]);
+
+        $schemaFields = $this->convertIntegrationFieldsToSchema($this->_getBoardFields($selectedBoardId));
+        $fieldMappingSchema = array_map(fn(array $f) => SchemaHelper::fieldSelectField([
+            'name' => $f['handle'],
+            'label' => $f['name'],
+            'required' => $f['required'],
+            'options' => $f['options'] ?? [],
+        ]), $schemaFields);
+
+        if ($fieldMappingSchema) {
+            $schema[] = SchemaHelper::groupField([
+                'name' => 'fieldMapping',
+                'label' => Craft::t('formie', 'Field Mapping'),
+                'instructions' => Craft::t('formie', 'Choose how your form fields should map to your {name} fields.', ['name' => $this->displayName()]),
+                'children' => $fieldMappingSchema,
+            ]);
+        }
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getCustomFields($columns, $excludeNames = []): array
+    {
+        $columnOptions = [];
+
+        foreach ($columns as $key => $column) {
+            $options = [];
+            $required = false;
+
+            if ($column['type'] === 'name') {
+                $required = true;
+            }
+
+            if ($column['type'] === 'color') {
+                $settings = Json::decode($column['settings_str']);
+                $labels = $settings['labels'] ?? [];
+
+                foreach ($labels as $labelId => $label) {
+                    $options[] = [
+                        'label' => $label,
+                        'value' => $labelId,
+                    ];
+                }
+            }
+
+            if ($options) {
+                $options = [
+                    'label' => $column['title'],
+                    'options' => $options,
+                ];
+            }
+
+
+            $columnOptions[] = new IntegrationField([
+                'handle' => $column['type'] . ':' . $column['id'],
+                'name' => $column['title'],
+                'type' => $column['type'],
+                'sourceType' => $column['type'],
+                'required' => $required,
+                'options' => $options,
+            ]);
+        }
+
+        return $columnOptions;
+    }
+
+    private function _prepColumns($columns): string
+    {
+        $newColumns = [];
+
+        // Prepare columns for the API - we keep a record of the type when mapping
+        foreach ($columns as $key => $value) {
+            $columnInfo = explode(':', $key);
+            [$type, $handle] = $columnInfo;
+
+            if ($type === 'email') {
+                $newColumns[$handle] = [
+                    'email' => $value,
+                    'text' => $value,
+                ];
+            } elseif ($type === 'link') {
+                $newColumns[$handle] = [
+                    'url' => $value,
+                    'text' => $value,
+                ];
+            } elseif ($type === 'phone') {
+                $newColumns[$handle] = [
+                    'phone' => $value,
+                    'countryShortName' => '',
+                ];
+            } elseif ($type === 'country') {
+                $countries = Formie::$plugin->getCountries()->getAddressCountries();
+
+                // Check if we supply either the value or label for a country
+                $countryValue = ArrayHelper::firstWhere($countries, 'value', $value);
+                $countryLabel = ArrayHelper::firstWhere($countries, 'label', $value);
+
+                $newColumns[$handle] = [
+                    'countryCode' => $countryValue['value'] ?? $countryLabel['value'] ?? '',
+                    'countryName' => $countryValue['label'] ?? $countryLabel['label'] ?? '',
+                ];
+            } elseif ($type === 'color') {
+                $newColumns[$handle] = [
+                    'index' => (int)$value,
+                ];
+            } elseif ($type === 'boolean' || $type === 'checkbox') {
+                $newColumns[$handle] = [
+                    'checked' => StringHelper::toBoolean($value) ? 'true' : 'false',
+                ];
+            } elseif ($type === 'lookup') {
+                // No supported in API
+            } elseif ($type === 'board-relation') {
+                // No supported in API
+            } elseif ($type === 'date') {
+                $date = DateTimeHelper::toDateTime($value);
+
+                if ($date) {
+                    $newColumns[$handle] = [
+                        'date' => $date->format('Y-m-d'),
+                        'time' => $date->format('H:i:s'),
+                    ];
+                } else {
+                    $newColumns[$handle] = $value;
+                }
+            } else {
+                $newColumns[$handle] = $value;
+            }
+        }
+
+        return Json::encode($newColumns);
+    }
+
+    private function _getBoardSettings(?string $boardId = null): array
+    {
+        $boards = $this->getConfigValue('boards');
+        $selectedBoardId = $boardId ?? $this->boardId ?? '';
+
+        if (!is_array($boards)) {
+            return [];
+        }
+
+        if ($board = ArrayHelper::firstWhere($boards, 'id', $selectedBoardId)) {
+            return $board;
+        }
+
+        return [];
+    }
+
+    private function _getBoardFields(?string $boardId = null): array
+    {
+        $board = $this->_getBoardSettings($boardId);
+        $fields = $board['fields'] ?? [];
+
+        return is_array($fields) ? $fields : [];
+    }
+
+    private function _getBoardOptions(): array
+    {
+        $options = [];
+        $boards = $this->getConfigValue('boards');
+
+        if (!is_array($boards)) {
+            return $options;
+        }
+
+        foreach ($boards as $board) {
+            $id = $board['id'] ?? null;
+            $name = $board['name'] ?? null;
+
+            if ($id === null || $name === null) {
+                continue;
+            }
+
+            $options[] = [
+                'label' => (string)$name,
+                'value' => (string)$id,
+            ];
+        }
+
+        return $options;
+    }
+
+    private function _getFirstBoardId(): string
+    {
+        $boards = $this->getConfigValue('boards');
+
+        if (!is_array($boards) || empty($boards)) {
+            return '';
+        }
+
+        $firstBoard = reset($boards);
+        $id = $firstBoard['id'] ?? null;
+
+        return $id !== null ? (string)$id : '';
+    }
+
+    private function _getPaginated($limit = 100, $page = 1, $items = [])
+    {
+        $response = $this->request('POST', '/', [
+            'json' => [
+                'query' => '
+                    query {
+                        boards (limit:' . $limit . ', page:' . $page . ') {
+                            name
+                            id
+
+                            groups {
+                                id
+                                title
+                            }
+
+                            columns {
+                                id
+                                title
+                                type
+                                settings_str
+                            }
+                        }
+                    }
+                ',
+            ],
+        ]);
+
+        $newItems = $response['data']['boards'] ?? [];
+        $nextPage = $page + 1;
+
+        if ($newItems) {
+            $items = array_merge($items, $newItems);
+
+            if (count($newItems) === $limit) {
+                $items = $this->_getPaginated($limit, $nextPage, $items);
+            }
+        }
+
+        return $items;
+    }
+}

@@ -1,0 +1,43 @@
+<?php
+namespace verbb\formie\fields\coercion;
+
+final class StringValueCoercer
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function asString(mixed $value): string
+    {
+        if (is_array($value)) {
+            return implode(', ', array_map(static function($item) {
+                if (is_scalar($item) || (is_object($item) && method_exists($item, '__toString'))) {
+                    return (string)$item;
+                }
+
+                return '';
+            }, $value));
+        }
+
+        return ScalarValueCoercer::toScalarString($value);
+    }
+
+    public static function asArray(mixed $value): array
+    {
+        if ($value === null) {
+            return [];
+        }
+
+        if (is_array($value)) {
+            return $value;
+        }
+
+        $string = self::asString($value);
+
+        return $string !== '' ? [$string] : [];
+    }
+
+    public static function forCondition(mixed $value): mixed
+    {
+        return $value;
+    }
+}

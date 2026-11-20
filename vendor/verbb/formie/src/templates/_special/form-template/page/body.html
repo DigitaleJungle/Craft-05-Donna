@@ -1,0 +1,22 @@
+{% set rows = page.getEnabledRows() %}
+{% set inlineSubmit = page.shouldRenderSubmitOnLastRow(rows|length > 0) %}
+
+{% formtag 'pageBody' %}
+    {% formtag 'rows' %}
+        {% for row in rows %}
+            {% set inlineSubmitButton = inlineSubmit and loop.last %}
+
+            {% formtag 'row' %}
+                {% for field in row.getRenderableFields() %}
+                    {{ craft.formie.renderField(form, field) }}
+                {% endfor %}
+
+                {% if inlineSubmitButton %}
+                    {% formtag 'rowSubmitButton' %}
+                        {{ formieInclude('page/submit-button') }}
+                    {% endformtag %}
+                {% endif %}
+            {% endformtag %}
+        {% endfor %}
+    {% endformtag %}
+{% endformtag %}

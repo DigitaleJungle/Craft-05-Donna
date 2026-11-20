@@ -1,0 +1,101 @@
+{% extends 'formie/_layouts/settings' %}
+{% set title = 'Notifications' | t('formie') %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% block content %}
+
+<h2>{{ 'Notifications' | t('formie') }}</h2>
+
+<form action="" method="post" accept-charset="UTF-8" data-saveshortcut>
+    <input type="hidden" name="action" value="formie/settings/save-settings">
+    <input type="hidden" name="page" value="notifications">
+    {{ redirectInput('formie/settings/notifications') }}
+    {{ csrfInput() }}
+
+    {% namespace 'settings' %}
+        {{ forms.lightswitchField({
+            first: true,
+            label: 'Use Queue for Notifications' | t('formie'),
+            instructions: 'Whether to use Craft‘s queue system to trigger emails. This is highly recommended to prevent slow submissions for your users.' | t('formie'),
+            id: 'useQueueForNotifications',
+            name: 'useQueueForNotifications',
+            on: settings.useQueueForNotifications,
+            warning: macros.configWarning('useQueueForNotifications', 'formie'),
+        }) }}
+
+        {{ forms.textField({
+            label: 'Empty Value Placeholder' | t('formie'),
+            instructions: 'When a field has no value and considered "empty", this text will be shown in email notifications.' | t('formie'),
+            name: 'emptyValuePlaceholder',
+            value: settings.emptyValuePlaceholder,
+            warning: macros.configWarning('emptyValuePlaceholder', 'formie'),
+        }) }}
+
+        {{ forms.textField({
+            label: 'Maximum Email Attachment Size' | t('formie'),
+            instructions: 'The maximum size in megabytes for assets attached to email notifications. Set to 0 for no limit.' | t('formie'),
+            name: 'maxEmailAttachmentSizeMb',
+            value: settings.maxEmailAttachmentSizeMb,
+            size: 5,
+            warning: macros.configWarning('maxEmailAttachmentSizeMb', 'formie'),
+        }) }}
+
+        {{ forms.lightswitchField({
+            label: 'Send Email Alert for Failed Notification' | t('formie'),
+            instructions: 'Enable this option send nominated email addresses an alert email when an email notification cannot be delivered.' | t('formie'),
+            name: 'sendEmailAlerts',
+            on: settings.sendEmailAlerts,
+            warning: macros.configWarning('sendEmailAlerts', 'formie'),
+            toggle: 'send-alerts',
+        }) }}
+
+        <div id="send-alerts" class="{{ not settings.sendEmailAlerts ? 'hidden' }}">
+            {% set groups = [{ label: 'None' | t('formie'), value: '' }] %}
+
+            {% for group in craft.app.userGroups.getAllGroups() %}
+                {% set groups = groups | merge([{ label: group.name, value: group.uid }]) %}
+            {% endfor %}
+
+            {{ forms.selectField({
+                label: 'Notification User Group' | t('formie'),
+                instructions: 'Select the user group to receive failed notification alerts. Each user in this group will receive an email.' | t('formie'),
+                id: 'alertEmailsUserGroup',
+                name: 'alertEmailsUserGroup',
+                suggestEnvVars: true,
+                value: settings.alertEmailsUserGroup,
+                options: groups,
+                errors: settings.getErrors('alertEmailsUserGroup'),
+                warning: macros.configWarning('alertEmailsUserGroup', 'formie'),
+            }) }}
+
+            {{ forms.editableTableField({
+                label: 'Notification Email Addresses' | t('formie'),
+                instructions: 'Enter any additional email addresses to receive failed notification alerts. These recipients do not need to be Craft users.' | t('formie'),
+                id: 'alertEmails',
+                name: 'alertEmails',
+                cols: {
+                    email: {
+                        type: 'autosuggest',
+                        heading: 'Email Address' | t('formie'),
+                        suggestEnvVars: true,
+                    },
+                },
+                rows: settings.getAlertEmailRows(),
+                errors: settings.getErrors('alertEmails'),
+                warning: macros.configWarning('alertEmails', 'formie'),
+                allowAdd: true,
+                allowDelete: true,
+                allowReorder: true,
+            }) }}
+        </div>
+
+    {% endnamespace %}
+
+    <hr>
+
+    <input type="submit" class="btn submit" value="{{ 'Save' | t('formie') }}">
+</form>
+
+{% endblock %}

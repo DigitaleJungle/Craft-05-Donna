@@ -1,0 +1,23 @@
+{% set prevPage = form.getPreviousPage(page) %}
+{% set inlineSubmit = page.shouldRenderSubmitOnLastRow(page.getEnabledRows()|length > 0) %}
+
+{% formtag 'pageButtons' %}
+    {# Next button goes first. https://stackoverflow.com/a/1963285 #}
+    {% formtag 'buttonContainer' %}
+        {% if not inlineSubmit %}
+            {{ formieInclude('page/submit-button') }}
+        {% endif %}
+
+        {% if page.settings.showBackButton and prevPage %}
+            {% formtag 'backButton' %}
+                {{ page.settings.backButtonLabel }}
+            {% endformtag %}
+        {% endif %}
+
+        {% if page.settings.showSaveButton %}
+            {% formtag 'saveButton' %}
+                {{ page.settings.saveButtonLabel }}
+            {% endformtag %}
+        {% endif %}
+    {% endformtag %}
+{% endformtag %}

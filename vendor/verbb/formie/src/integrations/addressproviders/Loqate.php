@@ -1,0 +1,102 @@
+<?php
+namespace verbb\formie\integrations\addressproviders;
+
+use verbb\formie\Formie;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\AddressProvider;
+use verbb\formie\models\BrowserModule;
+use verbb\formie\models\BrowserModuleContext;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+class Loqate extends AddressProvider
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Loqate';
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const LOQATE_INPUT_NAME = 'formie-loqate-autocomplete';
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    public array $reconfigurableOptions = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Use {link} to suggest addresses, for address fields.', ['link' => '[Loqate](https://www.loqate.com/)']);
+    }
+
+    public function getBrowserModule(BrowserModuleContext $context): ?BrowserModule
+    {
+        if (!$this->hasValidSettings()) {
+            return null;
+        }
+
+        return new BrowserModule([
+            'moduleId' => 'formie:loqate',
+            'surfaces' => [BrowserModule::SURFACE_SERVER_RENDERED, BrowserModule::SURFACE_CLIENT_RENDERED, BrowserModule::SURFACE_CP_EDIT],
+            'config' => [
+                'apiKey' => App::parseEnv($this->apiKey),
+                'namespace' => $context->field ? Formie::$plugin->getService()->getFieldNamespaceForScript($context->field) : '',
+                'reconfigurableOptions' => $this->_getOptions(),
+            ],
+        ]);
+    }
+
+    public function hasValidSettings(): bool
+    {
+        if ($this->apiKey) {
+            return true;
+        }
+
+        return false;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey'], 'required'];
+
+        return $rules;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getOptions(): array
+    {
+        $options = [];
+        $optionsRaw = $this->reconfigurableOptions;
+
+        foreach ($optionsRaw as $key => $value) {
+            $options[$value[0]] = Json::decode($value[1]);
+        }
+
+        return $options;
+    }
+}

@@ -1,0 +1,129 @@
+{% extends '_layouts/cp' %}
+
+{% set crumbs = [
+    { label: craft.formie.getPluginName() | t('formie'), url: url('formie') },
+    { label: 'Forms' | t('formie'), url: url('formie/forms') },
+] %}
+
+{% if builderSiteCrumb ?? null %}
+    {% set crumbs = crumbs | unshift(builderSiteCrumb) %}
+{% endif %}
+
+{% set pluginName = craft.formie.getPluginName() | t('formie') %}
+{% set title = form.title ?? ('Form' | t('formie')) %}
+{% set docTitle = title ~ ' - ' ~ pluginName %}
+{% set selectedSubnavItem = 'forms' %}
+{% set showHeader = false %}
+{% set bodyClass = 'formie-form-page' %}
+
+{% block main %}
+
+	{% if fieldTypeHydrationPayload ?? null %}
+		<script id="formie-inline-field-type-configs" type="application/json">{{ fieldTypeHydrationPayload | raw }}</script>
+	{% endif %}
+
+	<div class="formie-form-builder"></div>
+
+	<div class="formie-form-builder__placeholder" aria-live="polite">
+		<div class="formie-form-builder__placeholder_wrap">
+			<div class="formie-form-builder__placeholder_tabs"></div>
+			<div class="formie-form-builder__spinner" aria-hidden="true"></div>
+		</div>
+	</div>
+
+{% endblock %}
+
+{% css %}
+
+footer#global-footer {
+    display: none !important;
+}
+
+.formie-form-page #main-content {
+    padding-bottom: 0;
+}
+
+/* Craft focuses #main / #content-container on load and applies its global focus ring. */
+.formie-form-page #main:focus,
+.formie-form-page #main:focus-visible,
+.formie-form-page #content-container:focus,
+.formie-form-page #content-container:focus-visible {
+    box-shadow: none;
+}
+
+.formie-form-builder  {
+    //padding-bottom: 1rem;
+    margin-bottom: 1rem;
+    position: relative;
+}
+
+.formie-form-builder [data-formie-shadow-root] {
+    height: calc(-80px + 100vh);
+    display: flex;
+    flex-direction: column;
+}
+
+.formie-form-builder__placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    position: absolute;
+    z-index: 200;
+    width: 100%;
+    color: #6b7280;
+    font-size: 13px;
+
+    transition: opacity 200ms ease-in-out;
+
+    background: var(--body-bg);
+    height: calc(-80px + 100vh);
+    padding-top: 59px;
+}
+
+.formie-form-builder__placeholder_wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    height: 100%;
+    color: #6b7280;
+    font-size: 13px;
+    background-color: #fff;
+    box-shadow: rgb(205, 216, 228) 0px 0px 0px 1px, rgba(205, 216, 228, 0.5) 0px 2px 12px 0px;      
+    border-radius: 5px;
+}
+
+.formie-form-builder.formie-form-builder--ready + .formie-form-builder__placeholder {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.formie-form-builder__placeholder_tabs {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 45px;
+    border-radius: 5px 5px 0 0;
+    background-color: rgb(243, 247, 252);
+    box-shadow: rgba(154, 165, 177, 0.25) 0px -1px 0px 0px inset;
+}
+
+.formie-form-builder__spinner {
+    width: 3rem;
+    height: 3rem;
+    border-radius: 999px;
+    border: 2px solid transparent;
+    border-top-color: #dc2627;
+    animation: formie-builder-spin 0.5s linear infinite;
+}
+
+@keyframes formie-builder-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+{% endcss %}

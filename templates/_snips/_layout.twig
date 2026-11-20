@@ -1,0 +1,61 @@
+{% set HQ = company.address.main(1) %}
+{% set addresses = company.address %}
+
+<!DOCTYPE html>
+<html lang="{{ currentSite.language }}">
+<head>
+{% cache if not craft.app.config.general.devMode %}
+
+    {% include "_snips/_head.twig" %}
+
+{% endcache %}
+</head>
+<body>
+    {% if craft.app.config.general.devMode %}
+        <style>
+            #devmode {
+                text-align:center;
+                width:100%;
+                display:block;
+                background:#f0f0d080;
+                position:fixed;
+                bottom:0;
+                right:0;
+                padding:5px;
+                cursor:pointer;
+                z-index:1000
+            }
+        </style>
+        <span id="devmode" onclick="this.style.display='none'">
+            Devmode is active, Click to hide.
+        </span>
+    {% endif %}
+    {% cache if not craft.app.config.general.devMode %}
+
+        {% include "_snips/_navbar.twig" %}
+
+    {% endcache %}
+
+    {% block body %}
+
+
+
+
+        {# Here comes the content #}
+
+
+
+    {% endblock %}
+   <footer>
+    {% cache if not craft.app.config.general.devMode %}
+    
+        {% include "_snips/_footer.twig" %}
+
+    {% endcache %}
+    </footer>
+    
+    {% cache if not craft.app.config.general.devMode %}
+        {% include "_snips/_end.twig" %}
+    {% endcache %}
+</body>
+</html>

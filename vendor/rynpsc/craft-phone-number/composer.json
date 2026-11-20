@@ -1,0 +1,63 @@
+{
+    "name": "rynpsc/craft-phone-number",
+    "description": "International phone number field.",
+    "type": "craft-plugin",
+    "keywords": [
+        "cms",
+        "craftcms",
+        "libphonenumber",
+        "phone",
+        "number",
+        "yii2"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "rynpsc",
+            "homepage": "https://github.com/rynpsc"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/rynpsc/craft-phone-number/issues?state=open",
+        "source": "https://github.com/rynpsc/craft-phone-number",
+        "docs": "https://github.com/rynpsc/craft-phone-number"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require": {
+        "php": "^8.2",
+        "ext-intl": "*",
+        "craftcms/cms": "^5.3.0",
+        "giggsey/libphonenumber-for-php": "^8.9"
+    },
+    "require-dev": {
+        "craftcms/phpstan": "dev-main",
+        "craftcms/ecs": "dev-main"
+    },
+    "autoload": {
+        "psr-4": {
+            "rynpsc\\phonenumber\\": "src/"
+        }
+    },
+    "extra": {
+        "name": "Phone Number",
+        "handle": "phone-number",
+        "class": "rynpsc\\phonenumber\\PhoneNumber",
+        "changelogUrl": "https://raw.githubusercontent.com/rynpsc/craft-phone-number/master/CHANGELOG.md",
+        "downloadUrl": "https://github.com/rynpsc/craft-phone-number/archive/master.zip"
+    },
+    "scripts": {
+        "ecs": "ecs check --ansi",
+        "ecs-fix": "ecs check --ansi --fix",
+        "phpstan": "phpstan analyse --memory-limit=1G"
+    },
+    "config": {
+        "platform": {
+            "php": "8.02"
+        },
+        "allow-plugins": {
+            "yiisoft/yii2-composer": true,
+            "craftcms/plugin-installer": true
+        }
+    }
+}

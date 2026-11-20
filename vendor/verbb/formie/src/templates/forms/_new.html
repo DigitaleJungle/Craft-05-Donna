@@ -1,0 +1,15 @@
+{% extends '_layouts/cp' %}
+{% set crumbs = [
+    { label: craft.formie.getPluginName() | t('formie'), url: url('formie') },
+    { label: 'Forms' | t('formie'), url: url('formie/forms') },
+] %}
+
+{% set bodyClass = 'fui-body fui-body-start' %}
+{% set title = '' %}
+{% set selectedSubnavItem = 'forms' %}
+
+{% block main %}
+
+	<div class="formie-new-form"></div>
+
+{% endblock %}

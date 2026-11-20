@@ -1,0 +1,33 @@
+<?php
+namespace verbb\formie\workflow\tasks\dispatch;
+
+use verbb\formie\Formie;
+use verbb\formie\enums\SubmissionAuthorityType;
+use verbb\formie\workflow\tasks\TaskInterface;
+use verbb\formie\workflow\tasks\TaskResult;
+use verbb\formie\workflow\WorkflowContext;
+
+class RevisionFollowUpsTask implements TaskInterface
+{
+    // Public Methods
+    // =========================================================================
+
+    public function execute(WorkflowContext $context): TaskResult
+    {
+        $command = $context->command;
+        $state = $context->taskState['dispatch.state'];
+        $state->runOnce('revisionFollowUps', function() use ($command, $context): void {
+            Formie::$plugin->getNotificationTriggers()->dispatchStatusChange($command->submission, $context->taskState['dispatch.statusChanged'] ?? null);
+
+            if ($command->authority->type === SubmissionAuthorityType::CONTROL_PANEL && ($context->taskState['dispatch.spamUnmarked'] ?? $command->submission->hasSpamChanged(true, false))) {
+                Formie::$plugin->getIntegrationTriggers()->dispatchSpamUnmarkWithAuthority(
+                    $command->submission,
+                    $command->sendNotificationsOnSpamUnmark,
+                    $command->triggerIntegrationsOnSpamUnmark,
+                    $command->authority,
+                );
+            }
+        });
+        return TaskResult::continue();
+    }
+}

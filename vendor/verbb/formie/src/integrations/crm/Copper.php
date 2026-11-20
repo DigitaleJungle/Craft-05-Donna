@@ -1,0 +1,792 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Copper extends Crm
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Copper';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    public ?string $apiEmail = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToPeople = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToLead = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToOpportunity = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToTask = false;
+
+    #[FormIntegrationSetting]
+    public ?array $peopleFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $leadFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $opportunityFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $taskFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            // Get Custom fields
+            $fields = $this->request('GET', 'custom_field_definitions');
+
+            // Get People fields
+            if ($this->mapToPeople && $this->settingsContext->dataKey === 'people') {
+                $settings['people'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'assignee_id',
+                        'name' => Craft::t('formie', 'Assignee'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_id',
+                        'name' => Craft::t('formie', 'Company'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_name',
+                        'name' => Craft::t('formie', 'Company Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'contact_type_id',
+                        'name' => Craft::t('formie', 'Contact Type'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'contact_type'),
+                            'options' => array_map(function($contactType) {
+                                return [
+                                    'label' => $contactType['name'],
+                                    'value' => $contactType['id'],
+                                ];
+                            }, $this->request('GET', 'contact_types')),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'details',
+                        'name' => Craft::t('formie', 'Details'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'emails',
+                        'name' => Craft::t('formie', 'Email'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone_numbers',
+                        'name' => Craft::t('formie', 'Phone Number'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'socials',
+                        'name' => Craft::t('formie', 'Social'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'title',
+                        'name' => Craft::t('formie', 'Title'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'websites',
+                        'name' => Craft::t('formie', 'Website'),
+                    ]),
+                ], $this->_getCustomFields($fields, 'person'));
+            }
+
+            // Get Lead fields
+            if ($this->mapToLead && $this->settingsContext->dataKey === 'lead') {
+                $settings['lead'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'assignee_id',
+                        'name' => Craft::t('formie', 'Assignee'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_name',
+                        'name' => Craft::t('formie', 'Company Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'customer_source_id',
+                        'name' => Craft::t('formie', 'Customer Source'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Customer Source'),
+                            'options' => array_map(function($customerSource) {
+                                return [
+                                    'label' => $customerSource['name'],
+                                    'value' => $customerSource['id'],
+                                ];
+                            }, $this->request('GET', 'customer_sources')),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'details',
+                        'name' => Craft::t('formie', 'Details'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'monetary_value',
+                        'name' => Craft::t('formie', 'Monetary Value'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone_numbers',
+                        'name' => Craft::t('formie', 'Phone Number'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'socials',
+                        'name' => Craft::t('formie', 'Social'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'status',
+                        'name' => Craft::t('formie', 'Status'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Status'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'New'),
+                                    'value' => 'New',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Unqualified'),
+                                    'value' => 'Unqualified',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Contacted'),
+                                    'value' => 'Contacted',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Qualified'),
+                                    'value' => 'Qualified',
+                                ],
+                            ],
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'websites',
+                        'name' => Craft::t('formie', 'Website'),
+                    ]),
+                ], $this->_getCustomFields($fields, 'lead'));
+            }
+
+            // Get Opportunity fields
+            if ($this->mapToOpportunity && $this->settingsContext->dataKey === 'opportunity') {
+                $settings['opportunity'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'assignee_id',
+                        'name' => Craft::t('formie', 'Assignee'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'close_date',
+                        'name' => Craft::t('formie', 'Close Date'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_id',
+                        'name' => Craft::t('formie', 'Company'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company_name',
+                        'name' => Craft::t('formie', 'Company Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'customer_source_id',
+                        'name' => Craft::t('formie', 'Customer Source'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Customer Source'),
+                            'options' => array_map(function($customerSource) {
+                                return [
+                                    'label' => $customerSource['name'],
+                                    'value' => $customerSource['id'],
+                                ];
+                            }, $this->request('GET', 'customer_sources')),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'details',
+                        'name' => Craft::t('formie', 'Details'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'loss_reason_id',
+                        'name' => Craft::t('formie', 'Loss Reason'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Loss Reason'),
+                            'options' => array_map(function($lossReason) {
+                                return [
+                                    'label' => $lossReason['name'],
+                                    'value' => $lossReason['id'],
+                                ];
+                            }, $this->request('GET', 'loss_reasons')),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'monetary_value',
+                        'name' => Craft::t('formie', 'Monetary Value'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'pipeline_id',
+                        'name' => Craft::t('formie', 'pipeline_id'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Pipelines'),
+                            'options' => array_map(function($pipeline) {
+                                return [
+                                    'label' => $pipeline['name'],
+                                    'value' => $pipeline['id'],
+                                ];
+                            }, $this->request('GET', 'pipelines')),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'priority',
+                        'name' => Craft::t('formie', 'Priority'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Priority'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'None'),
+                                    'value' => 'None',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Low'),
+                                    'value' => 'Low',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Medium'),
+                                    'value' => 'Medium',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'High'),
+                                    'value' => 'High',
+                                ],
+                            ],
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'pipeline_stage_id',
+                        'name' => Craft::t('formie', 'Pipeline Stage'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Stages'),
+                            'options' => array_map(function($pipelineStage) {
+                                return [
+                                    'label' => $pipelineStage['name'],
+                                    'value' => $pipelineStage['id'],
+                                ];
+                            }, $this->request('GET', 'pipeline_stages')),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'status',
+                        'name' => Craft::t('formie', 'Status'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Status'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'Open'),
+                                    'value' => 'Open',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Won'),
+                                    'value' => 'Won',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Lost'),
+                                    'value' => 'Lost',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Abandoned'),
+                                    'value' => 'Abandoned',
+                                ],
+                            ],
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'win_probability',
+                        'name' => Craft::t('formie', 'Win Probability'),
+                    ]),
+                ], $this->_getCustomFields($fields, 'opportunity'));
+            }
+
+            if ($this->mapToTask && $this->settingsContext->dataKey === 'task') {
+                $settings['task'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'related_resource',
+                        'name' => Craft::t('formie', 'Related Resource'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'assignee_id',
+                        'name' => Craft::t('formie', 'Assignee'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'due_date',
+                        'name' => Craft::t('formie', 'Due Date'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'reminder_date',
+                        'name' => Craft::t('formie', 'Reminder Date'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'priority',
+                        'name' => Craft::t('formie', 'Priority'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Priority'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'None'),
+                                    'value' => 'None',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'High'),
+                                    'value' => 'High',
+                                ],
+                            ],
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'status',
+                        'name' => Craft::t('formie', 'Status'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Status'),
+                            'options' => [
+                                [
+                                    'label' => Craft::t('formie', 'Open'),
+                                    'value' => 'Open',
+                                ],
+                                [
+                                    'label' => Craft::t('formie', 'Completed'),
+                                    'value' => 'Completed',
+                                ],
+                            ],
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'details',
+                        'name' => Craft::t('formie', 'Details'),
+                    ]),
+                ], $this->_getCustomFields($fields, 'task'));
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'account');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $peopleValues = $this->getFieldMappingValues($submission, $this->peopleFieldMapping, 'people');
+            $leadValues = $this->getFieldMappingValues($submission, $this->leadFieldMapping, 'lead');
+            $opportunityValues = $this->getFieldMappingValues($submission, $this->opportunityFieldMapping, 'opportunity');
+            $taskValues = $this->getFieldMappingValues($submission, $this->taskFieldMapping, 'task');
+
+            // Directly modify the field values first
+            $peopleFields = $this->_prepCustomFields($peopleValues);
+            $leadFields = $this->_prepCustomFields($leadValues);
+            $opportunityFields = $this->_prepCustomFields($opportunityValues);
+            $taskFields = $this->_prepCustomFields($taskValues);
+
+            $peopleId = null;
+            $leadId = null;
+            $opportunityId = null;
+            $taskId = null;
+
+            if ($this->mapToPeople) {
+                $peoplePayload = array_merge($peopleValues, [
+                    'custom_fields' => $peopleFields,
+                ]);
+
+                // Try and find the person first, doesn't handle adding existing ones well
+                // `people/fetch_by_email` no longer seems to work...
+                $response = $this->request('POST', 'people/search', [
+                    'json' => [
+                        'emails' => [$peoplePayload['emails'][0]['email'] ?? ''],
+                    ],
+                ]);
+
+                $existingPersonId = $response[0]['id'] ?? null;
+
+                // Update or create
+                if ($existingPersonId) {
+                    $response = $this->deliverPayload($submission, "people/{$existingPersonId}", $peoplePayload, 'PUT');
+                } else {
+                    $response = $this->deliverPayload($submission, 'people', $peoplePayload);
+                }
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $peopleId = $response['id'] ?? '';
+
+                if (!$peopleId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “peopleId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($peoplePayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->mapToLead) {
+                $leadPayload = array_merge($leadValues, [
+                    'custom_fields' => $leadFields,
+                ]);
+
+                $response = $this->deliverPayload($submission, 'leads', $leadPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $leadId = $response['id'] ?? '';
+
+                if (!$leadId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “leadId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($leadPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->mapToOpportunity) {
+                $opportunityPayload = array_merge($opportunityValues, [
+                    'custom_fields' => $opportunityFields,
+                ]);
+
+                if ($peopleId) {
+                    $opportunityPayload['primary_contact_id'] = $peopleId;
+                }
+
+                $response = $this->deliverPayload($submission, 'opportunities', $opportunityPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $opportunityId = $response['id'] ?? '';
+
+                if (!$opportunityId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “opportunityId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($opportunityPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->mapToTask) {
+                $taskPayload = array_merge($taskValues, [
+                    'custom_fields' => $taskFields,
+                ]);
+
+                $response = $this->deliverPayload($submission, 'tasks', $taskPayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $taskId = $response['id'] ?? '';
+
+                if (!$taskId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “taskId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($taskPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey', 'apiEmail'], 'required'];
+
+        $people = $this->getConfigValue('people');
+        $lead = $this->getConfigValue('lead');
+        $opportunity = $this->getConfigValue('opportunity');
+        $task = $this->getConfigValue('task');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['peopleFieldMapping'], 'validateFieldMapping', 'params' => $people, 'when' => function($model) {
+                return $model->enabled && $model->mapToPeople;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['leadFieldMapping'], 'validateFieldMapping', 'params' => $lead, 'when' => function($model) {
+                return $model->enabled && $model->mapToLead;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['opportunityFieldMapping'], 'validateFieldMapping', 'params' => $opportunity, 'when' => function($model) {
+                return $model->enabled && $model->mapToOpportunity;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['taskFieldMapping'], 'validateFieldMapping', 'params' => $task, 'when' => function($model) {
+                return $model->enabled && $model->mapToTask;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        return Craft::createGuzzleClient([
+            'base_uri' => 'https://api.copper.com/developer_api/v1/',
+            'headers' => [
+                'X-PW-AccessToken' => App::parseEnv($this->apiKey),
+                'X-PW-Application' => 'developer_api',
+                'X-PW-UserEmail' => App::parseEnv($this->apiEmail),
+                'Content-Type' => 'application/json',
+            ],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToPeople',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'People']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'People']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'peopleFieldMapping',
+            'if' => 'mapToPeople',
+            'dataLabel' => 'People',
+            'dataKey' => 'people',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToLead',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Lead']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Leads']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'leadFieldMapping',
+            'if' => 'mapToLead',
+            'dataLabel' => 'Lead',
+            'dataKey' => 'lead',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToOpportunity',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Opportunity']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Opportunities']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'opportunityFieldMapping',
+            'if' => 'mapToOpportunity',
+            'dataLabel' => 'Opportunity',
+            'dataKey' => 'opportunity',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToTask',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Task']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Tasks']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'taskFieldMapping',
+            'if' => 'mapToTask',
+            'dataLabel' => 'Task',
+            'dataKey' => 'task',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'Float' => IntegrationField::TYPE_FLOAT,
+            'Checkbox' => IntegrationField::TYPE_BOOLEAN,
+            'Date' => IntegrationField::TYPE_DATE,
+            'MultiSelect' => IntegrationField::TYPE_ARRAY,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields($fields, $namespace): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $field) {
+            if (!in_array($namespace, $field['available_on'])) {
+                continue;
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => 'custom:' . $field['id'],
+                'name' => $field['name'],
+                'type' => $this->_convertFieldType($field['data_type']),
+                'sourceType' => $field['data_type'],
+            ]);
+        }
+
+        return $customFields;
+    }
+
+    private function _prepCustomFields(&$fields): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $value) {
+            if (str_starts_with($key, 'custom:')) {
+                $field = ArrayHelper::remove($fields, $key);
+
+                $customFields[] = [
+                    'custom_field_definition_id' => str_replace('custom:', '', $key),
+                    'value' => $value,
+                ];
+            }
+
+            if ($key === 'email') {
+                $fields[$key] = [
+                    'category' => 'work',
+                    'email' => $value,
+                ];
+            }
+
+            if ($key === 'emails') {
+                $fields[$key] = [
+                    [
+                        'category' => 'work',
+                        'email' => $value,
+                    ],
+                ];
+            }
+
+            if ($key === 'phone_numbers') {
+                $fields[$key] = [
+                    [
+                        'category' => 'work',
+                        'number' => $value,
+                    ],
+                ];
+            }
+
+            if ($key === 'socials') {
+                $fields[$key] = [
+                    [
+                        'category' => '',
+                        'url' => $value,
+                    ],
+                ];
+            }
+
+            if ($key === 'websites') {
+                $fields[$key] = [
+                    [
+                        'category' => 'work',
+                        'url' => $value,
+                    ],
+                ];
+            }
+        }
+
+        return $customFields;
+    }
+}

@@ -1,0 +1,22 @@
+{(() => {
+    const options = field.options || [];
+    const visibleOptions = options.slice(0, 5);
+    const hiddenCount = Math.max(options.length - visibleOptions.length, 0);
+
+    return (
+        <div className={`formie-field-preview-layout-${field.layout || 'vertical' }`}>
+            {visibleOptions.map((option, index) => (
+                <div key={index} className="formie-field-preview-checkbox">
+                    <input type="checkbox" value={option.value} defaultChecked={option.isDefault} />
+                    <label>{option.label}</label>
+                </div>
+            ))}
+
+            {hiddenCount > 0 && (
+                <div className="formie-field-preview-instructions">
+                    ... {hiddenCount} {Craft.t('formie', 'more')}
+                </div>
+            )}
+        </div>
+    );
+})()}

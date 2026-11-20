@@ -1,0 +1,20 @@
+{% if craft.app.user.isGuest %}
+
+    {% do entry.setFieldValue('count', (entry.count ?? 0) + 1) %}
+    {% do craft.app.elements.saveElement(entry) %}
+
+    {% if getenv('UMAMI_SITE_ID') %}
+        {# Analytics tracking #}
+        <script async src="https://analytics.digitalejungle.be/script.js" data-website-id="{{ getenv('UMAMI_SITE_ID') }}" data-do-not-track></script>
+        <script>
+            umami.track('QR Code', {
+                {% if entry.medium %}Location: '{{ entry.medium }}'{% endif %}
+            });
+            setTimeout(() => window.location.href = '{{ entry.ctaLink }}', 500);
+        </script>
+    {% else %}
+        {% redirect entry.ctaLink %}
+    {% endif %}
+{% else %}
+    {% include "_qr-code/download.twig" %}
+{% endif %}

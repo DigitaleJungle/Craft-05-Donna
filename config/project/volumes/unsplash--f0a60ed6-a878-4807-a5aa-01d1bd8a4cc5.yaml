@@ -1,0 +1,54 @@
+altTranslationKeyFormat: null
+altTranslationMethod: site
+fieldLayouts:
+  67f78386-3f65-4973-9741-8feaf420ca52:
+    cardThumbAlignment: start
+    cardView:
+      - imageSize
+      - location
+    tabs:
+      -
+        elementCondition: null
+        elements:
+          -
+            autocapitalize: true
+            autocomplete: false
+            autocorrect: true
+            class: null
+            dateAdded: '2026-04-06T21:33:43+00:00'
+            disabled: false
+            elementCondition: null
+            id: null
+            inputType: null
+            instructions: null
+            label: null
+            max: null
+            min: null
+            name: null
+            orientation: null
+            placeholder: null
+            readonly: false
+            requirable: false
+            size: null
+            step: null
+            tip: null
+            title: null
+            type: craft\fieldlayoutelements\assets\AssetTitleField
+            uid: cf98a203-5f15-452e-a97d-c54c87d3f892
+            userCondition: null
+            warning: null
+            width: 100
+        name: Content
+        uid: b9a4e715-c39c-4695-b95d-835160d8b4dc
+        userCondition: null
+    thumbFieldKey: null
+fs: localImages
+handle: unsplash
+name: Unsplash
+propagationMethod: all
+sortOrder: 2
+subpath: unsplash
+titleTranslationKeyFormat: null
+titleTranslationMethod: site
+transformFs: transforms
+transformSubpath: unsplash

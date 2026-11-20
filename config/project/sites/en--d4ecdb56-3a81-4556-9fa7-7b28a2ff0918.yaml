@@ -1,0 +1,9 @@
+baseUrl: '@web/en'
+enabled: $ACTIVATE_EN
+handle: en
+hasUrls: true
+language: en
+name: Engels
+primary: false
+siteGroup: c5c66daa-734e-4c55-8b7a-fb3bc33dc9e8 # $PROJECT_NAME
+sortOrder: 2

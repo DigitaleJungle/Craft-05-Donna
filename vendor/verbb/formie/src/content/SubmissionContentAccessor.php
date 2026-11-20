@@ -1,0 +1,278 @@
+<?php
+namespace verbb\formie\content;
+
+use verbb\formie\base\ParentFieldInterface;
+use verbb\formie\base\RepeatableParentFieldInterface;
+use verbb\formie\elements\Submission;
+use verbb\formie\fields\Date;
+use verbb\formie\fields\Phone;
+use verbb\formie\fields\values\FieldValueInterface;
+use verbb\formie\helpers\ArrayHelper;
+
+use craft\errors\InvalidFieldException;
+
+use ArrayAccess;
+use stdClass;
+use UnitEnum;
+
+class SubmissionContentAccessor
+{
+    // Public Methods
+    // =========================================================================
+
+    public function setRawValue(Submission $submission, string $fieldPath, mixed $value): void
+    {
+        $state = $submission->getContentState();
+        [$rootHandle, $nestedPath] = $this->splitFieldPath($fieldPath);
+        $field = $submission->getContentManager()->getFieldByHandle($submission, $rootHandle);
+
+        if (!$field) {
+            throw new InvalidFieldException($rootHandle);
+        }
+
+        $uid = $field->uid;
+
+        if ($state->uploadedDataFiles && !$state->isMergingPartialPayload) {
+            $owner = $field;
+            $segments = $nestedPath === null ? [] : explode('.', $nestedPath);
+
+            while ($segments && $owner instanceof ParentFieldInterface) {
+                $row = $owner instanceof RepeatableParentFieldInterface ? array_shift($segments) : null;
+                $handle = array_shift($segments);
+                $child = null;
+
+                foreach ($owner->getFields($row) as $candidate) {
+                    if ($candidate->handle === $handle) {
+                        $child = $candidate;
+                        break;
+                    }
+                }
+                $owner = $child;
+            }
+
+            if ($owner && !$segments) {
+                $owner->discardRequestValue($submission);
+            }
+        }
+
+        if ($nestedPath === null) {
+            $state->conditions->invalidate();
+            $state->rawValuesByUid[$uid] = $value;
+            unset($state->normalizedValuesByUid[$uid]);
+            return;
+        }
+
+        // Nested paths use handles. Normalize stored UID keys before applying the
+        // edit, and preserve hydrated sibling values such as pending uploads.
+        $rootValue = $this->_getRootNormalizedValue($submission, $rootHandle);
+
+        if ($rootValue instanceof FieldValueInterface) {
+            // Nested edits need the field's writable input shape, not a generic
+            // value-object transport representation.
+            $rootValue = $field->serializeValueForClientInput($rootValue, $submission);
+        }
+
+        if (!is_array($rootValue) && !$rootValue instanceof ArrayAccess && !$rootValue instanceof stdClass) {
+            $rootValue = [];
+        }
+
+        // A rich value can also sit inside a Group or Repeater. Convert only the
+        // edited branch; projecting the whole parent would change untouched uploads.
+        $owner = $field;
+        $segments = explode('.', $nestedPath);
+        $path = [];
+
+        while ($segments && $owner instanceof ParentFieldInterface) {
+            $row = $owner instanceof RepeatableParentFieldInterface ? array_shift($segments) : null;
+
+            if ($row !== null) {
+                $path[] = $row;
+            }
+            $handle = array_shift($segments);
+            $path[] = $handle;
+            $child = null;
+
+            foreach ($owner->getFields($row) as $candidate) {
+                if ($candidate->handle === $handle) {
+                    $child = $candidate;
+                    break;
+                }
+            }
+            $owner = $child;
+            $childValue = ArrayHelper::getValue($rootValue, $path);
+
+            if ($child && $childValue instanceof FieldValueInterface) {
+                ArrayHelper::setValue($rootValue, $path, $child->serializeValueForClientInput($childValue, $submission));
+            }
+        }
+
+        ArrayHelper::setValue($rootValue, $nestedPath, $value);
+        $state->conditions->invalidate();
+        $state->rawValuesByUid[$uid] = $rootValue;
+        unset($state->normalizedValuesByUid[$uid]);
+    }
+
+    public function setNormalizedValue(Submission $submission, string $fieldHandle, mixed $value): void
+    {
+        $state = $submission->getContentState();
+        $field = $submission->getContentManager()->getFieldByHandle($submission, $fieldHandle);
+
+        if (!$field) {
+            throw new InvalidFieldException($fieldHandle);
+        }
+
+        $field->valueType()->assert($value, get_class($field) . ' [' . $field->handle . ']');
+        $state->conditions->invalidate();
+        $state->rawValuesByUid[$field->uid] = $value;
+        $state->normalizedValuesByUid[$field->uid] = $value;
+    }
+
+    public function getNormalizedValue(Submission $submission, string $fieldPath): mixed
+    {
+        [$rootHandle, $nestedPath] = $this->splitFieldPath($fieldPath);
+        $rootValue = $this->_getRootNormalizedValue($submission, $rootHandle);
+
+        if ($nestedPath === null) {
+            return $rootValue;
+        }
+
+        $field = $submission->getContentManager()->getFieldByHandle($submission, $rootHandle);
+
+        if ($field instanceof Date || $field instanceof Phone) {
+            return $field->resolveNormalizedValuePath($rootValue, $nestedPath);
+        }
+
+        return $this->resolvePathValue($rootValue, $nestedPath);
+    }
+
+    public function cloneNormalizedValue(Submission $submission, string $fieldPath): mixed
+    {
+        $value = $this->getNormalizedValue($submission, $fieldPath);
+
+        if (is_object($value) && !$value instanceof UnitEnum) {
+            return clone $value;
+        }
+
+        return $value;
+    }
+
+    // Compatibility wrapper for existing callsites during migration.
+    public function setValue(Submission $submission, string $fieldPath, mixed $value): void
+    {
+        $this->setRawValue($submission, $fieldPath, $value);
+    }
+
+    // Compatibility wrapper for existing callsites during migration.
+    public function getValue(Submission $submission, string $fieldPath): mixed
+    {
+        return $this->getNormalizedValue($submission, $fieldPath);
+    }
+
+    // Compatibility wrapper for existing callsites during migration.
+    public function cloneValue(Submission $submission, string $fieldPath): mixed
+    {
+        return $this->cloneNormalizedValue($submission, $fieldPath);
+    }
+
+    public function getPathValue(Submission $submission, string $fieldPath): mixed
+    {
+        return $this->getNormalizedValue($submission, $fieldPath);
+    }
+
+    public function resolvePathValue(mixed $fieldValue, ?string $path): mixed
+    {
+        if ($path === null || $path === '') {
+            return $fieldValue;
+        }
+
+        if ($fieldValue instanceof FieldValueInterface) {
+            return $fieldValue->getPathValue($path);
+        }
+
+        if (!is_array($fieldValue) && !$fieldValue instanceof ArrayAccess && !$fieldValue instanceof stdClass) {
+            return $fieldValue;
+        }
+
+        // Walk one segment at a time. Nested FieldValueInterface objects (e.g. Date
+        // inside Group/Repeater) expose virtual keys like `date`/`time` via
+        // getPathValue — ArrayHelper property access on those keys fatals in PHP 8+.
+        $segments = explode('.', $path);
+        $current = $fieldValue;
+
+        foreach ($segments as $index => $segment) {
+            if ($current instanceof FieldValueInterface) {
+                return $current->getPathValue(implode('.', array_slice($segments, $index)));
+            }
+
+            if (is_array($current)) {
+                if (!array_key_exists($segment, $current)) {
+                    return null;
+                }
+
+                $current = $current[$segment];
+                continue;
+            }
+
+            if ($current instanceof ArrayAccess) {
+                if (!isset($current[$segment])) {
+                    return null;
+                }
+
+                $current = $current[$segment];
+                continue;
+            }
+
+            if ($current instanceof stdClass) {
+                if (!property_exists($current, $segment)) {
+                    return null;
+                }
+
+                $current = $current->{$segment};
+                continue;
+            }
+
+            return $current;
+        }
+
+        return $current;
+    }
+
+    public function splitFieldPath(string $fieldPath): array
+    {
+        $segments = explode('.', $fieldPath);
+        $rootHandle = array_shift($segments);
+        $nestedPath = $segments ? implode('.', $segments) : null;
+
+        return [$rootHandle, $nestedPath];
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getRootNormalizedValue(Submission $submission, string $fieldHandle): mixed
+    {
+        $state = $submission->getContentState();
+        $field = $submission->getContentManager()->getFieldByHandle($submission, $fieldHandle);
+
+        if (!$field) {
+            throw new InvalidFieldException($fieldHandle);
+        }
+
+        $uid = $field->uid;
+
+        if (array_key_exists($uid, $state->normalizedValuesByUid)) {
+            return $state->normalizedValuesByUid[$uid];
+        }
+
+        // Cache normalization per field uid for the lifetime of the submission
+        // state so repeated template, export, and workflow reads do not keep
+        // re-running field-specific normalization logic.
+        $rawValue = $state->rawValuesByUid[$uid] ?? null;
+        $normalizedValue = $field->normalizeFieldValue($rawValue, $submission);
+        $state->normalizedValuesByUid[$uid] = $normalizedValue;
+        $state->rawValuesByUid[$uid] = $rawValue;
+
+        return $normalizedValue;
+    }
+}

@@ -1,0 +1,49 @@
+{
+  "name": "digitale-jungle/craft-easy-gallery",
+  "description": "This plugin provides a new field type and extra functionality to easily create galleries. Create beautiful galleries olders",
+  "version": "v1.2.4",
+  "type": "craft-plugin",
+  "license": "proprietary",
+  "support": {
+    "email": "info@digitalejungle.be",
+    "issues": "https://github.com/DigitaleJungle/easy-gallery/issues",
+    "source": "https://github.com/DigitaleJungle/easy-gallery/",
+    "docs": "https://github.com/DigitaleJungle/easy-gallery/",
+    "rss": "https://github.com/DigitaleJungle/easy-gallery/releases.atom"
+  },
+  "require": {
+    "php": ">=8.2",
+    "craftcms/cms": "^5.0.0"
+  },
+  "require-dev": {
+    "craftcms/ecs": "dev-main",
+    "craftcms/phpstan": "dev-main"
+  },
+  "autoload": {
+    "psr-4": {
+      "digitalejungle\\crafteasygallery\\": "src/"
+    }
+  },
+  "extra": {
+    "handle": "easy-gallery",
+    "name": "Easy Gallery",
+    "developer": "Digitale Jungle",
+    "documentationUrl": "https://github.com/DigitaleJungle/easy-gallery#readme",
+    "class": "digitalejungle\\crafteasygallery\\Gallery"
+  },
+  "scripts": {
+    "check-cs": "ecs check --ansi",
+    "fix-cs": "ecs check --ansi --fix",
+    "phpstan": "phpstan --memory-limit=1G"
+  },
+  "config": {
+    "sort-packages": true,
+    "platform": {
+      "php": "8.2"
+    },
+    "allow-plugins": {
+      "yiisoft/yii2-composer": true,
+      "craftcms/plugin-installer": true
+    }
+  }
+}

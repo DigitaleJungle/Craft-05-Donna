@@ -1,0 +1,14 @@
+{% set class = class ?? '' %}
+{% set link = link ?? '' %}
+{% set gallery = gallery ?? '' %}
+{% set size = size ?? 'default' %}
+
+{% set template = "_partials/assetKind/" ~ asset.kind ~ ".twig" %}
+
+{% include [template, '_partials/assets/default'] ignore missing with {
+    asset,
+    loading: 'lazy',
+    size,
+    class,
+    link
+} %}

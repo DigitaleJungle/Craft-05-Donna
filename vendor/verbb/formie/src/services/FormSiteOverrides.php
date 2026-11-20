@@ -1,0 +1,1808 @@
+<?php
+namespace verbb\formie\services;
+
+use verbb\formie\Formie;
+use verbb\formie\base\FieldInterface;
+use verbb\formie\base\ParentFieldInterface;
+use verbb\formie\compatibility\fields\FieldConfigNormalizer;
+use verbb\formie\elements\Form;
+use verbb\formie\fields\MissingField;
+use verbb\formie\helpers\Table;
+use verbb\formie\models\FieldLayout;
+use verbb\formie\models\FieldLayoutPage;
+use verbb\formie\models\FieldLayoutPageSettings;
+use verbb\formie\models\FormSettings;
+use verbb\formie\models\Notification;
+use verbb\formie\models\RichText;
+use verbb\formie\records\FormSiteOverride as FormSiteOverrideRecord;
+
+use Craft;
+use craft\db\Query;
+use craft\db\Table as CraftTable;
+use craft\elements\User;
+use craft\helpers\Cp;
+use craft\helpers\Json;
+use craft\helpers\UrlHelper;
+use craft\models\Site;
+use craft\web\Request;
+
+use yii\base\Component;
+
+class FormSiteOverrides extends Component
+{
+    // Constants
+    // =========================================================================
+
+    private const FIELD_INSTANCE_OVERRIDE_KEYS = [
+        'required',
+    ];
+
+
+    // Properties
+    // =========================================================================
+
+    private array $_sourceSiteIdsByFormId = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function isEnabled(): bool
+    {
+        return Craft::$app->getIsMultiSite();
+    }
+
+    public function getBuilderTranslatableConfig(): array
+    {
+        $fieldTypes = $this->_fieldTypeTranslatableMap();
+
+        return [
+            'form' => Form::translatableRootProperties(),
+            'formSettings' => FormSettings::translatableProperties(),
+            'page' => FieldLayoutPage::translatableProperties(),
+            'pageSettings' => FieldLayoutPageSettings::translatableProperties(),
+            'notification' => Notification::translatableProperties(),
+            'fieldTypes' => $fieldTypes,
+            'fieldInstance' => self::FIELD_INSTANCE_OVERRIDE_KEYS,
+            'scalarKeys' => $this->_buildScalarOverrideKeys($fieldTypes),
+            'nestedKeys' => ['options', 'columns'],
+        ];
+    }
+
+    public function getPrimarySiteId(): int
+    {
+        return (int)Craft::$app->getSites()->getPrimarySite()->id;
+    }
+
+    public function getSourceSiteId(Form $form): int
+    {
+        if ($form->sourceSiteId) {
+            return (int)$form->sourceSiteId;
+        }
+
+        if ($form->id) {
+            return $this->getSourceSiteIdForFormId((int)$form->id);
+        }
+
+        return $this->resolveSourceSiteIdForNewForm($form);
+    }
+
+    public function getSourceSiteIdForFormId(int $formId): int
+    {
+        if (isset($this->_sourceSiteIdsByFormId[$formId])) {
+            return $this->_sourceSiteIdsByFormId[$formId];
+        }
+
+        $sourceSiteId = (new Query())
+            ->select(['sourceSiteId'])
+            ->from([Table::FORMIE_FORMS])
+            ->where(['id' => $formId])
+            ->scalar();
+
+        if ($sourceSiteId) {
+            return $this->_sourceSiteIdsByFormId[$formId] = (int)$sourceSiteId;
+        }
+
+        return $this->_sourceSiteIdsByFormId[$formId] = $this->getPrimarySiteId();
+    }
+
+    public function resolveSourceSiteIdForNewForm(Form $form): int
+    {
+        if ($form->sourceSiteId) {
+            return (int)$form->sourceSiteId;
+        }
+
+        $request = Craft::$app->getRequest();
+        $requestedSite = $request instanceof Request ? Cp::requestedSite() : null;
+
+        // Craft initializes new elements on the primary site before the selected
+        // creation site is applied. Resolve the request before that default.
+        $candidateIds = array_filter([
+            $request instanceof Request ? $request->getParam('siteId') : null,
+            $requestedSite?->id,
+            $form->siteId,
+            Craft::$app->getSites()->getCurrentSite()->id,
+        ], fn(mixed $siteId) => $siteId !== null && $siteId !== '');
+
+        foreach ($candidateIds as $candidateId) {
+            return (int)$candidateId;
+        }
+
+        return $this->getPrimarySiteId();
+    }
+
+    public function isSourceSiteForForm(int $formId, int $siteId): bool
+    {
+        return (int)$siteId === $this->getSourceSiteIdForFormId($formId);
+    }
+
+    public function getEditableSites(?User $user = null): array
+    {
+        return Formie::$plugin->getFormSitePropagation()->getEditableSites($user);
+    }
+
+    public function getBuilderSitesForForm(?Form $form = null): array
+    {
+        if (!$this->isEnabled()) {
+            return [];
+        }
+
+        $editableSites = $this->getEditableSites();
+
+        if (!$form) {
+            return $editableSites;
+        }
+
+        $availableSiteIds = Formie::$plugin->getFormSitePropagation()->resolveSiteIdsForForm($form);
+
+        return array_values(array_filter(
+            $editableSites,
+            fn(Site $site) => in_array((int)$site->id, $availableSiteIds, true),
+        ));
+    }
+
+    public function resolveBuilderActiveSiteId(?Form $form = null, ?int $activeSiteId = null): int
+    {
+        $activeSiteId ??= $this->getActiveSiteId();
+        $sites = $this->getBuilderSitesForForm($form);
+
+        if ($sites === []) {
+            return $activeSiteId;
+        }
+
+        $siteIds = array_map(fn(Site $site) => (int)$site->id, $sites);
+
+        if (in_array($activeSiteId, $siteIds, true)) {
+            return $activeSiteId;
+        }
+
+        if ($form) {
+            $sourceSiteId = $this->getSourceSiteId($form);
+
+            if (in_array($sourceSiteId, $siteIds, true)) {
+                return $sourceSiteId;
+            }
+        }
+
+        return (int)$siteIds[0];
+    }
+
+    public function getActiveSiteId(): int
+    {
+        $requestedSite = Cp::requestedSite();
+
+        if ($requestedSite) {
+            return (int)$requestedSite->id;
+        }
+
+        return (int)Craft::$app->getSites()->getCurrentSite()->id;
+    }
+
+    public function resolveFormTitlesForSite(array $canonicalTitles, int $siteId): array
+    {
+        if (!$this->isEnabled() || $canonicalTitles === []) {
+            return $canonicalTitles;
+        }
+
+        $siteId = (int)$siteId;
+
+        $formIds = array_map('intval', array_keys($canonicalTitles));
+
+        $rows = (new Query())
+            ->select(['formId', 'overrides'])
+            ->from(Table::FORMIE_FORM_SITE_OVERRIDES)
+            ->where([
+                'siteId' => $siteId,
+                'formId' => $formIds,
+            ])
+            ->all();
+
+        $resolved = $canonicalTitles;
+
+        foreach ($rows as $row) {
+            $formId = (int)$row['formId'];
+
+            if ($this->isSourceSiteForForm($formId, $siteId)) {
+                continue;
+            }
+
+            $overrides = Json::decodeIfJson($row['overrides'] ?? null);
+
+            if (!is_array($overrides)) {
+                continue;
+            }
+
+            $normalized = $this->normalizeOverrides($overrides);
+            $title = $normalized['title'] ?? null;
+
+            if ($title !== null && $title !== '' && array_key_exists($formId, $resolved)) {
+                $resolved[$formId] = (string)$title;
+            }
+        }
+
+        return $resolved;
+    }
+
+    public function getOverrides(int $formId, int $siteId): array
+    {
+        if (!$this->isEnabled() || $this->isSourceSiteForForm($formId, $siteId)) {
+            return [];
+        }
+
+        $record = FormSiteOverrideRecord::findOne([
+            'formId' => $formId,
+            'siteId' => $siteId,
+        ]);
+
+        if (!$record) {
+            return [];
+        }
+
+        $overrides = Json::decodeIfJson($record->overrides);
+
+        if (!is_array($overrides)) {
+            return [];
+        }
+
+        return $this->_stripFormFieldOverrides($this->_remapLegacyOverrideKeys($formId, $this->normalizeOverrides($overrides)));
+    }
+
+    public function getAllOverrides(int $formId): array
+    {
+        if (!$this->isEnabled() || !$formId) {
+            return [];
+        }
+
+        $rows = (new Query())
+            ->select(['siteId', 'overrides'])
+            ->from(Table::FORMIE_FORM_SITE_OVERRIDES)
+            ->where(['formId' => $formId])
+            ->all();
+
+        $result = [];
+
+        foreach ($rows as $row) {
+            $siteId = (int)$row['siteId'];
+            $overrides = Json::decodeIfJson($row['overrides'] ?? null);
+
+            if (!is_array($overrides)) {
+                continue;
+            }
+
+            $normalized = $this->_stripFormFieldOverrides($this->_remapLegacyOverrideKeys($formId, $this->normalizeOverrides($overrides)));
+
+            if ($normalized !== []) {
+                $result[$siteId] = $normalized;
+            }
+        }
+
+        return $result;
+    }
+
+    public function saveOverrides(int $formId, int $siteId, array $overrides): void
+    {
+        if (!$this->isEnabled() || !$formId || $this->isSourceSiteForForm($formId, $siteId)) {
+            return;
+        }
+
+        unset($overrides['fields'], $overrides['fieldOverrides']);
+
+        // The builder submits the complete placement-scoped diff, including an
+        // empty section when every override has been reset to its source value.
+        $replaceFieldInstanceOverrides = array_key_exists('fieldInstanceOverrides', $overrides);
+        $existing = $this->getOverrides($formId, $siteId);
+
+        if ($replaceFieldInstanceOverrides) {
+            unset($existing['fieldInstanceOverrides']);
+        }
+
+        $overrides = $this->_remapLegacyOverrideKeys($formId, $this->normalizeOverrides($overrides));
+        $overrides = $this->_mergeOverridePayloads($existing, $overrides);
+
+        if ($overrides === []) {
+            $this->deleteOverrides($formId, $siteId);
+
+            return;
+        }
+
+        $record = FormSiteOverrideRecord::findOne([
+            'formId' => $formId,
+            'siteId' => $siteId,
+        ]) ?? new FormSiteOverrideRecord([
+            'formId' => $formId,
+            'siteId' => $siteId,
+        ]);
+
+        $record->overrides = $overrides;
+        $record->save(false);
+
+        Formie::$plugin->getFormSitePropagation()->syncElementSiteTitles($formId);
+    }
+
+    public function saveTranslationBundle(int $formId, int $siteId, array $translations): void
+    {
+        if (!$this->isEnabled() || !$formId || $this->isSourceSiteForForm($formId, $siteId)) {
+            return;
+        }
+
+        $fieldOverrides = $translations['fieldOverrides'] ?? [];
+        unset($translations['fields'], $translations['fieldOverrides']);
+
+        if (is_array($fieldOverrides) && $fieldOverrides !== []) {
+            Formie::$plugin->getFieldSiteOverrides()->saveOverrides($siteId, $fieldOverrides);
+        }
+
+        $this->saveOverrides($formId, $siteId, $translations);
+    }
+
+    public function deleteOverrides(int $formId, int $siteId): void
+    {
+        FormSiteOverrideRecord::deleteAll([
+            'formId' => $formId,
+            'siteId' => $siteId,
+        ]);
+
+        Formie::$plugin->getFormSitePropagation()->syncElementSiteTitles($formId);
+    }
+
+    public function applyToNotification(Notification $notification, int $siteId): Notification
+    {
+        $notification = clone $notification;
+        $overrides = $this->getOverrides((int)$notification->formId, $siteId);
+        $this->_applyNotificationOverride($notification, $overrides['notifications'] ?? []);
+        return $notification;
+    }
+
+    public function applyToForm(Form $form, ?int $siteId = null, bool $clone = false): Form
+    {
+        if (!$this->isEnabled()) {
+            return $form;
+        }
+
+        $siteId ??= (int)($form->siteId ?: Craft::$app->getSites()->getCurrentSite()->id);
+
+        if ($siteId === $this->getSourceSiteId($form)) {
+            return $form;
+        }
+
+        $target = $clone ? clone $form : $form;
+
+        if ($clone) {
+            // Clone mutable presentation state without serializing runtime callbacks.
+            $target->setFormLayout($this->_cloneLayout($form->getFormLayout()));
+            $target->settings = clone $form->settings;
+            $target->settings->setForm($target);
+            $target->setNotifications(array_map(static fn(Notification $notification) => clone $notification, $form->getNotifications() ?? []));
+        }
+
+        $overrides = $this->getOverrides((int)$form->id, $siteId);
+
+        if ($overrides !== []) {
+            $this->_applyOverridesToFormElement($target, $overrides);
+        }
+
+        $fieldOverrides = Formie::$plugin->getFieldSiteOverrides()->getOverridesForFieldIds(
+            Formie::$plugin->getFieldSiteOverrides()->collectFieldDefinitionIds($target),
+            $siteId,
+        );
+
+        if ($fieldOverrides !== []) {
+            foreach ($target->getFields() as $field) {
+                if ($field instanceof FieldInterface) {
+                    $this->_applyFieldOverridesFromPayload($field, $fieldOverrides);
+                }
+            }
+        }
+
+        $fieldInstanceOverrides = $overrides['fieldInstanceOverrides'] ?? [];
+
+        if (is_array($fieldInstanceOverrides) && $fieldInstanceOverrides !== []) {
+            foreach ($target->getFields() as $field) {
+                if ($field instanceof FieldInterface) {
+                    $this->_applyFieldInstanceOverridesFromPayload($field, $fieldInstanceOverrides);
+                }
+            }
+        }
+
+        if ($overrides === [] && $fieldOverrides === []) {
+            return $form;
+        }
+
+        return $target;
+    }
+
+    public function applyToBuilderData(array $canonicalData, ?int $siteId, ?array $overrides = null): array
+    {
+        if (!$this->isEnabled()) {
+            return $canonicalData;
+        }
+
+        $formId = (int)($canonicalData['id'] ?? 0);
+        $sourceSiteId = $formId
+            ? $this->getSourceSiteIdForFormId($formId)
+            : $this->resolveSourceSiteIdForNewForm(new Form());
+        $siteId ??= $sourceSiteId;
+
+        if ($siteId === $sourceSiteId) {
+            return $canonicalData;
+        }
+
+        $formId = (int)($canonicalData['id'] ?? 0);
+        $overrides ??= $formId ? $this->getOverrides($formId, $siteId) : [];
+
+        $fieldOverrides = $formId
+            ? Formie::$plugin->getFieldSiteOverrides()->getOverridesForFieldIds(
+                Formie::$plugin->getFieldSiteOverrides()->collectFieldDefinitionIdsFromBuilderData($canonicalData),
+                (int)$siteId,
+            )
+            : [];
+
+        if ($overrides === [] && $fieldOverrides === []) {
+            return $canonicalData;
+        }
+
+        return $this->mergeOverridesIntoBuilderData($canonicalData, $overrides, $fieldOverrides);
+    }
+
+    public function mergeOverridesIntoBuilderData(array $canonicalData, array $overrides, array $fieldOverrides = []): array
+    {
+        $merged = $this->_cloneBuilderData($canonicalData);
+
+        if (isset($overrides['title'])) {
+            $merged['title'] = $overrides['title'];
+        }
+
+        if (isset($overrides['settings']) && is_array($overrides['settings'])) {
+            $merged['settings'] = $this->_mergeSettingsArray(
+                is_array($merged['settings'] ?? null) ? $merged['settings'] : [],
+                $overrides['settings'],
+            );
+        }
+
+        if (isset($overrides['pages']) && is_array($overrides['pages']) && isset($merged['pages']) && is_array($merged['pages'])) {
+            $merged['pages'] = $this->_mergePagesArray($merged['pages'], $overrides['pages']);
+        }
+
+        if (isset($overrides['notifications']) && is_array($overrides['notifications']) && isset($merged['notifications']) && is_array($merged['notifications'])) {
+            $merged['notifications'] = $this->_mergeNotificationsArray($merged['notifications'], $overrides['notifications']);
+        }
+
+        if ($fieldOverrides !== [] && isset($merged['pages']) && is_array($merged['pages'])) {
+            $merged['pages'] = $this->_mergeFieldsIntoPages($merged['pages'], $fieldOverrides);
+        }
+
+        if (!empty($overrides['fieldInstanceOverrides']) && is_array($overrides['fieldInstanceOverrides']) && isset($merged['pages']) && is_array($merged['pages'])) {
+            $merged['pages'] = $this->_mergeFieldInstancesIntoPages($merged['pages'], $overrides['fieldInstanceOverrides']);
+        }
+
+        return $merged;
+    }
+
+    public function normalizeOverrides(array $overrides): array
+    {
+        $normalized = [];
+
+        if (!empty($overrides['title'])) {
+            $normalized['title'] = (string)$overrides['title'];
+        }
+
+        if (!empty($overrides['settings']) && is_array($overrides['settings'])) {
+            $settings = $this->_normalizeSettingsOverrides($overrides['settings']);
+
+            if ($settings !== []) {
+                $normalized['settings'] = $settings;
+            }
+        }
+
+        if (!empty($overrides['pages']) && is_array($overrides['pages'])) {
+            $pages = $this->_normalizePagesOverrides($overrides['pages']);
+
+            if ($pages !== []) {
+                $normalized['pages'] = $pages;
+            }
+        }
+
+        if (!empty($overrides['notifications']) && is_array($overrides['notifications'])) {
+            $notifications = $this->_normalizeNotificationsOverrides($overrides['notifications']);
+
+            if ($notifications !== []) {
+                $normalized['notifications'] = $notifications;
+            }
+        }
+
+        if (isset($overrides['fieldInstanceOverrides']) && is_array($overrides['fieldInstanceOverrides'])) {
+            $fieldInstanceOverrides = $this->_normalizeFieldInstanceOverrides($overrides['fieldInstanceOverrides']);
+
+            if ($fieldInstanceOverrides !== []) {
+                $normalized['fieldInstanceOverrides'] = $fieldInstanceOverrides;
+            }
+        }
+
+        return $normalized;
+    }
+
+    public function getBuilderSiteCrumbConfig(?Form $form = null, ?int $activeSiteId = null): ?array
+    {
+        if (!$this->isEnabled()) {
+            return null;
+        }
+
+        $sites = $this->getBuilderSitesForForm($form);
+
+        if (count($sites) <= 1) {
+            return null;
+        }
+
+        $activeSiteId = $this->resolveBuilderActiveSiteId($form, $activeSiteId);
+        $selectedSite = Craft::$app->getSites()->getSiteById($activeSiteId) ?? Craft::$app->getSites()->getCurrentSite();
+        $request = Craft::$app->getRequest();
+        $path = $request->getPathInfo();
+        $params = $request->getQueryParamsWithoutPath();
+        unset($params['fresh'], $params['site']);
+
+        $items = array_map(function(Site $site) use ($activeSiteId, $path, $params) {
+            return [
+                'label' => Craft::t('site', $site->name),
+                'selected' => (int)$site->id === $activeSiteId,
+                'url' => UrlHelper::cpUrl($path, ['site' => $site->handle] + $params),
+                'attributes' => [
+                    'data' => [
+                        'site-id' => $site->id,
+                        'formie-site-id' => $site->id,
+                    ],
+                ],
+            ];
+        }, $sites);
+
+        return [
+            'id' => 'site-crumb',
+            'icon' => 'world',
+            'iconAltText' => Craft::t('app', 'Site'),
+            'label' => Craft::t('site', $selectedSite->name),
+            'menu' => [
+                'items' => $items,
+                'label' => Craft::t('app', 'Select site'),
+            ],
+        ];
+    }
+
+    public function getBuilderMultiSiteConfig(Form $form, ?int $activeSiteId = null): array
+    {
+        if (!$this->isEnabled()) {
+            return [
+                'enabled' => false,
+            ];
+        }
+
+        $sourceSiteId = $this->getSourceSiteId($form);
+        $activeSiteId = $this->resolveBuilderActiveSiteId($form, $activeSiteId);
+        $sites = array_map(function(Site $site) use ($sourceSiteId) {
+            return [
+                'id' => (int)$site->id,
+                'name' => $site->name,
+                'handle' => $site->handle,
+                'language' => $site->language,
+                'source' => (int)$site->id === $sourceSiteId,
+            ];
+        }, $this->getBuilderSitesForForm($form));
+
+        return [
+            'enabled' => count($sites) > 1,
+            'sourceSiteId' => $sourceSiteId,
+            'activeSiteId' => $activeSiteId,
+            'sites' => $sites,
+            'overrides' => $form->id ? $this->getAllOverrides((int)$form->id) : [],
+            'fieldOverrides' => $form->id ? array_map(
+                fn(array $overrides) => $this->filterFieldTranslationsForLayout($form->getFormLayout(), $overrides),
+                Formie::$plugin->getFieldSiteOverrides()->getAllForForm($form),
+            ) : [],
+            'layoutReadOnly' => false,
+        ];
+    }
+
+    public function normalizeFieldOverrides(array $fields): array
+    {
+        return $this->_normalizeFieldsOverrides($fields);
+    }
+
+    public function filterFieldTranslationProperties(string $fieldType, array $overrides, bool $preserveUnavailable = false): array
+    {
+        if ($fieldType === MissingField::class || !in_array($fieldType, Formie::$plugin->getFields()->getResolvedRegisteredFieldTypes(), true)) {
+            // Portable writes retain missing-type data; application paths keep it inert.
+            return $preserveUnavailable ? $overrides : [];
+        }
+
+        $overrides = FieldConfigNormalizer::normalizeSettingAliases($overrides, $fieldType);
+
+        return array_intersect_key($overrides, array_fill_keys($fieldType::translatableProperties(), true));
+    }
+
+    /** Filter the separate site-switch payload as well as the already-translated builder data. */
+    public function filterFieldTranslationsForLayout(FieldLayout $layout, array $overrides): array
+    {
+        $filtered = [];
+
+        foreach ($layout->getFieldsRecursively() as $field) {
+            foreach (array_filter([$field->definitionId, $field->reference, $field->uid]) as $key) {
+                if (isset($overrides[$key]) && is_array($overrides[$key])) {
+                    $values = $this->filterFieldTranslationProperties($field::class, $overrides[$key]);
+
+                    if ($values !== []) {
+                        $filtered[$key] = $values;
+                    }
+                }
+            }
+        }
+
+        return $filtered;
+    }
+
+    public function remapOverrideKeysForForm(int $formId, array $overrides): array
+    {
+        return $this->_remapLegacyOverrideKeys($formId, $overrides);
+    }
+
+    public function resolveCanonicalFormTitle(Form $form): string
+    {
+        return $this->_resolveCanonicalFormTitle($form);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _stripFormFieldOverrides(array $overrides): array
+    {
+        unset($overrides['fields'], $overrides['fieldOverrides']);
+
+        return $overrides;
+    }
+
+    private function _applyOverridesToFormElement(Form $form, array $overrides): void
+    {
+        if (!empty($overrides['title'])) {
+            $form->title = (string)$overrides['title'];
+        }
+
+        if (!empty($overrides['settings']) && is_array($overrides['settings'])) {
+            $this->_applySettingsOverrides($form, $overrides['settings']);
+        }
+
+        foreach ($form->getPages() as $page) {
+            $pageOverride = $this->_resolvePageOverride(
+                $overrides['pages'] ?? [],
+                ['id' => $page->id, 'uid' => $page->uid, '_handle' => $page->getHandle()],
+            );
+
+            if (!is_array($pageOverride)) {
+                continue;
+            }
+
+            if (!empty($pageOverride['label'])) {
+                $page->label = (string)$pageOverride['label'];
+            }
+
+            if (!empty($pageOverride['settings']) && is_array($pageOverride['settings'])) {
+                $this->_applyPageSettingsOverrides($page, $pageOverride['settings']);
+            }
+        }
+
+        if (!empty($overrides['notifications']) && is_array($overrides['notifications'])) {
+            $this->_applyNotificationOverrides($form, $overrides['notifications']);
+        }
+    }
+
+    private function _applySettingsOverrides(Form $form, array $settingsOverrides): void
+    {
+        foreach (FormSettings::translatableProperties() as $key) {
+            if (!array_key_exists($key, $settingsOverrides)) {
+                continue;
+            }
+
+            $value = $settingsOverrides[$key];
+
+            if ($form->settings->hasProperty($key)) {
+                $form->settings->$key = $this->_coerceRichTextValue($value);
+            }
+        }
+    }
+
+    private function _applyPageSettingsOverrides(FieldLayoutPage $page, array $settingsOverrides): void
+    {
+        $settings = $page->getPageSettings();
+
+        foreach (FieldLayoutPageSettings::translatableProperties() as $key) {
+            if (!array_key_exists($key, $settingsOverrides)) {
+                continue;
+            }
+
+            if ($settings->hasProperty($key)) {
+                $settings->$key = (string)$settingsOverrides[$key];
+            }
+        }
+    }
+
+    private function _applyFieldOverridesFromPayload(FieldInterface $field, array $fieldOverrides): void
+    {
+        $fieldId = (int)($field->definitionId ?: 0);
+        $resolved = $fieldId ? $this->_resolveFieldOverride($fieldOverrides, ['fieldId' => $fieldId]) : null;
+
+        if (is_array($resolved)) {
+            $this->_applyFieldOverrides($field, $resolved);
+        }
+
+        if ($field instanceof ParentFieldInterface) {
+            $this->_applyNestedLayoutFieldOverrides($field, $fieldOverrides);
+        }
+    }
+
+    private function _applyNestedLayoutFieldOverrides(ParentFieldInterface $field, array $fieldOverrides): void
+    {
+        foreach ($field->getFieldLayout()->getPages() as $page) {
+            foreach ($page->getRows() as $row) {
+                foreach ($row->getFields() as $nestedField) {
+                    if (!$nestedField instanceof FieldInterface) {
+                        continue;
+                    }
+
+                    $this->_applyFieldOverridesFromPayload($nestedField, $fieldOverrides);
+                }
+            }
+        }
+    }
+
+    private function _applyFieldInstanceOverridesFromPayload(FieldInterface $field, array $fieldInstanceOverrides): void
+    {
+        $storageKey = $this->_getFieldStorageKey([
+            'reference' => $field->reference,
+            'uid' => $field->uid,
+        ]);
+        $resolved = $storageKey !== null ? ($fieldInstanceOverrides[$storageKey] ?? null) : null;
+
+        if (is_array($resolved) && array_key_exists('required', $resolved)) {
+            $field->required = (bool)$resolved['required'];
+        }
+
+        if ($field instanceof ParentFieldInterface) {
+            foreach ($field->getFieldLayout()->getPages() as $page) {
+                foreach ($page->getRows() as $row) {
+                    foreach ($row->getFields() as $nestedField) {
+                        if ($nestedField instanceof FieldInterface) {
+                            $this->_applyFieldInstanceOverridesFromPayload($nestedField, $fieldInstanceOverrides);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private function _cloneLayout(FieldLayout $source): FieldLayout
+    {
+        $layout = clone $source;
+        $pages = [];
+
+        foreach ($source->getPages() as $sourcePage) {
+            $page = clone $sourcePage;
+            $page->setPageSettings($sourcePage->getPageSettings()?->toArray());
+            $rows = [];
+
+            foreach ($sourcePage->getRows() as $sourceRow) {
+                $row = clone $sourceRow;
+                $fields = [];
+
+                foreach ($sourceRow->getFields() as $sourceField) {
+                    $field = clone $sourceField;
+
+                    if ($field instanceof ParentFieldInterface) {
+                        $field->setFieldLayout($this->_cloneLayout($sourceField->getFieldLayout()));
+                    }
+
+                    $fields[] = $field;
+                }
+
+                $row->setFields($fields);
+                $rows[] = $row;
+            }
+
+            $page->setRows($rows);
+            $pages[] = $page;
+        }
+
+        $layout->setPages($pages);
+
+        return $layout;
+    }
+
+    private function _applyFieldOverrides(FieldInterface $field, array $fieldOverrides): void
+    {
+        $fieldOverrides = $this->filterFieldTranslationProperties($field::class, $fieldOverrides);
+
+        foreach ($fieldOverrides as $key => $value) {
+            if ($key === 'options' && is_array($value)) {
+                $settings = $field->getSettings();
+                $settings['options'] = $this->_mergeOptionsArray(
+                    is_array($settings['options'] ?? null) ? $settings['options'] : [],
+                    $value,
+                );
+                $field->setAttributes($settings, false);
+
+                continue;
+            }
+
+            if ($key === 'columns' && is_array($value)) {
+                $settings = $field->getSettings();
+                $settings['columns'] = $this->_mergeColumnsArray(
+                    is_array($settings['columns'] ?? null) ? $settings['columns'] : [],
+                    $value,
+                );
+                $field->setAttributes($settings, false);
+
+                continue;
+            }
+
+            if ($key === 'validationMessages' && is_array($value)) {
+                $field->setAttributes([
+                    'validationMessages' => array_replace(
+                        is_array($field->validationMessages ?? null) ? $field->validationMessages : [],
+                        $value,
+                    ),
+                ], false);
+
+                continue;
+            }
+
+            $richTextKeys = $field::translatableRichTextProperties();
+
+            if (in_array($key, $richTextKeys, true)) {
+                if (property_exists($field, $key)) {
+                    $current = $field->$key;
+
+                    if ($current instanceof RichText) {
+                        $field->$key = $this->_coerceRichTextValue($value);
+                    } else {
+                        $field->$key = is_string($value) ? $value : (string)($value ?? '');
+                    }
+                } else {
+                    $field->setAttributes([$key => $this->_coerceRichTextValue($value)], false);
+                }
+
+                continue;
+            }
+
+            if (property_exists($field, $key)) {
+                $field->$key = $value;
+            } else {
+                $field->setAttributes([$key => $value], false);
+            }
+        }
+    }
+
+    private function _applyNotificationOverrides(Form $form, array $notificationOverrides): void
+    {
+        $notifications = $form->getNotifications();
+
+        foreach ($notifications as $notification) {
+            if (!$notification instanceof Notification) {
+                continue;
+            }
+
+            $this->_applyNotificationOverride($notification, $notificationOverrides);
+        }
+    }
+
+    private function _applyNotificationOverride(Notification $notification, array $notificationOverrides): void
+    {
+        $override = $this->_resolveNotificationOverride(
+            $notificationOverrides,
+            ['handle' => $notification->handle, 'uid' => $notification->uid],
+        );
+
+        if (!is_array($override)) {
+            return;
+        }
+
+        if (array_key_exists('subject', $override)) {
+            $notification->subject = (string)$override['subject'];
+        }
+
+        if (array_key_exists('fromName', $override)) {
+            $notification->fromName = (string)$override['fromName'];
+        }
+
+        if (array_key_exists('replyToName', $override)) {
+            $notification->replyToName = (string)$override['replyToName'];
+        }
+
+        if (array_key_exists('content', $override)) {
+            // Notification content stores HTML or serialized nodes. Assigning a
+            // RichText object to its string property would flatten it to plain text.
+            $notification->content = (new Notification(['content' => $override['content']]))->content;
+        }
+    }
+
+    private function _mergePagesArray(array $pages, array $pageOverrides): array
+    {
+        return array_map(function(array $page) use ($pageOverrides) {
+            $override = $this->_resolvePageOverride($pageOverrides, $page);
+
+            if (is_array($override) && !empty($override['label'])) {
+                $page['label'] = $override['label'];
+            }
+
+            if (is_array($override) && !empty($override['settings']) && is_array($override['settings'])) {
+                $page['settings'] = $this->_mergePageSettingsArray(
+                    is_array($page['settings'] ?? null) ? $page['settings'] : [],
+                    $override['settings'],
+                );
+            }
+
+            return $page;
+        }, $pages);
+    }
+
+    private function _mergeFieldsIntoPages(array $pages, array $fieldOverrides): array
+    {
+        return array_map(function(array $page) use ($fieldOverrides) {
+            return $this->_mergePageFields($page, $fieldOverrides);
+        }, $pages);
+    }
+
+    private function _mergeFieldInstancesIntoPages(array $pages, array $fieldInstanceOverrides): array
+    {
+        return array_map(function(array $page) use ($fieldInstanceOverrides) {
+            if (!isset($page['rows']) || !is_array($page['rows'])) {
+                return $page;
+            }
+
+            $page['rows'] = $this->_mergeRowsWithFieldInstanceOverrides($page['rows'], $fieldInstanceOverrides);
+
+            return $page;
+        }, $pages);
+    }
+
+    private function _mergePageFields(array $page, array $fieldOverrides): array
+    {
+        if (!isset($page['rows']) || !is_array($page['rows'])) {
+            return $page;
+        }
+
+        $page['rows'] = array_map(function($row) use ($fieldOverrides) {
+            if (!is_array($row) || !isset($row['fields']) || !is_array($row['fields'])) {
+                return $row;
+            }
+
+            $row['fields'] = array_map(function($field) use ($fieldOverrides) {
+                if (!is_array($field)) {
+                    return $field;
+                }
+
+                return $this->_mergeFieldWithOverrides($field, $fieldOverrides);
+            }, $row['fields']);
+
+            return $row;
+        }, $page['rows']);
+
+        return $page;
+    }
+
+    private function _mergeFieldWithOverrides(array $field, array $fieldOverrides): array
+    {
+        $override = $this->_resolveFieldOverride($fieldOverrides, $field);
+
+        if (is_array($override)) {
+            $field = $this->_mergeFieldArray($field, $override);
+        }
+
+        if (isset($field['rows']) && is_array($field['rows'])) {
+            $field['rows'] = $this->_mergeRowsWithFieldOverrides($field['rows'], $fieldOverrides);
+        }
+
+        if (isset($field['settings']['rows']) && is_array($field['settings']['rows'])) {
+            $field['settings']['rows'] = $this->_mergeRowsWithFieldOverrides($field['settings']['rows'], $fieldOverrides);
+        }
+
+        return $field;
+    }
+
+    private function _mergeRowsWithFieldOverrides(array $rows, array $fieldOverrides): array
+    {
+        return array_map(function($row) use ($fieldOverrides) {
+            if (!is_array($row) || !isset($row['fields']) || !is_array($row['fields'])) {
+                return $row;
+            }
+
+            $row['fields'] = array_map(function($field) use ($fieldOverrides) {
+                if (!is_array($field)) {
+                    return $field;
+                }
+
+                return $this->_mergeFieldWithOverrides($field, $fieldOverrides);
+            }, $row['fields']);
+
+            return $row;
+        }, $rows);
+    }
+
+    private function _mergeRowsWithFieldInstanceOverrides(array $rows, array $fieldInstanceOverrides): array
+    {
+        return array_map(function($row) use ($fieldInstanceOverrides) {
+            if (!is_array($row) || !isset($row['fields']) || !is_array($row['fields'])) {
+                return $row;
+            }
+
+            $row['fields'] = array_map(function($field) use ($fieldInstanceOverrides) {
+                if (!is_array($field)) {
+                    return $field;
+                }
+
+                return $this->_mergeFieldInstanceWithOverrides($field, $fieldInstanceOverrides);
+            }, $row['fields']);
+
+            return $row;
+        }, $rows);
+    }
+
+    private function _mergeFieldInstanceWithOverrides(array $field, array $fieldInstanceOverrides): array
+    {
+        $storageKey = $this->_getFieldStorageKey($field);
+        $override = $storageKey !== null ? ($fieldInstanceOverrides[$storageKey] ?? null) : null;
+
+        if (is_array($override) && array_key_exists('required', $override)) {
+            $field['required'] = (bool)$override['required'];
+        }
+
+        if (isset($field['rows']) && is_array($field['rows'])) {
+            $field['rows'] = $this->_mergeRowsWithFieldInstanceOverrides($field['rows'], $fieldInstanceOverrides);
+        }
+
+        if (isset($field['settings']['rows']) && is_array($field['settings']['rows'])) {
+            $field['settings']['rows'] = $this->_mergeRowsWithFieldInstanceOverrides($field['settings']['rows'], $fieldInstanceOverrides);
+        }
+
+        return $field;
+    }
+
+    private function _mergeFieldArray(array $field, array $override): array
+    {
+        $override = $this->filterFieldTranslationProperties((string)($field['type'] ?? ''), $override);
+
+        foreach ($override as $key => $value) {
+            if ($key === 'options' && is_array($value)) {
+                $field['options'] = $this->_mergeOptionsArray(
+                    is_array($field['options'] ?? null) ? $field['options'] : [],
+                    $value,
+                );
+
+                continue;
+            }
+
+            if ($key === 'columns' && is_array($value)) {
+                $field['columns'] = $this->_mergeColumnsArray(
+                    is_array($field['columns'] ?? null) ? $field['columns'] : [],
+                    $value,
+                );
+
+                continue;
+            }
+
+            $field[$key] = $value;
+        }
+
+        return $field;
+    }
+
+    private function _mergeNotificationsArray(array $notifications, array $notificationOverrides): array
+    {
+        return array_map(function($notification) use ($notificationOverrides) {
+            if (!is_array($notification)) {
+                return $notification;
+            }
+
+            $key = $this->_getNotificationStorageKey($notification);
+            $override = $key !== null
+                ? $this->_resolveNotificationOverride($notificationOverrides, $notification)
+                : null;
+
+            if (!is_array($override)) {
+                return $notification;
+            }
+
+            if (array_key_exists('subject', $override)) {
+                $notification['subject'] = $override['subject'];
+            }
+
+            if (array_key_exists('fromName', $override)) {
+                $notification['fromName'] = $override['fromName'];
+            }
+
+            if (array_key_exists('replyToName', $override)) {
+                $notification['replyToName'] = $override['replyToName'];
+            }
+
+            if (array_key_exists('content', $override)) {
+                $notification['content'] = $override['content'];
+            }
+
+            return $notification;
+        }, $notifications);
+    }
+
+    private function _mergeSettingsArray(array $settings, array $settingsOverrides): array
+    {
+        foreach (FormSettings::translatableProperties() as $key) {
+            if (array_key_exists($key, $settingsOverrides)) {
+                $settings[$key] = $settingsOverrides[$key];
+            }
+        }
+
+        return $settings;
+    }
+
+    private function _mergePageSettingsArray(array $settings, array $settingsOverrides): array
+    {
+        foreach (FieldLayoutPageSettings::translatableProperties() as $key) {
+            if (array_key_exists($key, $settingsOverrides)) {
+                $settings[$key] = $settingsOverrides[$key];
+            }
+        }
+
+        return $settings;
+    }
+
+    private function _mergeColumnsArray(array $columns, array $columnOverrides): array
+    {
+        $overridesByHandle = [];
+
+        foreach ($columnOverrides as $override) {
+            if (!is_array($override)) {
+                continue;
+            }
+
+            $handle = trim((string)($override['handle'] ?? ''));
+
+            if ($handle !== '') {
+                $overridesByHandle[$handle] = $override;
+            }
+        }
+
+        return array_map(function($column) use ($overridesByHandle) {
+            if (!is_array($column)) {
+                return $column;
+            }
+
+            $handle = trim((string)($column['handle'] ?? ''));
+            $override = $handle !== '' ? ($overridesByHandle[$handle] ?? null) : null;
+
+            if (is_array($override) && array_key_exists('heading', $override)) {
+                $column['heading'] = $override['heading'];
+            }
+
+            return $column;
+        }, $columns);
+    }
+
+    private function _mergeOptionsArray(array $options, array $optionOverrides): array
+    {
+        $overridesByCanonicalValue = [];
+
+        foreach ($optionOverrides as $option) {
+            if (!is_array($option)) {
+                continue;
+            }
+
+            $value = (string)($option['value'] ?? '');
+
+            if ($value !== '') {
+                $overridesByCanonicalValue[$value] = $option;
+            }
+        }
+
+        $legacyOverrides = array_values(array_filter(
+            $optionOverrides,
+            function($option) use ($options) {
+                if (!is_array($option) || array_key_exists('optgroup', $option)) {
+                    return false;
+                }
+
+                $value = (string)($option['value'] ?? '');
+
+                foreach ($options as $canonicalOption) {
+                    if (!is_array($canonicalOption) || array_key_exists('optgroup', $canonicalOption)) {
+                        continue;
+                    }
+
+                    if ((string)($canonicalOption['value'] ?? '') === $value) {
+                        return false;
+                    }
+                }
+
+                return true;
+            },
+        ));
+
+        return array_map(function($option) use ($legacyOverrides, $overridesByCanonicalValue) {
+            if (!is_array($option) || array_key_exists('optgroup', $option)) {
+                return $option;
+            }
+
+            $canonicalValue = (string)($option['value'] ?? '');
+            $override = $overridesByCanonicalValue[$canonicalValue] ?? null;
+
+            if (!is_array($override)) {
+                $override = $this->_resolveLegacyOptionOverride($option, $legacyOverrides);
+            }
+
+            if (!is_array($override)) {
+                return $option;
+            }
+
+            if (array_key_exists('label', $override)) {
+                $option['label'] = $override['label'];
+            }
+
+            if (array_key_exists('optionValue', $override)) {
+                $option['value'] = $override['optionValue'];
+            } elseif (
+                array_key_exists('value', $override)
+                && (string)$override['value'] !== $canonicalValue
+            ) {
+                $option['value'] = $override['value'];
+            }
+
+            return $option;
+        }, $options);
+    }
+
+    private function _resolveLegacyOptionOverride(array $option, array $legacyOverrides): ?array
+    {
+        $canonicalLabel = (string)($option['label'] ?? '');
+
+        foreach ($legacyOverrides as $override) {
+            if (!is_array($override) || array_key_exists('optgroup', $override)) {
+                continue;
+            }
+
+            $overrideLabel = (string)($override['label'] ?? '');
+
+            if ($canonicalLabel === '') {
+                continue;
+            }
+
+            if (
+                $overrideLabel === $canonicalLabel
+                || str_starts_with($overrideLabel, $canonicalLabel . ' ')
+                || str_starts_with($overrideLabel, $canonicalLabel . '(')
+            ) {
+                return $override;
+            }
+        }
+
+        return null;
+    }
+
+    private function _normalizeSettingsOverrides(array $settings): array
+    {
+        $normalized = [];
+
+        foreach (FormSettings::translatableProperties() as $key) {
+            if (array_key_exists($key, $settings) && $settings[$key] !== null && $settings[$key] !== '') {
+                $normalized[$key] = $settings[$key];
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function _normalizePageSettingsOverrides(array $settings): array
+    {
+        $normalized = [];
+
+        foreach (FieldLayoutPageSettings::translatableProperties() as $key) {
+            if (!empty($settings[$key])) {
+                $normalized[$key] = (string)$settings[$key];
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function _normalizePagesOverrides(array $pages): array
+    {
+        $normalized = [];
+
+        foreach ($pages as $pageUid => $pageOverride) {
+            if (!is_array($pageOverride)) {
+                continue;
+            }
+
+            $entry = [];
+
+            if (!empty($pageOverride['label'])) {
+                $entry['label'] = (string)$pageOverride['label'];
+            }
+
+            if (!empty($pageOverride['settings']) && is_array($pageOverride['settings'])) {
+                $settings = $this->_normalizePageSettingsOverrides($pageOverride['settings']);
+
+                if ($settings !== []) {
+                    $entry['settings'] = $settings;
+                }
+            }
+
+            if ($entry !== []) {
+                $normalized[(string)$pageUid] = $entry;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function _normalizeFieldsOverrides(array $fields): array
+    {
+        $normalized = [];
+
+        foreach ($fields as $fieldUid => $fieldOverride) {
+            if (!is_array($fieldOverride)) {
+                continue;
+            }
+
+            $entry = [];
+
+            foreach ($fieldOverride as $key => $value) {
+                if ($key === 'options' && is_array($value) && $value !== []) {
+                    $entry['options'] = $value;
+                    continue;
+                }
+
+                if ($key === 'columns' && is_array($value) && $value !== []) {
+                    $entry['columns'] = $value;
+                    continue;
+                }
+
+                if ($value !== null && $value !== '') {
+                    if (in_array($key, ['instructions', 'validationMessages'], true) && $value === []) {
+                        continue;
+                    }
+
+                    $entry[$key] = $value;
+                }
+            }
+
+            if ($entry !== []) {
+                $normalized[(string)$fieldUid] = $entry;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function _normalizeFieldInstanceOverrides(array $fields): array
+    {
+        $normalized = [];
+
+        foreach ($fields as $fieldReference => $fieldOverride) {
+            $fieldReference = trim((string)$fieldReference);
+
+            if ($fieldReference === '' || !is_array($fieldOverride)) {
+                continue;
+            }
+
+            $entry = [];
+
+            foreach (self::FIELD_INSTANCE_OVERRIDE_KEYS as $key) {
+                if ($key === 'required' && array_key_exists($key, $fieldOverride)) {
+                    $entry[$key] = (bool)$fieldOverride[$key];
+                }
+            }
+
+            if ($entry !== []) {
+                $normalized[$fieldReference] = $entry;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function _normalizeNotificationsOverrides(array $notifications): array
+    {
+        $normalized = [];
+
+        foreach ($notifications as $uid => $notificationOverride) {
+            if (!is_array($notificationOverride)) {
+                continue;
+            }
+
+            $entry = [];
+
+            if (!empty($notificationOverride['subject'])) {
+                $entry['subject'] = (string)$notificationOverride['subject'];
+            }
+
+            if (!empty($notificationOverride['fromName'])) {
+                $entry['fromName'] = (string)$notificationOverride['fromName'];
+            }
+
+            if (!empty($notificationOverride['replyToName'])) {
+                $entry['replyToName'] = (string)$notificationOverride['replyToName'];
+            }
+
+            if (!empty($notificationOverride['content'])) {
+                $entry['content'] = $notificationOverride['content'];
+            }
+
+            if ($entry !== []) {
+                $normalized[(string)$uid] = $entry;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function _getFieldStorageKey(array $field): ?string
+    {
+        $reference = trim((string)($field['reference'] ?? ''));
+
+        if ($reference !== '') {
+            return $reference;
+        }
+
+        $uid = trim((string)($field['uid'] ?? ''));
+
+        return $uid !== '' ? $uid : null;
+    }
+
+    private function _getPageStorageKey(array $page): ?string
+    {
+        $uid = trim((string)($page['uid'] ?? ''));
+
+        if ($uid !== '') {
+            return $uid;
+        }
+
+        if (isset($page['id']) && $page['id'] !== null && $page['id'] !== '') {
+            return (string)$page['id'];
+        }
+
+        return null;
+    }
+
+    private function _getNotificationStorageKey(array $notification): ?string
+    {
+        $handle = trim((string)($notification['handle'] ?? ''));
+
+        if ($handle !== '') {
+            return $handle;
+        }
+
+        $uid = trim((string)($notification['uid'] ?? ''));
+
+        return $uid !== '' ? $uid : null;
+    }
+
+    private function _resolveFieldOverride(array $fieldOverrides, array $field): ?array
+    {
+        $fieldId = (int)($field['definitionId'] ?? $field['fieldId'] ?? $field['settings']['definitionId'] ?? $field['settings']['fieldId'] ?? $field['syncId'] ?? $field['settings']['syncId'] ?? 0);
+
+        if ($fieldId) {
+            if (isset($fieldOverrides[$fieldId]) && is_array($fieldOverrides[$fieldId])) {
+                return $fieldOverrides[$fieldId];
+            }
+
+            $fieldIdKey = (string)$fieldId;
+
+            if (isset($fieldOverrides[$fieldIdKey]) && is_array($fieldOverrides[$fieldIdKey])) {
+                return $fieldOverrides[$fieldIdKey];
+            }
+        }
+
+        $storageKey = $this->_getFieldStorageKey($field);
+
+        if ($storageKey !== null && isset($fieldOverrides[$storageKey]) && is_array($fieldOverrides[$storageKey])) {
+            return $fieldOverrides[$storageKey];
+        }
+
+        return null;
+    }
+
+    private function _resolvePageOverride(array $pageOverrides, array $page): ?array
+    {
+        $storageKey = $this->_getPageStorageKey($page);
+
+        if ($storageKey !== null && isset($pageOverrides[$storageKey]) && is_array($pageOverrides[$storageKey])) {
+            return $pageOverrides[$storageKey];
+        }
+
+        if (isset($page['id']) && $page['id'] !== null && $page['id'] !== '') {
+            $id = (string)$page['id'];
+
+            if (isset($pageOverrides[$id]) && is_array($pageOverrides[$id])) {
+                return $pageOverrides[$id];
+            }
+        }
+
+        $handle = trim((string)($page['_handle'] ?? $page['handle'] ?? ''));
+
+        if ($handle !== '' && isset($pageOverrides[$handle]) && is_array($pageOverrides[$handle])) {
+            return $pageOverrides[$handle];
+        }
+
+        return null;
+    }
+
+    private function _resolveNotificationOverride(array $notificationOverrides, array $notification): ?array
+    {
+        $storageKey = $this->_getNotificationStorageKey($notification);
+
+        if ($storageKey !== null && isset($notificationOverrides[$storageKey]) && is_array($notificationOverrides[$storageKey])) {
+            return $notificationOverrides[$storageKey];
+        }
+
+        $uid = trim((string)($notification['uid'] ?? ''));
+
+        if ($uid !== '' && isset($notificationOverrides[$uid]) && is_array($notificationOverrides[$uid])) {
+            return $notificationOverrides[$uid];
+        }
+
+        return null;
+    }
+
+    private function _buildOverrideKeyMaps(int $formId): array
+    {
+        $form = Form::find()->id($formId)->status(null)->one();
+
+        if (!$form) {
+            return [
+                'fields' => [],
+                'pages' => [],
+                'notifications' => [],
+            ];
+        }
+
+        $fieldUidToReference = [];
+
+        foreach ($form->getFields() as $field) {
+            if (!$field instanceof FieldInterface) {
+                continue;
+            }
+
+            $this->_collectFieldReferenceMappings($field, $fieldUidToReference);
+        }
+
+        $pageKeyMap = [];
+
+        foreach ($form->getPages() as $page) {
+            $uid = trim((string)$page->uid);
+            $id = trim((string)$page->id);
+            $handle = trim((string)($page->getHandle() ?? ''));
+
+            if ($uid === '') {
+                continue;
+            }
+
+            if ($id !== '') {
+                $pageKeyMap[$id] = $uid;
+            }
+
+            if ($handle !== '') {
+                $pageKeyMap[$handle] = $uid;
+            }
+        }
+
+        $notificationUidToHandle = [];
+
+        foreach ($form->getNotifications() as $notification) {
+            if (!$notification instanceof Notification) {
+                continue;
+            }
+
+            $handle = trim((string)($notification->handle ?? ''));
+            $uid = trim((string)$notification->uid);
+
+            if ($uid !== '' && $handle !== '') {
+                $notificationUidToHandle[$uid] = $handle;
+            }
+        }
+
+        return [
+            'fields' => $fieldUidToReference,
+            'pages' => $pageKeyMap,
+            'notifications' => $notificationUidToHandle,
+        ];
+    }
+
+    private function _collectFieldReferenceMappings(FieldInterface $field, array &$fieldUidToReference): void
+    {
+        $reference = trim((string)$field->reference);
+        $uid = trim((string)$field->uid);
+
+        if ($uid !== '' && $reference !== '') {
+            $fieldUidToReference[$uid] = $reference;
+        }
+
+        if ($field instanceof ParentFieldInterface) {
+            foreach ($field->getFieldLayout()->getPages() as $page) {
+                foreach ($page->getRows() as $row) {
+                    foreach ($row->getFields() as $nestedField) {
+                        if ($nestedField instanceof FieldInterface) {
+                            $this->_collectFieldReferenceMappings($nestedField, $fieldUidToReference);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private function _mergeOverridePayloads(array $existing, array $incoming): array
+    {
+        if ($existing === []) {
+            return $incoming;
+        }
+
+        if ($incoming === []) {
+            return $existing;
+        }
+
+        $merged = $existing;
+
+        if (array_key_exists('title', $incoming)) {
+            $merged['title'] = $incoming['title'];
+        }
+
+        foreach (['settings', 'pages', 'fields', 'fieldInstanceOverrides', 'notifications'] as $section) {
+            if (!isset($incoming[$section]) || !is_array($incoming[$section])) {
+                continue;
+            }
+
+            $merged[$section] = $merged[$section] ?? [];
+
+            foreach ($incoming[$section] as $key => $value) {
+                if (
+                    isset($merged[$section][$key])
+                    && is_array($merged[$section][$key])
+                    && is_array($value)
+                ) {
+                    $merged[$section][$key] = array_replace($merged[$section][$key], $value);
+                } else {
+                    $merged[$section][$key] = $value;
+                }
+            }
+        }
+
+        return $this->normalizeOverrides($merged);
+    }
+
+    private function _remapLegacyOverrideKeys(int $formId, array $overrides): array
+    {
+        if ($formId <= 0) {
+            return $overrides;
+        }
+
+        $maps = $this->_buildOverrideKeyMaps($formId);
+
+        $sectionMaps = [
+            'fields' => $maps['fields'],
+            'fieldInstanceOverrides' => $maps['fields'],
+            'pages' => $maps['pages'],
+            'notifications' => $maps['notifications'],
+        ];
+
+        foreach ($sectionMaps as $section => $map) {
+            if (empty($overrides[$section]) || !is_array($overrides[$section])) {
+                continue;
+            }
+
+            $remapped = [];
+
+            foreach ($overrides[$section] as $key => $value) {
+                $stableKey = $map[(string)$key] ?? (string)$key;
+
+                if (isset($remapped[$stableKey]) && is_array($remapped[$stableKey]) && is_array($value)) {
+                    $remapped[$stableKey] = array_replace($remapped[$stableKey], $value);
+                } else {
+                    $remapped[$stableKey] = $value;
+                }
+            }
+
+            $overrides[$section] = $remapped;
+        }
+
+        return $this->normalizeOverrides($overrides);
+    }
+
+    private function _resolveCanonicalFormTitle(Form $form): string
+    {
+        if (!$form->id) {
+            return (string)$form->title;
+        }
+
+        $sourceSiteId = $this->getSourceSiteId($form);
+        $title = (new Query())
+            ->select(['title'])
+            ->from([CraftTable::ELEMENTS_SITES])
+            ->where(['elementId' => (int)$form->id, 'siteId' => $sourceSiteId])
+            ->scalar();
+
+        if (is_string($title) && $title !== '') {
+            return $title;
+        }
+
+        return (string)$form->title;
+    }
+
+    private function _cloneBuilderData(array $data): array
+    {
+        $cloned = Json::decode(Json::encode($data), true);
+
+        return is_array($cloned) ? $cloned : $data;
+    }
+
+    private function _coerceRichTextValue(mixed $value): RichText
+    {
+        if ($value instanceof RichText) {
+            return $value;
+        }
+
+        if (is_array($value)) {
+            return RichText::from($value);
+        }
+
+        return RichText::from((string)$value);
+    }
+
+    private function _fieldTypeTranslatableMap(): array
+    {
+        $map = [];
+
+        foreach (Formie::$plugin->getFields()->getResolvedRegisteredFieldTypes() as $fieldType) {
+            if (!is_subclass_of($fieldType, FieldInterface::class)) {
+                continue;
+            }
+
+            $map[$fieldType] = $fieldType::translatableProperties();
+        }
+
+        return $map;
+    }
+
+    private function _buildScalarOverrideKeys(array $fieldTypes): array
+    {
+        $nested = ['options', 'columns', 'validationMessages'];
+        $keys = array_merge(
+            Form::translatableRootProperties(),
+            FormSettings::translatableProperties(),
+            FieldLayoutPage::translatableProperties(),
+            FieldLayoutPageSettings::translatableProperties(),
+            Notification::translatableProperties(),
+        );
+
+        foreach ($fieldTypes as $properties) {
+            foreach ($properties as $property) {
+                if (!in_array($property, $nested, true)) {
+                    $keys[] = $property;
+                }
+            }
+        }
+
+        return array_values(array_unique($keys));
+    }
+}

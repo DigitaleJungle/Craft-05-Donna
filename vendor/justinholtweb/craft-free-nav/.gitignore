@@ -1,0 +1,10 @@
+CLAUDE.md
+.claude/
+vendor/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+.ddev/
+composer.lock
+.phpunit.cache/

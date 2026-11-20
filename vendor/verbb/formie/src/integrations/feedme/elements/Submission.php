@@ -1,0 +1,90 @@
+<?php
+namespace verbb\formie\integrations\feedme\elements;
+
+use verbb\formie\Formie;
+use verbb\formie\elements\Submission as SubmissionElement;
+
+use Craft;
+use craft\base\Element as CraftBaseElement;
+
+use Cake\Utility\Hash;
+use craft\feedme\base\Element;
+
+class Submission extends Element
+{
+    // Properties
+    // =========================================================================
+
+    public static string $class = SubmissionElement::class;
+    public static string $name = 'Submission';
+    public $element = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    // Templates
+    // =========================================================================
+
+    public function getGroupsTemplate(): string
+    {
+        return 'formie/integrations/feedme/elements/groups';
+    }
+
+    public function getColumnTemplate(): string
+    {
+        return 'formie/integrations/feedme/elements/column';
+    }
+
+    public function getMappingTemplate(): string
+    {
+        return 'formie/integrations/feedme/elements/map';
+    }
+
+    public function getGroups(): array
+    {
+        if (Formie::$plugin) {
+            $forms = Formie::$plugin->getForms()->getAllForms();
+
+            usort($forms, function($a, $b) {
+                return strcmp($a->title, $b->title);
+            });
+
+            return $forms;
+        }
+
+        return [];
+    }
+
+    public function getQuery($settings, array $params = []): mixed
+    {
+        $query = SubmissionElement::find()
+            ->status(null)
+            ->formId($settings['elementGroup'][SubmissionElement::class])
+            ->siteId(Hash::get($settings, 'siteId') ?: Craft::$app->getSites()->getPrimarySite()->id);
+
+        Craft::configure($query, $params);
+
+        return $query;
+    }
+
+    public function setModel($settings): CraftBaseElement
+    {
+        $this->element = new SubmissionElement();
+        $this->element->formId = $settings['elementGroup'][SubmissionElement::class];
+        $this->element->siteId = Hash::get($settings, 'siteId') ?: Craft::$app->getSites()->getPrimarySite()->id;
+
+        return $this->element;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function parseStatusId($feedData, $fieldInfo): ?int
+    {
+        $value = $this->fetchSimpleValue($feedData, $fieldInfo);
+
+        return Formie::$plugin->getSubmissionStatuses()->getStatusByHandle($value)->id;
+    }
+}

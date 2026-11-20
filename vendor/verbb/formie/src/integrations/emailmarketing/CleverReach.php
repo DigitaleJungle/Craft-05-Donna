@@ -1,0 +1,147 @@
+<?php
+namespace verbb\formie\integrations\emailmarketing;
+
+use verbb\formie\base\EmailMarketing;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\models\IntegrationCollection;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+
+use Throwable;
+
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\providers\CleverReach as CleverReachProvider;
+
+class CleverReach extends EmailMarketing implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return CleverReachProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'CleverReach';
+    }
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Sign up users to your {name} lists to grow your audience for campaigns.', ['name' => static::displayName()]);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            $groups = $this->request('GET', 'groups');
+            $fields = $this->request('GET', 'attributes');
+
+            foreach ($groups as $group) {
+                $groupId = $group['id'];
+
+                $listFields = array_merge([
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                    ]),
+                ], $this->_getCustomFields($fields));
+
+                $settings['lists'][] = new IntegrationCollection([
+                    'id' => (string)$groupId,
+                    'name' => $group['name'],
+                    'fields' => $listFields,
+                ]);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $fieldValues = $this->getFieldMappingValues($submission, $this->fieldMapping);
+            $email = ArrayHelper::remove($fieldValues, 'email');
+
+            $payload = [
+                [
+                    'email' => $email,
+                    'registered' => time(),
+                    'activated' => time(),
+                    'attributes' => $fieldValues,
+                    'global_attributes' => $fieldValues,
+                    'source' => 'Formie',
+                ],
+            ];
+
+            $response = $this->deliverPayload($submission, "groups/{$this->listId}/receivers/upsert", $payload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'date' => IntegrationField::TYPE_DATETIME,
+            'number' => IntegrationField::TYPE_NUMBER,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields = []): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $field) {
+            $customFields[] = new IntegrationField([
+                'handle' => (string)$field['name'],
+                'name' => $field['description'],
+                'type' => $this->_convertFieldType($field['type']),
+                'sourceType' => $field['type'],
+            ]);
+        }
+
+        return $customFields;
+    }
+}

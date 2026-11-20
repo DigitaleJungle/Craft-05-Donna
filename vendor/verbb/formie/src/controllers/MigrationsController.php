@@ -1,0 +1,163 @@
+<?php
+namespace verbb\formie\controllers;
+
+use verbb\formie\migrations\plugins\Line;
+use verbb\formie\migrations\plugins\MigrateFreeform4;
+use verbb\formie\migrations\plugins\MigrateFreeform5;
+use verbb\formie\migrations\plugins\MigrateSproutForms;
+use verbb\formie\migrations\plugins\MigrationResult;
+
+use Craft;
+use craft\helpers\App;
+
+use Throwable;
+
+use barrelstrength\sproutforms\elements\Form as SproutFormsForm;
+use Solspace\Freeform\Freeform;
+
+class MigrationsController extends SettingsAccessController
+{
+    // Public Methods
+    // =========================================================================
+
+    public function actionSproutForms(): void
+    {
+        $this->requirePostRequest();
+
+        App::maxPowerCaptain();
+
+        // Backup!
+        try {
+            Craft::$app->getDb()->backup();
+        } catch (Throwable $e) {
+        }
+
+        $formIds = $this->request->getParam('formIds');
+        $forms = SproutFormsForm::find()->id($formIds)->all();
+
+        $outputs = [];
+
+        if (!$forms) {
+            $this->setFailFlash(Craft::t('formie', 'No forms selected.'));
+
+            return;
+        }
+
+        foreach ($forms as $form) {
+            $migration = new MigrateSproutForms(['formId' => $form->id]);
+
+            try {
+                $result = $migration->run();
+                $outputs[$form->id] = MigrationResult::renderLinesHtml($result->lines);
+            } catch (Throwable $e) {
+                $outputs[$form->id] = MigrationResult::renderLinesHtml([
+                    Line::error('Failed to migrate: ' . $e->getMessage()),
+                ]);
+            }
+        }
+
+        Craft::$app->getUrlManager()->setRouteParams([
+            'outputs' => $outputs,
+        ]);
+
+        $this->setSuccessFlash(Craft::t('formie', 'Forms migrated.'));
+    }
+
+    public function actionFreeform4(): void
+    {
+        $this->requirePostRequest();
+
+        App::maxPowerCaptain();
+
+        // Backup!
+        try {
+            Craft::$app->getDb()->backup();
+        } catch (Throwable $e) {
+        }
+
+        $formIds = $this->request->getParam('formIds');
+
+        // Handle picking "all"
+        if ($formIds === '*') {
+            $formIds = Freeform::getInstance()->forms->getAllFormIds();
+        }
+
+        $forms = array_map([Freeform::getInstance()->forms, 'getFormById'], $formIds);
+
+        $outputs = [];
+
+        if (!$forms) {
+            $this->setFailFlash(Craft::t('formie', 'No forms selected.'));
+
+            return;
+        }
+
+        foreach ($forms as $form) {
+            $migration = new MigrateFreeform4(['formId' => $form->id]);
+
+            try {
+                $result = $migration->run();
+                $outputs[$form->id] = MigrationResult::renderLinesHtml($result->lines);
+            } catch (Throwable $e) {
+                $outputs[$form->id] = MigrationResult::renderLinesHtml([
+                    Line::error('Failed to migrate: ' . $e->getMessage()),
+                ]);
+            }
+        }
+
+        Craft::$app->getUrlManager()->setRouteParams([
+            'outputs' => $outputs,
+        ]);
+
+        $this->setSuccessFlash(Craft::t('formie', 'Forms migrated.'));
+    }
+
+    public function actionFreeform5(): void
+    {
+        $this->requirePostRequest();
+
+        App::maxPowerCaptain();
+
+        // Backup!
+        try {
+            Craft::$app->getDb()->backup();
+        } catch (Throwable $e) {
+        }
+
+        $formIds = $this->request->getParam('formIds');
+
+        // Handle picking "all"
+        if ($formIds === '*') {
+            $formIds = Freeform::getInstance()->forms->getAllFormIds();
+        }
+
+        $forms = array_map([Freeform::getInstance()->forms, 'getFormById'], $formIds);
+
+        $outputs = [];
+
+        if (!$forms) {
+            $this->setFailFlash(Craft::t('formie', 'No forms selected.'));
+
+            return;
+        }
+
+        foreach ($forms as $form) {
+            $migration = new MigrateFreeform5(['formId' => $form->getId()]);
+
+            try {
+                $result = $migration->run();
+                $outputs[$form->getId()] = MigrationResult::renderLinesHtml($result->lines);
+            } catch (Throwable $e) {
+                $outputs[$form->getId()] = MigrationResult::renderLinesHtml([
+                    Line::error('Failed to migrate: ' . $e->getMessage()),
+                ]);
+            }
+        }
+
+        Craft::$app->getUrlManager()->setRouteParams([
+            'outputs' => $outputs,
+        ]);
+
+        $this->setSuccessFlash(Craft::t('formie', 'Forms migrated.'));
+    }
+}

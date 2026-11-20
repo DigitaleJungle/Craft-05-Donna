@@ -1,0 +1,145 @@
+# Changelog
+
+## 5.2.1 - Unreleased
+### Security
+
+- **Custom attributes could carry script onto the front end.** A node's custom attributes were written onto its link unchecked, so anyone who could edit a menu, or a menu file imported from elsewhere, could add an event handler such as `onmouseover`, a `href` or `style` override, a front-end framework directive that runs code (`x-init`, `hx-get`, `v-html`, `ng-click`…), or an array value that expanded into further attributes. Custom attribute names are now an allowlist — `data-*` (except attributes that front-end frameworks run as code, such as htmx's `data-hx-*` and Datastar's `data-on-*`, `data-text` and `data-show`), `aria-*`, and plain attributes like `title`, `rel`, `id`, `lang`, `role` and `itemprop` — and values must be text. Anything else is refused when a node is saved, dropped from imports (control panel, console and Verbb Navigation), and skipped when a menu renders, which also covers menus saved before this release. Values are escaped as always; on a site whose front end runs a framework that executes other `data-*` attributes, treat menu editors as trusted.
+- **Editors could link to elements they can't see.** Adding a node accepted any element id, so a menu editor could link an entry, asset or product from a section they have no access to and copy its title into the menu, and the node builder's element picker showed the title of any id it was given. Both now require the editor to be able to view the element.
+- **A URL suffix could turn a custom link into a `javascript:` link.** The custom URL was checked on its own, but the link is the URL plus its suffix, so a relative URL such as `java` with a suffix of `script:…` passed. The full link is now checked after the suffix is added, which also covers menus saved before this release, and a suffix must start with `#`, `?`, `&` or `/`.
+
+## 5.2.0 - 2026-10-09
+### Added
+
+- **Menu import and export from the console.** `php craft free-nav/menus/export <handle> --file=…` writes the same JSON the control panel's "Export JSON" downloads (to stdout without `--file`), and `php craft free-nav/menus/import --file=…` reads it back — creating the menu, or with `--replace` swapping an existing menu's nodes for the file's. Seed menus in deploy scripts and move them between environments without the control panel. Replacing nodes is content, so it works where `allowAdminChanges` is off; creating a menu still needs it.
+- Exports now include each node's visibility rules and data.
+
+### Changed
+
+- Imports are all-or-nothing. Every node is checked before anything is written — custom URLs through the node editor's own rule, plus the menu's node and level limits — and a file that fails changes nothing. The control panel import used to skip nodes that wouldn't save and carry on.
+- The control panel import reports links to entries, categories, assets or products that don't exist in this environment instead of silently dropping them.
+
+### Fixed
+
+- **Exports of nested menus put every child under every parent.** A menu with two parents that each had children exported all the second-level nodes under each top-level node, so an import duplicated them. Each node now exports under its own parent.
+- An import only looks up a linked element of the class its node type links to; the class named in the file is no longer used to query.
+
+## 5.1.5 - 2026-10-01
+
+### Security
+
+- **Every control panel action now checks permissions.** None did before, so any signed-in user — a front-end member included — could delete menus, edit or delete nodes, import menus or change the plugin settings by posting to the action URLs. Each action now needs a CP request, *Access FreeNav*, and the permission the README documents for it; changes to menu definitions also need `allowAdminChanges`, and plugin settings are admin-only.
+- **A custom URL can no longer run script or reveal a secret.** `javascript:` and other non-link schemes are refused when a node is saved and render as no link if already stored, and an environment variable or alias has to resolve to an `http(s)` address — `$CRAFT_SECURITY_KEY` used to be resolved and printed into every page's menu and the REST API.
+- **The REST API applies node visibility rules**, so a members-only link isn't returned to an anonymous caller.
+
+### Fixed
+
+- **Cached menus were served to everyone as the first visitor saw them.** The cache key was the render options alone, so with caching on (the default) a menu rendered for a logged-in user — members-only links included — went to anonymous visitors, and the active item was whichever page warmed the cache. Menus are now cached per page and per visitor type, and pages with a query string are rendered fresh.
+- **Per-menu permissions can be granted on their own.** They were nested under the all-menus permissions, and Craft discards a nested permission whose parent isn't granted — so "edit nodes in one menu" was impossible without "edit nodes everywhere". Names are unchanged; re-save a user's or group's permissions to pick up any that were dropped.
+- The REST API listed every node at the top level and again under its parent; it now returns the tree once.
+- The builder hides the add, edit, delete and export controls a user can't use, and someone who can only edit nodes goes straight to the builder from the menu listing.
+
+## 5.1.4 - 2026-08-26
+
+### Fixed
+
+- **A caller-supplied `id` option produced a corrupted DOM id.** Twig's `??` binds tighter than `~`, so `options.id ?? 'freenav-' ~ menu.handle` parsed as `(options.id ?? 'freenav-') ~ menu.handle` — passing `{ id: 'main-nav' }` rendered `main-navprimary`. Fixed in all five navigation presets.
+
+## 5.1.3 - 2026-08-18
+
+### Fixed
+- Fixed the menu listing reporting "0 nodes" for menus that have nodes. The count ran `craft.freenav.nodes(handle).count()` with the element query's defaults, which meant enabled nodes on the request's current site — so a menu whose nodes live on another site counted nothing, and disabled nodes never counted anywhere. It now counts what the builder lists: every node in the menu, disabled ones included, on the site the "Nodes" link goes to.
+- The listing's "Nodes" and "Build" links now carry the site the count was taken on, so the page they open matches the number next to them.
+- Fixed the GitHub URLs in `composer.json` and the README, which pointed at `craft-free-nav` and 404'd. The support links render in the Craft Plugin Store listing.
+
+### Added
+- `Nodes::getNodeCount()` — a menu's node count for one site, disabled nodes included.
+
+## 5.1.2 - 2026-08-13
+
+### Fixed
+- Fixed the add/edit node panel closing when you dismissed a Craft element selector opened from inside it. The panel hand-rolled its own stacking and dismissal: its overlay sat above Craft's modal shade and swallowed the click, and its Escape handler was bound to the document, so both fired for interactions that belonged to the modal.
+- Fixed Craft's element selector rendering *behind* the panel, which covered the modal's Select button. Panels now sit on Craft's z-index for modals and slideouts and order themselves by position in `<body>`, so a modal opened from a panel stacks above it.
+- Panels now register as Garnish UI layers, so Escape closes the topmost thing — the element selector first, then the panel — the way the rest of the control panel behaves.
+
+## 5.1.1 - 2026-08-13
+
+### Fixed
+- Fixed the node builder always operating on the primary site, whatever the site selector said. Craft doesn't apply `?site=` to the current site on control panel requests — `Cp::requestedSite()` does — so on a menu that isn't enabled for the primary site every save failed with "Attempting to save an element in an unsupported site", and menus whose nodes live on another site showed up empty.
+- The builder now redirects to a site the menu is actually enabled for, and shows a site selector when a menu is enabled for more than one.
+- Fixed `propagationMethod` doing nothing. It was stored, validated, exposed in the CP, exported and migrated, but `Node::getSupportedSites()` never read it, so nodes propagated to every enabled site no matter the setting. All four methods (`none`, `siteGroup`, `language`, `all`) now apply. See **Changed** below.
+- Fixed management operations silently doing nothing for menus whose nodes live outside the current site: JSON export wrote an empty node list, `resave-nodes` and the console menu listing reported 0 nodes, the max-nodes limit went unenforced, and deleting a menu left its nodes behind as orphans.
+- Fixed node title syncing following the request's site instead of the saved element's, so only one site's nodes picked up a retitled element.
+- Adding a node to a site its menu isn't enabled for now fails with a message naming the menu and site, instead of an uncaught exception.
+
+### Changed
+- Menus set to a propagation method other than "all" will stop propagating *new* saves to sites the method excludes. Existing rows are left as they are — nothing is deleted — so a menu that had been propagating everywhere keeps the nodes it already has.
+- `Nodes::getNodesByMenuId()` and `Nodes::getParentOptions()` take an optional `$siteId`.
+
+### Added
+- `Nodes::findNodesInMenu()` — every node in a menu, once each, across all sites. Use it for management operations; rendering stays scoped to the current site.
+- `Menu::getEnabledSiteIds()` and `Menu::isEnabledForSite()`.
+
+## 5.1.0 - 2026-08-13
+
+### Fixed
+- Fixed nested menus rendering flat through `craft.freenav.tree()`. Node hierarchy lives in the menu's structure, but the tree builder grouped nodes by a `parentId` column that nothing ever wrote, so every node came back as a root. Trees are now built from the structure's `level`.
+- Fixed `Nodes::addNodes()` silently flattening menus on multi-site installs. The parent node was looked up against the current site only, so a parent living on another site resolved to `null` and the child was appended to the root instead. Parent lookups now search all sites and prefer the new node's site.
+- Fixed `node.url` in Twig and GraphQL returning the raw custom URL — empty for element-linked nodes — instead of the resolved one. The `url` property shadowed `getUrl()`; it is now `customUrl`, leaving `getUrl()` as the only accessor. See **Changed** below.
+- Fixed duplicated menus losing their nesting: `Menus::duplicateMenu()` copied nodes but never added them to the new menu's structure, so the copy came out flat (and invisible to structure-ordered queries).
+- Fixed nodes whose parent is hidden (disabled or failing a visibility rule) being promoted to the top level when rendering. They are now dropped along with their parent.
+- Fixed reordering a node — in the builder or the element index — leaving a stale cached menu on the front end.
+- Fixed the CP builder failing to find nodes that don't exist on the current CP site.
+- `Nodes::moveNode()` no longer throws when the requested parent or sibling can't be resolved; the node falls back to the menu root and a warning is logged.
+
+### Changed
+- **Breaking:** `Node::$url` is now `Node::$customUrl`, and the `freenav_nodes.url` column is now `customUrl`. Templates should call `node.getUrl()` (they always should have — `node.url` returned the wrong value for element-linked nodes). GraphQL's `url` field is unchanged and now resolves correctly. Menu exports emit `customUrl` and are stamped `"freeNav": "1.1.0"`; imports still accept the old `url` key.
+- **Breaking:** the unused `freenav_nodes.parentId` column has been dropped, along with `Node::$parentId`, which shadowed Craft's own `Element::getParentId()`. `node.parentId`, `node.getParent()`, and `node.getChildren()` now all read from the menu's structure.
+- Node queries now join structure data even when the query isn't scoped to a single menu, so `level`, `lft`, and `rgt` are populated on any `Node::find()` result.
+
+### Added
+- `Nodes::findNodeInMenu()`, `Nodes::placeNode()`, and `Nodes::moveNode()` — one place that resolves and positions nodes within a menu's structure.
+- `NodeHelper::buildParentMap()` — node ID => parent ID map derived from structure order.
+
+## 5.0.2 - 2026-07-19
+
+### Fixed
+- Fixed the element node types (Entry, Category, Asset, Product) being impossible to create in the node builder: the "Select Element" field now renders Craft's element picker so you can choose which element the node links to. Previously the field row appeared but its container stayed empty, and the selected element was never sent to the server. ([#reported](https://github.com/justinholtweb/craft-free-nav/issues))
+
+### Added
+- `nodes/element-select-html` controller action that renders the element selector for a given linkable node type (used by the builder UI).
+
+## 5.0.1 - 2026-07-19
+
+### Fixed
+- Fixed the element index columns for nodes: the `Node Type` and `New Window` columns now render their styled/custom HTML again (the Craft 3/4 `tableAttributeHtml()` hook was renamed to `attributeHtml()` in Craft 5, so the custom rendering was silently ignored).
+- Corrected the return type of `Node::getLinkedElement()` and its backing property to `ElementInterface`, matching what Craft's element lookup returns.
+
+### Dev
+- Added static analysis (PHPStan level 5, clean), code-style enforcement (ECS with Craft's rule set), and a PHPUnit unit-test suite for the plugin's enums and visibility rules.
+- Removed unused imports and redundant code flagged by the new tooling.
+
+## 5.0.0 - 2026-02-15
+
+### Added
+- Initial release
+- Full-featured navigation menu builder for Craft CMS 5
+- "Menus" terminology for clear naming
+- Drag-and-drop node builder in the Control Panel
+- Support for entry, category, asset, product, custom URL, passive, and site node types
+- Conditional visibility rules (user group, logged-in state, URL segments, entry type)
+- Built-in per-menu cache with automatic invalidation via tagged dependencies
+- Icon class and badge text fields on nodes
+- 6 template render presets: default, dropdown, sidebar, breadcrumb, footer, mega menu
+- JSON import/export of full menu structures
+- Built-in ARIA accessibility attributes (aria-current, aria-expanded, aria-haspopup, role)
+- REST API endpoints for headless/decoupled architectures
+- GraphQL schema with per-menu types and scoped permissions
+- Mega menu column layout support
+- Breadcrumb generation from URL segments with element resolution
+- Multi-site support with configurable propagation methods
+- Project Config support for menu definitions
+- Granular user permissions (manage menus, edit nodes, delete nodes)
+- MenuField field type for selecting menus in entries
+- Element syncing (title/URL updates when linked elements change)
+- Console commands for resaving nodes and clearing caches
+- Full English translation file

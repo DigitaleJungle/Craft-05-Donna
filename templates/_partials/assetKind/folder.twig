@@ -1,0 +1,11 @@
+{% set folderImage = folderImage ?? null%}
+<div class="folder">
+    <span class="folder-left">
+        {{ folderImage.render({
+                size
+            }) }}
+    </span>
+    <span class="folder-right">
+        {{ entry.title }}
+    </span>
+</div>

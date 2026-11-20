@@ -1,0 +1,182 @@
+<?php
+namespace verbb\formie\integrations\messaging;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Messaging;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\RichTextHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+use League\HTMLToMarkdown\HtmlConverter;
+
+class Plivo extends Messaging
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Plivo';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $authId = null;
+
+    #[Sensitive]
+    public ?string $authToken = null;
+
+    public ?string $fromNumber = null;
+
+    #[FormIntegrationSetting]
+    public ?string $toNumber = null;
+
+    #[FormIntegrationSetting]
+    public ?string $message = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to Plivo.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        return new IntegrationConfig([]);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'getMe');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $chatId = App::parseEnv($this->chatId);
+            $botToken = App::parseEnv($this->botToken);
+            $message = $this->_renderMessage($submission);
+
+            if (!$chatId || !$message) {
+                Integration::error($this, Craft::t('formie', 'Missing Chat ID or message.'));
+
+                return $this->resultForPayload(false);
+            }
+
+            $payload = [
+                'chat_id' => $chatId,
+                'text' => $message,
+                'parse_mode' => 'HTML',
+                'disable_web_page_preview' => true,
+            ];
+
+            $response = $this->deliverPayload($submission, 'sendMessage', $payload, 'POST', 'form_params');
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+
+            if ($response->getStatusCode() !== 200) {
+                $body = (string)$response->getBody();
+
+                Integration::error($this, Craft::t('formie', 'Telegram API error: {response}', [
+                    'response' => $body,
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['authId', 'authToken', 'fromNumber'], 'required'];
+
+        // Validate the following when saving form settings
+        $rules[] = [['toNumber', 'message'], 'required', 'on' => [Integration::SCENARIO_FORM]];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        $authId = App::parseEnv($this->authId);
+        $authToken = App::parseEnv($this->authToken);
+
+        return Craft::createGuzzleClient([
+            'base_uri' => 'https://api.plivo.com/v1/',
+            'auth' => [$authId, $authToken],
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::variableTextField([
+            'label' => Craft::t('formie', 'To Number'),
+            'instructions' => Craft::t('formie', 'The phone number to send the message to.'),
+            'name' => 'toNumber',
+            'required' => true,
+        ]);
+        $schema[] = SchemaHelper::richTextField([
+            'label' => Craft::t('formie', 'Message'),
+            'instructions' => Craft::t('formie', 'This text will be sent to {name}.', ['name' => $this->displayName()]),
+            'name' => 'message',
+            'required' => true,
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _renderMessage($submission): array|string
+    {
+        $html = RichTextHelper::getHtmlContent($this->message, $submission, false);
+
+        $converter = new HtmlConverter(['strip_tags' => true]);
+        $markdown = $converter->convert($html);
+
+        return $markdown;
+    }
+}

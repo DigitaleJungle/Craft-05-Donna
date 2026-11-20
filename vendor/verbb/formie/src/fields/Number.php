@@ -1,0 +1,501 @@
+<?php
+namespace verbb\formie\fields;
+
+use verbb\formie\base\Field;
+use verbb\formie\base\PreviewableFieldInterface;
+use verbb\formie\base\SortableFieldInterface;
+use verbb\formie\fields\coercion\DecimalValueCoercer;
+use verbb\formie\fields\definitions\FieldReferenceValue;
+use verbb\formie\fields\definitions\FieldValueType;
+use verbb\formie\fields\traits\UniqueValueFieldTrait;
+use verbb\formie\gql\types\Decimal as NumberType;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\ValidationMessagesHelper;
+use verbb\formie\models\SlotTag;
+use verbb\formie\query\NumericValueQueryHelper;
+use verbb\formie\references\ReferenceType;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\i18n\Locale;
+
+use yii\db\ExpressionInterface;
+use yii\db\Schema;
+
+use Faker\Generator as FakerFactory;
+use GraphQL\Type\Definition\Type;
+
+class Number extends Field implements SortableFieldInterface, PreviewableFieldInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Number');
+    }
+
+    public static function getSvgIconPath(): string
+    {
+        return 'formie/_formfields/number/icon.svg';
+    }
+
+    public static function dbType(): string
+    {
+        // Don't use integer columns, so we can handle large numbers as strings
+        return Schema::TYPE_JSON;
+    }
+
+    public static function queryCondition(array $instances, mixed $value, array &$params): array|string|ExpressionInterface|false|null
+    {
+        $condition = parent::queryCondition($instances, $value, $params);
+
+        return is_array($condition) ? NumericValueQueryHelper::applyRangeConditions($condition, $params) : $condition;
+    }
+
+    public static function supportsGqlConfigProvider(): bool
+    {
+        return true;
+    }
+
+    public static function gqlContentTypeFromConfig(array $config): Type|array
+    {
+        return NumberType::getType();
+    }
+
+    public static function gqlContentMutationArgumentTypeFromConfig(array $config): Type|array
+    {
+        return [
+            'name' => $config['handle'] ?? '',
+            'type' => NumberType::getType(),
+            'description' => $config['instructions'] ?? null,
+        ];
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_UNIQUE_QUERY = 'modifyUniqueQuery';
+
+
+    // Traits
+    // =========================================================================
+
+    use UniqueValueFieldTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    public bool $limit = false;
+    public int|float|null $min = null;
+    public int|float|null $max = null;
+    public ?int $decimals = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct(array $config = [])
+    {
+        // Normalize number settings
+        foreach (['defaultValue', 'min', 'max'] as $name) {
+            if (isset($config[$name]) && is_array($config[$name])) {
+                $config[$name] = DecimalValueCoercer::normalize($config[$name]['value'], $config[$name]['locale']);
+            }
+        }
+
+        parent::__construct($config);
+    }
+
+    public function fieldKind(): string
+    {
+        return self::KIND_TEXT;
+    }
+
+    public function init(): void
+    {
+        parent::init();
+
+        // Normalize $defaultValue
+        if ($this->defaultValue === '') {
+            $this->defaultValue = null;
+        }
+
+        // Normalize $decimals
+        if (!$this->decimals) {
+            $this->decimals = 0;
+        }
+    }
+
+    public function normalizeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        if (is_string($value)) {
+            $value = trim($value);
+        }
+
+        // Was this submitted with a locale ID?
+        if (is_array($value) && isset($value['locale'], $value['value'])) {
+            if (is_string($value['value'])) {
+                $value['value'] = trim($value['value']);
+            }
+
+            $value = DecimalValueCoercer::normalize($value['value'], is_string($value['locale']) ? $value['locale'] : null);
+        }
+
+        if ($value === '') {
+            return null;
+        }
+
+        return DecimalValueCoercer::normalize($value);
+    }
+
+    public function getSortOption(): array
+    {
+        $option = parent::getSortOption();
+        $valueSql = $this->getValueSql();
+
+        if ($valueSql !== null) {
+            $option['orderBy'][0] = NumericValueQueryHelper::buildSortKeySql($valueSql);
+        }
+
+        return $option;
+    }
+
+    public function getElementValidationRules(): array
+    {
+        $rules = parent::getElementValidationRules();
+        $rules[] = [$this->handle, 'number', 'min' => $this->limit ? $this->min : null, 'max' => $this->limit ? $this->max : null];
+
+        foreach ($this->getUniqueValueElementValidationRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        return $rules;
+    }
+
+    public function defineFormBuilderPreviewSchema(): array
+    {
+        return [
+            SchemaHelper::previewInput([
+                'type' => 'number',
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::labelField(),
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Placeholder'),
+                'instructions' => Craft::t('formie', 'The text that will be shown if the field doesn’t have a value.'),
+                'name' => 'placeholder',
+            ]),
+            SchemaHelper::numberField([
+                'label' => Craft::t('formie', 'Default Value'),
+                'instructions' => Craft::t('formie', 'Set a default value for the field when it doesn’t have a value.'),
+                'name' => 'defaultValue',
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderSettingsSchema(): array
+    {
+        return [
+            SchemaHelper::numberField([
+                'label' => Craft::t('formie', 'Decimal Points'),
+                'instructions' => Craft::t('formie', 'Set the number of decimal points to format the field value.'),
+                'name' => 'decimals',
+            ]),
+            SchemaHelper::prefillQueryParam(),
+            SchemaHelper::includeInEmailFieldSummariesField(),
+        ];
+    }
+
+    public function defineFormBuilderValidationSchema(): array
+    {
+        return [
+            SchemaHelper::requiredField(),
+            SchemaHelper::requiredValidationMessage(),
+            SchemaHelper::lightswitchField([
+                'label' => Craft::t('formie', 'Limit Numbers'),
+                'instructions' => Craft::t('formie', 'Whether to limit the numbers for this field.'),
+                'name' => 'limit',
+            ]),
+            [
+                '$el' => 'div',
+                'attrs' => [
+                    'class' => 'fui-row',
+                ],
+                'if' => 'limit',
+                'children' => [
+                    [
+                        '$el' => 'div',
+                        'attrs' => [
+                            'class' => 'fui-col-6',
+                        ],
+                        'children' => [
+                            SchemaHelper::numberField([
+                                'label' => Craft::t('formie', 'Min Value'),
+                                'instructions' => Craft::t('formie', 'Set a minimum value that users must enter.'),
+                                'name' => 'min',
+                            ]),
+                            SchemaHelper::textField([
+                                'label' => Craft::t('formie', 'Minimum Value Error Message'),
+                                'instructions' => ValidationMessagesHelper::tokenInstructions(['label', 'min']),
+                                'name' => 'validationMessages.numberMin',
+                                'if' => 'limit && min',
+                            ]),
+                        ],
+                    ],
+                    [
+                        '$el' => 'div',
+                        'attrs' => [
+                            'class' => 'fui-col-6',
+                        ],
+                        'children' => [
+                            SchemaHelper::numberField([
+                                'label' => Craft::t('formie', 'Max Value'),
+                                'instructions' => Craft::t('formie', 'Set a maximum value that users must enter.'),
+                                'name' => 'max',
+                            ]),
+                            SchemaHelper::textField([
+                                'label' => Craft::t('formie', 'Maximum Value Error Message'),
+                                'instructions' => ValidationMessagesHelper::tokenInstructions(['label', 'max']),
+                                'name' => 'validationMessages.numberMax',
+                                'if' => 'limit && max',
+                            ]),
+                        ],
+                    ],
+                ],
+            ],
+            SchemaHelper::textField([
+                'label' => Craft::t('formie', 'Invalid Number Error Message'),
+                'instructions' => ValidationMessagesHelper::tokenInstructions(['label']),
+                'name' => 'validationMessages.number',
+            ]),
+            SchemaHelper::matchField([
+                'includedTypes' => [self::class],
+            ]),
+            SchemaHelper::matchValidationMessage(),
+            ...$this->defineUniqueValueValidationSchema(),
+        ];
+    }
+
+    public function defineFormBuilderAppearanceSchema(): array
+    {
+        return [
+            SchemaHelper::visibility(),
+            SchemaHelper::labelPosition($this),
+            SchemaHelper::instructions(),
+            SchemaHelper::instructionsPosition($this),
+            SchemaHelper::errorMessagePosition($this),
+        ];
+    }
+
+    public function defineFormBuilderAdvancedSchema(): array
+    {
+        return [
+            SchemaHelper::handleField(),
+            SchemaHelper::cssClasses(),
+            SchemaHelper::containerAttributesField(),
+            SchemaHelper::inputAttributesField(),
+        ];
+    }
+
+    public function defineFormBuilderConditionsSchema(): array
+    {
+        return [
+            SchemaHelper::enableConditionsField(),
+            SchemaHelper::conditionsField(),
+        ];
+    }
+
+    public function getContentGqlType(): array|Type
+    {
+        return NumberType::getType();
+    }
+
+    public function getContentGqlMutationArgumentType(): Type|array
+    {
+        return [
+            'name' => $this->handle,
+            'type' => NumberType::getType(),
+            'description' => $this->instructions->isEmpty() ? null : $this->instructions->toPlainText(),
+        ];
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return array_merge(parent::getSettingGqlTypes(), [
+            'limit' => [
+                'name' => 'limit',
+                'type' => Type::boolean(),
+            ],
+            // We're forced to use a int-representation of the min/max values, due to the parent `min/max` definition
+            // So cast it properly here as an int, but also provide `minValue/maxValue` as the proper type.
+            'min' => [
+                'name' => 'min',
+                'type' => Type::int(),
+                'resolve' => function($field) {
+                    return (int)$field->min;
+                },
+            ],
+            'max' => [
+                'name' => 'max',
+                'type' => Type::int(),
+                'resolve' => function($field) {
+                    return (int)$field->max;
+                },
+            ],
+            'minValue' => [
+                'name' => 'minValue',
+                'type' => Type::float(),
+                'resolve' => function($field) {
+                    return $field->min;
+                },
+            ],
+            'maxValue' => [
+                'name' => 'maxValue',
+                'type' => Type::float(),
+                'resolve' => function($field) {
+                    return $field->max;
+                },
+            ],
+            'decimals' => [
+                'name' => 'decimals',
+                'type' => Type::int(),
+            ],
+        ]);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineValueType(): FieldValueType
+    {
+        return FieldValueType::string();
+    }
+
+    protected function supportedDefaults(): array
+    {
+        return ['decimals'];
+    }
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        $form = $context->form;
+        $errors = $context->errors;
+
+        $id = $this->getHtmlId($form);
+        $dataId = $this->getHtmlDataId($form);
+
+        if ($key === 'fieldInput') {
+            return SlotTag::make('input')
+                ->core(array_merge([
+                    'type' => 'number',
+                    'id' => $id,
+                    'name' => $this->getHtmlName(),
+                    'placeholder' => $this->placeholder ?: null,
+                    'required' => $this->required ? true : null,
+                    'min' => $this->limit ? $this->min : false,
+                    'max' => $this->limit ? $this->max : false,
+                    'data-formie-input' => true,
+                    'data-formie-number-input' => true,
+                    'data-formie-input-id' => $dataId,
+                    'data-formie-input-type' => 'number',
+                    'data-formie-input-error-state' => $errors ? true : false,
+                    'aria-describedby' => $this->hasInstructions() ? "{$id}-instructions" : null,
+                ], ValidationMessagesHelper::numberValidationBrowserAttributes(
+                    $this,
+                    (bool)$this->limit,
+                    $this->min,
+                    $this->max,
+                )))
+                ->theme([
+                    'class' => [
+                        'formie-input',
+                        'formie-number-input',
+                        $errors ? 'formie-input-error' : false,
+                    ],
+                ])
+                ->instanceAttributes($this->getInputAttributes());
+        }
+
+        return parent::defineSlotTag($key, $context);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['defaultValue', 'min', 'max'], 'number'];
+        $rules[] = [['decimals'], 'integer'];
+        $rules[] = [['max'], 'compare', 'compareAttribute' => 'min', 'operator' => '>='];
+
+        if (!$this->decimals) {
+            $rules[] = [['defaultValue', 'min', 'max'], 'integer'];
+        }
+
+        foreach ($this->defineUniqueValueRules() as $rule) {
+            $rules[] = $rule;
+        }
+
+        return $rules;
+    }
+
+    protected function defineSubmissionHtml(mixed $value, ?ElementInterface $element, bool $inline): string
+    {
+        // Editing must retain all stored digits, even when the configured precision changes.
+        if (is_string($value) && $this->decimals && preg_match('/^([+-]?\d+)(?:\.(\d*))?$/D', $value, $parts)) {
+            $value = $parts[1] . '.' . str_pad($parts[2] ?? '', $this->decimals, '0');
+        }
+
+        return Craft::$app->getView()->renderTemplate('formie/_formfields/number/input', [
+            'name' => $this->handle,
+            'value' => $value,
+            'field' => $this,
+        ]);
+    }
+
+    protected function defineValueForEmailPreview(FakerFactory $faker): mixed
+    {
+        return $faker->randomDigit;
+    }
+
+    protected function defineReferenceValues(): array
+    {
+        return [
+            FieldReferenceValue::primary(types: [ReferenceType::Number, ReferenceType::Text]),
+        ];
+    }
+
+    protected function defineBrowserValidationRules(): array
+    {
+        $validators = parent::defineBrowserValidationRules();
+        $validators[] = [
+            'type' => 'number',
+            'min' => $this->limit ? $this->min : null,
+            'max' => $this->limit ? $this->max : null,
+        ];
+
+        return $validators;
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        return array_merge(parent::defineClientRenderedInput(), [
+            'min' => $this->limit ? $this->min : null,
+            'max' => $this->limit ? $this->max : null,
+            'inputType' => 'number',
+        ]);
+    }
+}

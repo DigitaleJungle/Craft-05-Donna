@@ -1,0 +1,790 @@
+<?php
+namespace verbb\formie\services;
+
+use verbb\formie\Formie;
+use verbb\formie\base\FieldInterface;
+use verbb\formie\base\ParentFieldInterface;
+use verbb\formie\elements\Form;
+use verbb\formie\events\StencilEvent;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\helpers\Table;
+use verbb\formie\models\Stencil;
+use verbb\formie\records\Stencil as StencilRecord;
+
+use Craft;
+use craft\db\Query;
+use craft\events\ConfigEvent;
+use craft\helpers\Db;
+use craft\helpers\ProjectConfig as ProjectConfigHelper;
+use craft\models\Site;
+
+use yii\base\Component;
+
+use Exception;
+use Throwable;
+
+class Stencils extends Component
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function resolveScopeForNew(?string $requestedScope = null): string
+    {
+        if ($requestedScope === self::SCOPE_PROJECT && Craft::$app->getConfig()->getGeneral()->allowAdminChanges) {
+            return self::SCOPE_PROJECT;
+        }
+
+        return self::SCOPE_SITE;
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const SCOPE_PROJECT = 'project';
+    public const SCOPE_SITE = 'site';
+
+    public const EVENT_BEFORE_SAVE_STENCIL = 'beforeSaveStencil';
+    public const EVENT_AFTER_SAVE_STENCIL = 'afterSaveStencil';
+    public const EVENT_BEFORE_DELETE_STENCIL = 'beforeDeleteStencil';
+    public const EVENT_BEFORE_APPLY_STENCIL_DELETE = 'beforeApplyStencilDelete';
+    public const EVENT_AFTER_DELETE_STENCIL = 'afterDeleteStencil';
+    public const CONFIG_STENCILS_KEY = 'formie.stencils';
+
+
+    // Properties
+    // =========================================================================
+
+    private ?array $_stencils = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function createFromStencil(Stencil $stencil, array $identity = []): Form
+    {
+        $identity = array_intersect_key($identity, array_flip(['title', 'handle', 'groupId', 'sourceSiteId']));
+        $form = new Form($identity);
+        $stencil->applyStencilToForm($form, true);
+
+        return $form;
+    }
+
+    public function getAllStencils(bool $withTrashed = false): array
+    {
+        if ($this->_stencils !== null && !$withTrashed) {
+            return $this->_stencils;
+        }
+
+        $results = $this->_createStencilsQuery($withTrashed)->all();
+        $stencils = [];
+
+        foreach ($results as $row) {
+            $stencils[] = new Stencil($row);
+        }
+
+        if (!$withTrashed) {
+            $this->_stencils = $stencils;
+        }
+
+        return $stencils;
+    }
+
+    public function getStencilArray(): array
+    {
+        $stencils = [];
+
+        foreach ($this->getAllStencils() as $stencil) {
+            $stencils[] = [
+                'value' => $stencil->id,
+                'label' => $stencil->name,
+            ];
+        }
+
+        return $stencils;
+    }
+
+    public function getStencilById(int $id): ?Stencil
+    {
+        return ArrayHelper::firstWhere($this->getAllStencils(), 'id', $id);
+    }
+
+    public function getStencilByHandle(string $handle): ?Stencil
+    {
+        return ArrayHelper::firstWhere($this->getAllStencils(), 'handle', $handle, false);
+    }
+
+    public function getStencilByUid(string $uid): ?Stencil
+    {
+        return ArrayHelper::firstWhere($this->getAllStencils(), 'uid', $uid, false);
+    }
+
+    public function getBuilderMultiSiteConfig(Stencil $stencil, ?int $activeSiteId = null): array
+    {
+        $siteOverrides = Formie::$plugin->getFormSiteOverrides();
+
+        if (!$siteOverrides->isEnabled()) {
+            return ['enabled' => false];
+        }
+
+        $sites = $siteOverrides->getEditableSites();
+
+        if ($sites === []) {
+            return ['enabled' => false];
+        }
+
+        $siteIds = array_map(static fn(Site $site): int => (int)$site->id, $sites);
+        $sourceSiteId = $siteOverrides->getPrimarySiteId();
+
+        if (!in_array($sourceSiteId, $siteIds, true)) {
+            $sourceSiteId = (int)$siteIds[0];
+        }
+
+        $activeSiteId ??= $siteOverrides->getActiveSiteId();
+
+        if (!in_array($activeSiteId, $siteIds, true)) {
+            $activeSiteId = $sourceSiteId;
+        }
+
+        [$overrides, $fieldOverrides] = $this->_getBuilderTranslationMaps($stencil, $sites, $sourceSiteId);
+
+        return [
+            'enabled' => count($sites) > 1,
+            'sourceSiteId' => $sourceSiteId,
+            'activeSiteId' => $activeSiteId,
+            'sites' => array_map(static function(Site $site) use ($sourceSiteId): array {
+                return [
+                    'id' => (int)$site->id,
+                    'name' => $site->name,
+                    'handle' => $site->handle,
+                    'language' => $site->language,
+                    'source' => (int)$site->id === $sourceSiteId,
+                ];
+            }, $sites),
+            'overrides' => $overrides,
+            'fieldOverrides' => $fieldOverrides,
+            'layoutReadOnly' => false,
+        ];
+    }
+
+    public function applyTranslationsToBuilderData(Stencil $stencil, array $canonicalData, int $siteId): array
+    {
+        $config = $this->getBuilderMultiSiteConfig($stencil, $siteId);
+
+        if (empty($config['enabled']) || $siteId === (int)($config['sourceSiteId'] ?? 0)) {
+            return $canonicalData;
+        }
+
+        return Formie::$plugin->getFormSiteOverrides()->mergeOverridesIntoBuilderData(
+            $canonicalData,
+            $config['overrides'][$siteId] ?? [],
+            $config['fieldOverrides'][$siteId] ?? [],
+        );
+    }
+
+    public function saveTranslationBundle(Stencil $stencil, int $siteId, array $translations): void
+    {
+        $siteOverrides = Formie::$plugin->getFormSiteOverrides();
+        $config = $this->getBuilderMultiSiteConfig($stencil, $siteId);
+
+        if (empty($config['enabled']) || $siteId === (int)($config['sourceSiteId'] ?? 0)) {
+            return;
+        }
+
+        $site = Craft::$app->getSites()->getSiteById($siteId);
+
+        if (!$site) {
+            return;
+        }
+
+        $fieldOverrides = $siteOverrides->normalizeFieldOverrides(
+            is_array($translations['fieldOverrides'] ?? null) ? $translations['fieldOverrides'] : [],
+        );
+        unset($translations['fields'], $translations['fieldOverrides'], $translations['title']);
+
+        $bundle = $siteOverrides->normalizeOverrides($translations);
+
+        if ($fieldOverrides !== []) {
+            $bundle['fieldOverrides'] = $fieldOverrides;
+        }
+
+        if ($bundle === []) {
+            unset($stencil->data->translations[$site->uid]);
+
+            return;
+        }
+
+        $stencil->data->translations[$site->uid] = $bundle;
+    }
+
+    public function populateTranslationBundlesFromForm(Stencil $stencil, Form $form): void
+    {
+        $siteOverrides = Formie::$plugin->getFormSiteOverrides();
+
+        if (!$siteOverrides->isEnabled() || !$form->id) {
+            return;
+        }
+
+        $rootOverrides = $siteOverrides->getAllOverrides((int)$form->id);
+        $fieldOverrides = Formie::$plugin->getFieldSiteOverrides()->getAllForForm($form);
+        $fieldReferences = array_flip($this->_buildFieldReferenceMap($form));
+        $translations = [];
+
+        foreach (array_unique([...array_keys($rootOverrides), ...array_keys($fieldOverrides)]) as $siteId) {
+            $site = Craft::$app->getSites()->getSiteById((int)$siteId);
+
+            if (!$site) {
+                continue;
+            }
+
+            $bundle = $rootOverrides[$siteId] ?? [];
+            unset($bundle['title']);
+            $portableFields = [];
+
+            foreach ($fieldOverrides[$siteId] ?? [] as $fieldId => $override) {
+                $reference = $fieldReferences[(int)$fieldId] ?? null;
+
+                if ($reference && is_array($override)) {
+                    $portableFields[$reference] = $override;
+                }
+            }
+
+            if ($portableFields !== []) {
+                $bundle['fieldOverrides'] = $portableFields;
+            }
+
+            if ($bundle !== []) {
+                $translations[$site->uid] = $bundle;
+            }
+        }
+
+        $stencil->data->translations = $translations;
+    }
+
+    public function materializeTranslationsForForm(Form $form): void
+    {
+        $translations = $form->getPendingStencilTranslations();
+
+        if (!$form->id || $translations === []) {
+            return;
+        }
+
+        $siteOverrides = Formie::$plugin->getFormSiteOverrides();
+
+        if (!$siteOverrides->isEnabled()) {
+            return;
+        }
+
+        $availableSiteIds = Formie::$plugin->getFormSitePropagation()->resolveSiteIdsForForm($form);
+        $sourceSiteId = $siteOverrides->getSourceSiteId($form);
+        $fieldReferenceMap = $this->_buildFieldReferenceMap($form);
+
+        // Keep site UIDs and field references portable until the new form has local site and field IDs.
+        foreach ($translations as $siteUid => $bundle) {
+            if (!is_array($bundle)) {
+                continue;
+            }
+
+            $site = $this->_getSiteByUid((string)$siteUid);
+
+            if (
+                !$site
+                || (int)$site->id === $sourceSiteId
+                || !in_array((int)$site->id, $availableSiteIds, true)
+            ) {
+                continue;
+            }
+
+            $portableFields = is_array($bundle['fieldOverrides'] ?? null) ? $bundle['fieldOverrides'] : [];
+            $materializedFields = [];
+
+            foreach ($portableFields as $reference => $override) {
+                $fieldId = $fieldReferenceMap[(string)$reference] ?? null;
+
+                if ($fieldId && is_array($override)) {
+                    $materializedFields[$fieldId] = $override;
+                }
+            }
+
+            unset($bundle['fieldOverrides']);
+
+            if ($materializedFields !== []) {
+                $bundle['fieldOverrides'] = $materializedFields;
+            }
+
+            $siteOverrides->saveTranslationBundle((int)$form->id, (int)$site->id, $bundle);
+        }
+
+        $form->setPendingStencilTranslations([]);
+    }
+
+    public function saveStencil(Stencil $stencil, bool $runValidation = true): bool
+    {
+        $isNewStencil = !$stencil->id;
+
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_SAVE_STENCIL)) {
+            $this->trigger(self::EVENT_BEFORE_SAVE_STENCIL, new StencilEvent([
+                'stencil' => $stencil,
+                'isNew' => $isNewStencil,
+            ]));
+        }
+
+        if ($runValidation && !$stencil->validate()) {
+            Formie::info('Stencil not saved due to validation error.');
+
+            return false;
+        }
+
+        if (!$stencil->canEdit()) {
+            $stencil->addError('name', Craft::t('formie', 'This stencil cannot be edited in the current environment.'));
+
+            return false;
+        }
+
+        if ($isNewStencil) {
+            Formie::$plugin->getFormDefaults()->applyCaptchaDefaultsToIntegrations($stencil->data->settings->integrations);
+        }
+
+        if ($existingStencil = $this->_findConflictingStencil($stencil)) {
+            $stencil->addError('handle', Craft::t('formie', 'That handle is already in use'));
+
+            return false;
+        }
+
+        if ($stencil->isSiteScope()) {
+            return $this->_saveSiteStencil($stencil, $isNewStencil);
+        }
+
+        return $this->_saveProjectStencil($stencil, $isNewStencil);
+    }
+
+    public function handleChangedStencil(ConfigEvent $event): void
+    {
+        $stencilUid = $event->tokenMatches[0];
+        $stencilRecord = $this->_getStencilsRecord($stencilUid);
+
+        // Preserve instance-owned stencils, including trashed ones, before syncing dependencies.
+        if ($stencilRecord->scope === self::SCOPE_SITE) {
+            return;
+        }
+
+        $data = ProjectConfigHelper::unpackAssociativeArray($event->newValue);
+
+        $projectConfig = Craft::$app->getProjectConfig();
+        $formTemplates = $projectConfig->get(FormTemplates::CONFIG_TEMPLATES_KEY, true) ?? [];
+        $emailTemplates = $projectConfig->get(EmailTemplates::CONFIG_TEMPLATES_KEY, true) ?? [];
+        $statuses = $projectConfig->get(SubmissionStatuses::CONFIG_SUBMISSION_STATUSES_KEY, true) ?? [];
+
+        foreach ($formTemplates as $formTemplateUid => $formTemplateData) {
+            $projectConfig->processConfigChanges(FormTemplates::CONFIG_TEMPLATES_KEY . '.' . $formTemplateUid);
+        }
+
+        foreach ($emailTemplates as $emailTemplateUid => $emailTemplateData) {
+            $projectConfig->processConfigChanges(EmailTemplates::CONFIG_TEMPLATES_KEY . '.' . $emailTemplateUid);
+        }
+
+        foreach ($statuses as $statusUid => $statusData) {
+            $projectConfig->processConfigChanges(SubmissionStatuses::CONFIG_SUBMISSION_STATUSES_KEY . '.' . $statusUid);
+        }
+
+        $transaction = Craft::$app->getDb()->beginTransaction();
+
+        try {
+            $isNewStencil = $stencilRecord->getIsNewRecord();
+
+            $stencilRecord->name = $data['name'];
+            $stencilRecord->handle = $data['handle'];
+            $stencilRecord->data = $data['data'];
+            $stencilRecord->uid = $stencilUid;
+            $stencilRecord->scope = self::SCOPE_PROJECT;
+
+            $redirectEntryUid = $data['redirectEntry'] ?? $data['submitActionEntry'] ?? null;
+            $defaultStatusUid = $data['defaultStatus'] ?? null;
+            $templateUid = $data['template'] ?? null;
+
+            if ($defaultStatusUid) {
+                $defaultStatus = Formie::$plugin->getSubmissionStatuses()->getStatusByUid($defaultStatusUid);
+
+                if ($defaultStatus) {
+                    $stencilRecord->defaultStatusId = $defaultStatus->id;
+                }
+            }
+
+            if ($redirectEntryUid) {
+                $redirectEntry = Craft::$app->getElements()->getElementByUid($redirectEntryUid);
+
+                if ($redirectEntry) {
+                    $stencilRecord->redirectEntryId = $redirectEntry->id;
+                }
+            }
+
+            if ($templateUid) {
+                $template = Formie::$plugin->getFormTemplates()->getTemplateByUid($templateUid);
+
+                if ($template) {
+                    $stencilRecord->templateId = $template->id;
+                }
+            }
+
+            if ($wasTrashed = (bool)$stencilRecord->dateDeleted) {
+                $stencilRecord->restore();
+            } else {
+                $stencilRecord->save(false);
+            }
+
+            $transaction->commit();
+        } catch (Throwable $e) {
+            $transaction->rollBack();
+            throw $e;
+        }
+
+        $this->_clearStencilCache();
+
+        if ($this->hasEventHandlers(self::EVENT_AFTER_SAVE_STENCIL)) {
+            $this->trigger(self::EVENT_AFTER_SAVE_STENCIL, new StencilEvent([
+                'stencil' => $this->getStencilById($stencilRecord->id),
+                'isNew' => $isNewStencil,
+            ]));
+        }
+    }
+
+    public function deleteStencilById(int $id): bool
+    {
+        $stencil = $this->getStencilById($id);
+
+        if (!$stencil) {
+            return false;
+        }
+
+        return $this->deleteStencil($stencil);
+    }
+
+    public function deleteStencil(Stencil $stencil): bool
+    {
+        if (!$stencil->canDelete()) {
+            return false;
+        }
+
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_DELETE_STENCIL)) {
+            $this->trigger(self::EVENT_BEFORE_DELETE_STENCIL, new StencilEvent([
+                'stencil' => $stencil,
+            ]));
+        }
+
+        if ($stencil->isSiteScope()) {
+            return $this->_deleteSiteStencil($stencil);
+        }
+
+        Craft::$app->getProjectConfig()->remove(self::CONFIG_STENCILS_KEY . '.' . $stencil->uid);
+
+        return true;
+    }
+
+    public function handleDeletedStencil(ConfigEvent $event): void
+    {
+        $stencilUid = $event->tokenMatches[0];
+        $stencilRecord = $this->_getStencilsRecord($stencilUid);
+
+        // Removing project config cannot delete an instance-owned stencil or invoke its hooks.
+        if ($stencilRecord->getIsNewRecord() || $stencilRecord->scope === self::SCOPE_SITE) {
+            return;
+        }
+
+        $stencil = $this->getStencilByUid($stencilUid);
+
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_APPLY_STENCIL_DELETE)) {
+            $this->trigger(self::EVENT_BEFORE_APPLY_STENCIL_DELETE, new StencilEvent([
+                'stencil' => $stencil,
+            ]));
+        }
+
+        $transaction = Craft::$app->getDb()->beginTransaction();
+
+        try {
+            $stencilRecord->softDelete();
+            $transaction->commit();
+        } catch (Throwable $e) {
+            $transaction->rollBack();
+            throw $e;
+        }
+
+        $this->_clearStencilCache();
+
+        if ($this->hasEventHandlers(self::EVENT_AFTER_DELETE_STENCIL)) {
+            $this->trigger(self::EVENT_AFTER_DELETE_STENCIL, new StencilEvent([
+                'stencil' => $stencil,
+            ]));
+        }
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getBuilderTranslationMaps(Stencil $stencil, array $sites, int $sourceSiteId): array
+    {
+        $sitesByUid = [];
+
+        foreach ($sites as $site) {
+            $sitesByUid[$site->uid] = $site;
+        }
+
+        $overrides = [];
+        $fieldOverrides = [];
+
+        foreach ($stencil->data->translations as $siteUid => $bundle) {
+            $site = $sitesByUid[(string)$siteUid] ?? null;
+
+            if (!$site || (int)$site->id === $sourceSiteId || !is_array($bundle)) {
+                continue;
+            }
+
+            $siteId = (int)$site->id;
+            $fields = $bundle['fieldOverrides'] ?? [];
+            unset($bundle['fieldOverrides'], $bundle['title']);
+
+            if ($bundle !== []) {
+                $overrides[$siteId] = $bundle;
+            }
+
+            if (is_array($fields) && $fields !== []) {
+                $fieldOverrides[$siteId] = Formie::$plugin->getFormSiteOverrides()->filterFieldTranslationsForLayout($stencil->getFormLayout(), $fields);
+            }
+        }
+
+        return [$overrides, $fieldOverrides];
+    }
+
+    private function _buildFieldReferenceMap(Form $form): array
+    {
+        $map = [];
+
+        foreach ($form->getFields() as $field) {
+            if ($field instanceof FieldInterface) {
+                $this->_collectFieldReferenceMap($field, $map);
+            }
+        }
+
+        return $map;
+    }
+
+    private function _collectFieldReferenceMap(FieldInterface $field, array &$map): void
+    {
+        $reference = trim((string)$field->reference);
+        $fieldId = (int)($field->definitionId ?: 0);
+
+        if ($reference !== '' && $fieldId) {
+            $map[$reference] = $fieldId;
+        }
+
+        if (!$field instanceof ParentFieldInterface) {
+            return;
+        }
+
+        foreach ($field->getFieldLayout()->getPages() as $page) {
+            foreach ($page->getRows() as $row) {
+                foreach ($row->getFields() as $nestedField) {
+                    if ($nestedField instanceof FieldInterface) {
+                        $this->_collectFieldReferenceMap($nestedField, $map);
+                    }
+                }
+            }
+        }
+    }
+
+    private function _getSiteByUid(string $uid): ?Site
+    {
+        foreach (Craft::$app->getSites()->getAllSites() as $site) {
+            if ($site->uid === $uid) {
+                return $site;
+            }
+        }
+
+        return null;
+    }
+
+    private function _saveProjectStencil(Stencil $stencil, bool $isNewStencil): bool
+    {
+        if (!Craft::$app->getConfig()->getGeneral()->allowAdminChanges) {
+            $stencil->addError('name', Craft::t('formie', 'Project stencils cannot be saved when admin changes are disabled.'));
+
+            return false;
+        }
+
+        if ($isNewStencil) {
+            $stencilUid = StringHelper::UUID();
+            $stencil->scope = self::SCOPE_PROJECT;
+        } else {
+            $stencilUid = Db::uidById(Table::FORMIE_STENCILS, $stencil->id);
+        }
+
+        $configData = $stencil->dateDeleted ? null : $stencil->getConfig();
+        $configPath = self::CONFIG_STENCILS_KEY . '.' . $stencilUid;
+        Craft::$app->getProjectConfig()->set($configPath, $configData);
+
+        if ($isNewStencil) {
+            $stencil->id = Db::idByUid(Table::FORMIE_STENCILS, $stencilUid);
+            $stencil->uid = $stencilUid;
+        }
+
+        $this->_clearStencilCache();
+
+        return true;
+    }
+
+    private function _saveSiteStencil(Stencil $stencil, bool $isNewStencil): bool
+    {
+        $stencil->scope = self::SCOPE_SITE;
+        $config = $stencil->getConfig();
+
+        $transaction = Craft::$app->getDb()->beginTransaction();
+
+        try {
+            if ($isNewStencil) {
+                $stencilRecord = new StencilRecord();
+                $stencilRecord->uid = StringHelper::UUID();
+            } else {
+                $stencilRecord = StencilRecord::findOne($stencil->id);
+
+                if (!$stencilRecord) {
+                    throw new Exception('Invalid stencil ID: ' . $stencil->id);
+                }
+            }
+
+            $stencilRecord->name = $config['name'];
+            $stencilRecord->handle = $config['handle'];
+            $stencilRecord->scope = self::SCOPE_SITE;
+            $stencilRecord->data = $config['data'];
+
+            if ($defaultStatusUid = $config['defaultStatus'] ?? null) {
+                $defaultStatus = Formie::$plugin->getSubmissionStatuses()->getStatusByUid($defaultStatusUid);
+                $stencilRecord->defaultStatusId = $defaultStatus?->id;
+            } else {
+                $stencilRecord->defaultStatusId = $stencil->defaultStatusId;
+            }
+
+            if ($templateUid = $config['template'] ?? null) {
+                $template = Formie::$plugin->getFormTemplates()->getTemplateByUid($templateUid);
+                $stencilRecord->templateId = $template?->id;
+            } else {
+                $stencilRecord->templateId = $stencil->templateId;
+            }
+
+            if ($redirectEntryUid = $config['redirectEntry'] ?? $config['submitActionEntry'] ?? null) {
+                $redirectEntry = Craft::$app->getElements()->getElementByUid($redirectEntryUid);
+                $stencilRecord->redirectEntryId = $redirectEntry?->id;
+                $stencilRecord->redirectEntrySiteId = $redirectEntry?->siteId;
+            } else {
+                $stencilRecord->redirectEntryId = $stencil->redirectEntryId;
+                $stencilRecord->redirectEntrySiteId = $stencil->redirectEntrySiteId;
+            }
+
+            $stencilRecord->save(false);
+
+            $stencil->id = $stencilRecord->id;
+            $stencil->uid = $stencilRecord->uid;
+
+            $transaction->commit();
+        } catch (Throwable $e) {
+            $transaction->rollBack();
+            throw $e;
+        }
+
+        $this->_clearStencilCache();
+
+        if ($this->hasEventHandlers(self::EVENT_AFTER_SAVE_STENCIL)) {
+            $this->trigger(self::EVENT_AFTER_SAVE_STENCIL, new StencilEvent([
+                'stencil' => $this->getStencilById($stencil->id),
+                'isNew' => $isNewStencil,
+            ]));
+        }
+
+        return true;
+    }
+
+    private function _deleteSiteStencil(Stencil $stencil): bool
+    {
+        $transaction = Craft::$app->getDb()->beginTransaction();
+
+        try {
+            $stencilRecord = StencilRecord::findOne($stencil->id);
+
+            if (!$stencilRecord || $stencilRecord->scope !== self::SCOPE_SITE) {
+                $transaction->rollBack();
+
+                return false;
+            }
+
+            $stencilRecord->softDelete();
+            $transaction->commit();
+        } catch (Throwable $e) {
+            $transaction->rollBack();
+            throw $e;
+        }
+
+        $this->_clearStencilCache();
+
+        if ($this->hasEventHandlers(self::EVENT_AFTER_DELETE_STENCIL)) {
+            $this->trigger(self::EVENT_AFTER_DELETE_STENCIL, new StencilEvent([
+                'stencil' => $stencil,
+            ]));
+        }
+
+        return true;
+    }
+
+    private function _findConflictingStencil(Stencil $stencil): ?Stencil
+    {
+        $existingStencil = $this->getStencilByHandle($stencil->handle);
+
+        if ($existingStencil && (!$stencil->id || $stencil->id != $existingStencil->id)) {
+            return $existingStencil;
+        }
+
+        return null;
+    }
+
+    private function _clearStencilCache(): void
+    {
+        $this->_stencils = null;
+    }
+
+    private function _createStencilsQuery(bool $withTrashed = false): Query
+    {
+        $select = [
+            'id',
+            'name',
+            'handle',
+            'scope',
+            'data',
+            'templateId',
+            'redirectEntryId',
+            'redirectEntrySiteId',
+            'defaultStatusId',
+            'dateDeleted',
+            'uid',
+        ];
+
+        $query = (new Query())
+            ->select($select)
+            ->orderBy(['scope' => SORT_ASC, 'name' => SORT_ASC])
+            ->from([Table::FORMIE_STENCILS]);
+
+        if (!$withTrashed) {
+            $query->where(['dateDeleted' => null]);
+        }
+
+        return $query;
+    }
+
+    private function _getStencilsRecord(string $uid): StencilRecord
+    {
+        /** @var StencilRecord $stencil */
+        if ($stencil = StencilRecord::findWithTrashed()->where(['uid' => $uid])->one()) {
+            return $stencil;
+        }
+
+        return new StencilRecord();
+    }
+}

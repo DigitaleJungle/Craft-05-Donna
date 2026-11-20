@@ -1,0 +1,48 @@
+{% extends 'formie/_layouts/integrations/plugin-settings' %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% block content %}
+
+{% if integration.uid %}
+    {{ macros.proxyField(fieldVariables, 'textField', {
+        readonly: true,
+        label: 'Webhook URL' | t('formie'),
+        instructions: 'Use this URL when setting up webhooks for your {name} account.' | t('formie'),
+        value: integration.getWebhookUrl(),
+    }) }}
+{% endif %}
+
+{{ macros.proxyField(fieldVariables, 'autosuggestField', {
+    label: 'Access Token' | t('formie'),
+    instructions: 'Enter your {name} {label} here.' | t('formie'),
+    name: 'accessToken',
+    required: true,
+    suggestEnvVars: true,
+    value: integration.settings.accessToken ?? '',
+    warning: macros.configWarning('accessToken', 'formie'),
+    errors: integration.getErrors('accessToken'),
+}) }}
+
+{{ macros.proxyField(fieldVariables, 'booleanMenuField', {
+    label: 'Use Sandbox' | t('formie'),
+    instructions: 'Whether to use the {name} sandbox.' | t('formie'),
+    name: 'useSandbox',
+    includeEnvVars: true,
+    value: integration.settings.useSandbox ?? false,
+    warning: macros.configWarning('useSandbox', 'formie'),
+    errors: integration.getErrors('useSandbox'),
+}) }}
+
+{{ macros.proxyField(fieldVariables, 'autosuggestField', {
+    label: 'Webhook Signing Secret' | t('formie'),
+    instructions: 'Enter your {name} {label} here.' | t('formie'),
+    name: 'webhookSecretKey',
+    suggestEnvVars: true,
+    value: integration.settings.webhookSecretKey ?? '',
+    warning: macros.configWarning('webhookSecretKey', 'formie'),
+    errors: integration.getErrors('webhookSecretKey'),
+}) }}
+
+{% endblock %}

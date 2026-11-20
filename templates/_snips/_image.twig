@@ -1,0 +1,25 @@
+{% set class = class ~ ' overflow-hidden' %}
+{% set attributes = (attributes ?? {})|merge({
+    width: asset.getWidth(size), 
+    height: asset.getHeight(size),
+    class,
+}) %}
+
+<picture {{ attr(attributes) }}>
+    {% if link|length %}
+        <a href="{{ link }}" {{ gallery ? 'data-gallery='~gallery : '' }}>
+
+    {% endif %}
+        <img 
+            src="{{ asset.getUrl( size ) }}"
+            width="{{ asset.getWidth( size ) }}"
+            height="{{ asset.getHeight( size ) }}"
+            alt="{{ asset.alt ?? asset.title }}"
+            loading="{{ loading ?? 'lazy' }}"
+            sizes="{{ size }}"
+        >
+
+    {% if link|length %}
+        </a>
+    {% endif %}
+</picture>

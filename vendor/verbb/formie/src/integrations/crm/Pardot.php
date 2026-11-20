@@ -1,0 +1,801 @@
+<?php
+namespace verbb\formie\integrations\crm;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\Crm;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\OptionsField;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\ModifyFieldIntegrationValueEvent;
+use verbb\formie\events\ModifyPayloadEvent;
+use verbb\formie\fields\values\MultiOptionFieldValue;
+use verbb\formie\fields\values\OptionValue;
+use verbb\formie\fields\values\SingleOptionFieldValue;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Psr7\Query;
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\models\Token;
+use verbb\auth\providers\Salesforce as SalesforceProvider;
+
+class Pardot extends Crm implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return SalesforceProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'Pardot';
+    }
+
+    private static function _getApiCompatibilityError(mixed $response): ?string
+    {
+        if (!is_array($response)) {
+            return null;
+        }
+
+        $attributes = $response['@attributes'] ?? [];
+        $errCode = (int)($attributes['err_code'] ?? $response['err_code'] ?? 0);
+        $err = strtolower((string)($response['err'] ?? ''));
+
+        if ($errCode === 89 || str_contains($err, 'unable to use version 4')) {
+            return Craft::t('formie', 'Your Pardot account does not support API v4. Formie requires Account Engagement (Salesforce Pardot). The legacy Pardot Classic app (pi.pardot.com) is not supported.');
+        }
+
+        return null;
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_FORM_HANDLER_PAYLOAD = 'modifyFormHandlerPayload';
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $businessUnitId = null;
+    public bool|string $useSandbox = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToProspect = false;
+
+    #[FormIntegrationSetting]
+    public bool $mapToOpportunity = false;
+
+    #[FormIntegrationSetting]
+    public bool $enableFormHandler = false;
+
+    #[FormIntegrationSetting]
+    public ?array $prospectFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?array $opportunityFieldMapping = null;
+
+    #[FormIntegrationSetting]
+    public ?string $endpointUrl = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function init(): void
+    {
+        parent::init();
+
+        // Apply Pardot's array encoding to both direct lookups and outgoing mapping batches.
+        $this->on(self::EVENT_MODIFY_FIELD_MAPPING_VALUE, function(ModifyFieldIntegrationValueEvent $event) {
+            if ($event->integrationField->getType() === IntegrationField::TYPE_ARRAY && is_array($event->value)) {
+                $event->value = implode(';', $event->value);
+            }
+        });
+    }
+
+    public function getUseSandbox(): string
+    {
+        return App::parseBooleanEnv($this->useSandbox);
+    }
+
+    public function getBusinessUnitId(): string
+    {
+        return App::parseEnv($this->businessUnitId);
+    }
+
+    public function getApiDomain(): string
+    {
+        $prefix = $this->getUseSandbox() ? 'pi.demo' : 'pi';
+
+        return "https://{$prefix}.pardot.com/api";
+    }
+
+    public function getBaseApiUrl(?Token $token): ?string
+    {
+        return rtrim($this->getApiDomain(), '/') . '/';
+    }
+
+    public function getOAuthProviderConfig(): array
+    {
+        $config = parent::getOAuthProviderConfig();
+        $config['baseApiUrl'] = fn(?Token $token) => $this->getBaseApiUrl($token);
+
+        return $config;
+    }
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Manage your {name} customers by providing important information on their conversion on your site.', ['name' => static::displayName()]);
+    }
+
+    public function getAuthorizationUrlOptions(): array
+    {
+        $options = parent::getAuthorizationUrlOptions();
+
+        $options['scope'] = [
+            'pardot_api',
+            'refresh_token',
+        ];
+
+        return $options;
+    }
+
+    public function request(string $method, string $uri, array $options = []): mixed
+    {
+        $options['headers']['Pardot-Business-Unit-Id'] = $this->getBusinessUnitId();
+        $options['query']['format'] = 'json';
+
+        return parent::request($method, $uri, $options);
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToProspect && $this->settingsContext->dataKey === 'prospect') {
+                $response = $this->request('GET', 'customField/version/4/do/query');
+                $fields = $response['result']['customField'] ?? [];
+
+                $booleanOptions = [
+                    [
+                        'label' => Craft::t('formie', 'Yes'),
+                        'value' => true,
+                    ],
+                    [
+                        'label' => Craft::t('formie', 'No'),
+                        'value' => false,
+                    ],
+                ];
+
+                $settings['prospect'] = array_merge([
+                    new IntegrationField([
+                        'handle' => 'list_id',
+                        'name' => Craft::t('formie', 'Segmentation List'),
+                        'options' => [
+                            'label' => Craft::t('formie', 'Lists'),
+                            'options' => array_map(function($list) {
+                                return [
+                                    'label' => $list['name'],
+                                    'value' => $list['id'],
+                                ];
+                            }, $this->request('GET', 'list/version/4/do/query')['result']['list'] ?? []),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'salutation',
+                        'name' => Craft::t('formie', 'Salutation'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'first_name',
+                        'name' => Craft::t('formie', 'First Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'last_name',
+                        'name' => Craft::t('formie', 'Last Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'email',
+                        'name' => Craft::t('formie', 'Email'),
+                        'required' => true,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'password',
+                        'name' => Craft::t('formie', 'Password'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'company',
+                        'name' => Craft::t('formie', 'Company'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'prospect_account_id',
+                        'name' => Craft::t('formie', 'Prospect Account Id'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Prospect Accounts'),
+                            'options' => array_map(function($prospectAccount) {
+                                return [
+                                    'label' => $prospectAccount['name'],
+                                    'value' => $prospectAccount['id'],
+                                ];
+                            }, $this->request('GET', 'prospectAccount/version/4/do/query')['result']['prospectAccount'] ?? []),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'website',
+                        'name' => Craft::t('formie', 'Website'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'job_title',
+                        'name' => Craft::t('formie', 'Job Title'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'department',
+                        'name' => Craft::t('formie', 'Department'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'country',
+                        'name' => Craft::t('formie', 'Country'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'address_one',
+                        'name' => Craft::t('formie', 'Address Line 1'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'address_two',
+                        'name' => Craft::t('formie', 'Address Line 2'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'city',
+                        'name' => Craft::t('formie', 'City'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'state',
+                        'name' => Craft::t('formie', 'State'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'territory',
+                        'name' => Craft::t('formie', 'Territory'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'zip',
+                        'name' => Craft::t('formie', 'ZIP / Postal Code'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'phone',
+                        'name' => Craft::t('formie', 'Phone'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'fax',
+                        'name' => Craft::t('formie', 'Fax'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'source',
+                        'name' => Craft::t('formie', 'Source'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'annual_revenue',
+                        'name' => Craft::t('formie', 'Annual Revenue'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'employees',
+                        'name' => Craft::t('formie', 'Employees'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'industry',
+                        'name' => Craft::t('formie', 'Industry'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'years_in_business',
+                        'name' => Craft::t('formie', 'Years in Business'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'comments',
+                        'name' => Craft::t('formie', 'Comments'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'notes',
+                        'name' => Craft::t('formie', 'Notes'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'score',
+                        'name' => Craft::t('formie', 'Score'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'is_do_not_email',
+                        'name' => Craft::t('formie', 'Do Not Email'),
+                        'type' => IntegrationField::TYPE_BOOLEAN,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Do Not Email'),
+                            'options' => $booleanOptions,
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'is_do_not_call',
+                        'name' => Craft::t('formie', 'Do Not Call'),
+                        'type' => IntegrationField::TYPE_BOOLEAN,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Do Not Call'),
+                            'options' => $booleanOptions,
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'is_reviewed',
+                        'name' => Craft::t('formie', 'Reviewed'),
+                        'type' => IntegrationField::TYPE_BOOLEAN,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Reviewed'),
+                            'options' => $booleanOptions,
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'is_archived',
+                        'name' => Craft::t('formie', 'Archived'),
+                        'type' => IntegrationField::TYPE_BOOLEAN,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Archived'),
+                            'options' => $booleanOptions,
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'is_starred',
+                        'name' => Craft::t('formie', 'Starred'),
+                        'type' => IntegrationField::TYPE_BOOLEAN,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Starred'),
+                            'options' => $booleanOptions,
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'campaign_id',
+                        'name' => Craft::t('formie', 'Campaign ID'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                        'options' => [
+                            'label' => Craft::t('formie', 'Campaigns'),
+                            'options' => array_map(function($campaign) {
+                                return [
+                                    'label' => $campaign['name'],
+                                    'value' => $campaign['id'],
+                                ];
+                            }, $this->request('GET', 'campaign/version/4/do/query')['result']['campaign'] ?? []),
+                        ],
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'profile',
+                        'name' => Craft::t('formie', 'Profile'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'assign_to',
+                        'name' => Craft::t('formie', 'Assign To'),
+                    ]),
+                ], $this->_getCustomFields($fields));
+            }
+
+            if ($this->mapToOpportunity && $this->settingsContext->dataKey === 'opportunity') {
+                $settings['opportunity'] = [
+                    new IntegrationField([
+                        'handle' => 'name',
+                        'name' => Craft::t('formie', 'Name'),
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'value',
+                        'name' => Craft::t('formie', 'Value'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'probability',
+                        'name' => Craft::t('formie', 'Probability'),
+                        'type' => IntegrationField::TYPE_NUMBER,
+                    ]),
+                    new IntegrationField([
+                        'handle' => 'prospect_email',
+                        'name' => Craft::t('formie', 'Prospect Email'),
+                    ]),
+                ];
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function populateContext(): void
+    {
+        parent::populateContext();
+
+        if (!isset($this->context['pardot_tracking']) || !$this->context['pardot_tracking']) {
+            $trackingData = [];
+            $pattern = '/^visitor_id[0-9]+(-hash)?$/';
+
+            foreach ($_COOKIE as $key => $value) {
+                if (preg_match($pattern, $key)) {
+                    $trackingData[$key] = $value;
+                }
+            }
+
+            $this->context['pardot_tracking'] = $trackingData;
+        }
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $prospectValues = $this->getFieldMappingValues($submission, $this->prospectFieldMapping, 'prospect');
+            $opportunityValues = $this->getFieldMappingValues($submission, $this->opportunityFieldMapping, 'opportunity');
+
+            if ($this->mapToProspect) {
+                // Remove a segmented list ID, if picked
+                $listId = ArrayHelper::remove($prospectValues, 'list_id');
+
+                $prospectPayload = $this->_prepPayload($prospectValues);
+                $emailSegment = StringHelper::encodePathSegment($prospectPayload['email']);
+
+                // It'd be great to use `upsert/email/{email}` but that always creates a new prospect - useless!!
+                // https://developer.salesforce.com/docs/marketing/pardot/guide/prospects-v4.html#prospect-upsert
+                // Even more annoying it throws an error if the email wasn't found...
+                try {
+                    $response = $this->request('GET', "prospect/version/4/do/read/email/{$emailSegment}");
+
+                    // This can either be a single prospect, or multiple prospects
+                    $prospectId = $response['prospect']['id'] ?? $response['prospect'][0]['id'] ?? '';
+
+                    if ($prospectId) {
+                        $prospectIdSegment = StringHelper::encodePathSegment($prospectId);
+                        $response = $this->deliverPayload($submission, "prospect/version/4/do/update/id/{$prospectIdSegment}", $prospectPayload, 'POST', 'form_params');
+                    } else {
+                        $response = $this->deliverPayload($submission, "prospect/version/4/do/create/{$emailSegment}", $prospectPayload, 'POST', 'form_params');
+                    }
+                } catch (Throwable $e) {
+                    $response = $this->deliverPayload($submission, "prospect/version/4/do/create/{$emailSegment}", $prospectPayload, 'POST', 'form_params');
+                }
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $prospectId = $response['prospect']['id'] ?? '';
+
+                if (!$prospectId) {
+                    if ($message = self::_getApiCompatibilityError($response)) {
+                        Integration::error($this, $message, true);
+
+                        return $this->resultForPayload(false);
+                    }
+
+                    Integration::error($this, Craft::t('formie', 'Missing return “prospectId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($prospectPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+
+                // If there was a segmented list to add the prospect to...
+                if ($listId) {
+                    try {
+                        $listIdSegment = StringHelper::encodePathSegment($listId);
+                        $prospectIdSegment = StringHelper::encodePathSegment($prospectId);
+                        $this->deliverPayload($submission, "listMembership/version/4/do/create/list_id/{$listIdSegment}/{$prospectIdSegment}", [
+                            'list_id' => $listId,
+                            'prospect_id' => $prospectId,
+                        ], 'POST', 'form_params');
+                    } catch (Throwable $e) {
+                        // An error will indicate they're already part of the list, so ignore
+                    }
+                }
+            }
+
+            if ($this->mapToOpportunity) {
+                $opportunityPayload = $this->_prepPayload($opportunityValues);
+
+                $response = $this->deliverPayload($submission, 'opportunity/version/4/do/create', $opportunityPayload, 'POST', 'form_params');
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $opportunityId = $response['opportunity']['id'] ?? '';
+
+                if (!$opportunityId) {
+                    if ($message = self::_getApiCompatibilityError($response)) {
+                        Integration::error($this, $message, true);
+
+                        return $this->resultForPayload(false);
+                    }
+
+                    Integration::error($this, Craft::t('formie', 'Missing return “opportunityId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($opportunityPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+
+            if ($this->enableFormHandler) {
+                // Generate flat payload values to send
+                $payload = $this->generatePayloadValues($submission);
+                $formHandlerPayload = ArrayHelper::filterNull($this->_prepareFormHandlerPayload($submission, $payload));
+
+                // Form handlers must not receive the OAuth credentials used by
+                // Pardot's provider API client.
+                $response = $this->requestPublicEndpoint('POST', $this->endpointUrl, [
+                    'headers' => [
+                        'Content-Type' => 'application/x-www-form-urlencoded',
+                    ],
+                    'body' => Query::build($formHandlerPayload, PHP_QUERY_RFC1738),
+                ]);
+
+                if (is_string($response) && str_contains($response, 'Please correct the following errors')) {
+                    Integration::error($this, Craft::t('formie', 'Error in form handler response {response}. Sent payload {payload}', [
+                        'response' => $response,
+                        'payload' => Json::encode($formHandlerPayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['businessUnitId'], 'required'];
+
+        $prospect = $this->getConfigValue('prospect');
+        $opportunity = $this->getConfigValue('opportunity');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['prospectFieldMapping'], 'validateFieldMapping', 'params' => $prospect, 'when' => function($model) {
+                return $model->enabled && $model->mapToProspect;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['opportunityFieldMapping'], 'validateFieldMapping', 'params' => $opportunity, 'when' => function($model) {
+                return $model->enabled && $model->mapToOpportunity;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        $rules[] = [
+            ['endpointUrl'], 'required', 'when' => function($model) {
+                return $model->enabled && $model->enableFormHandler;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToProspect',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Prospect']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Prospects']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'prospectFieldMapping',
+            'if' => 'mapToProspect',
+            'dataLabel' => 'Prospect',
+            'dataKey' => 'prospect',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToOpportunity',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Opportunity']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Opportunities']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'opportunityFieldMapping',
+            'if' => 'mapToOpportunity',
+            'dataLabel' => 'Opportunity',
+            'dataKey' => 'opportunity',
+        ]);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'enableFormHandler',
+            'label' => Craft::t('formie', 'Enable Form Handler'),
+            'instructions' => Craft::t('formie', 'Whether to submit this form data to your Pardot form handler endpoint.'),
+        ]);
+        $schema[] = SchemaHelper::textField([
+            'name' => 'endpointUrl',
+            'label' => Craft::t('formie', 'Form Handler URL'),
+            'instructions' => Craft::t('formie', 'The Pardot form handler endpoint URL to post payloads to.'),
+            'if' => 'enableFormHandler',
+            'required' => true,
+        ]);
+
+        return $schema;
+    }
+
+    protected function generatePayloadValues(Submission $submission): array
+    {
+        $payloadData = $this->generateSubmissionPayloadValues($submission);
+
+        $payload = $payloadData['submission'] ?? [];
+
+        // Option fields are encoded as option objects (or arrays of them) for JSON export. Flattening
+        // those produces keys like `Industry.value` or `Services.0.value`. Provide scalar field names
+        // while preserving legacy single-select mappings. Keep multi-select values in their established
+        // semicolon-delimited event format; they are expanded for transport after listeners run.
+        foreach ($submission->getFields() as $field) {
+            if ($field->getIsCosmetic() || !$field instanceof OptionsField) {
+                continue;
+            }
+
+            $value = $submission->getFieldValue($field->handle);
+
+            if ($field->multi) {
+                $values = [];
+
+                if ($value instanceof MultiOptionFieldValue) {
+                    $values = $value->values();
+                } elseif (is_iterable($value)) {
+                    foreach ($value as $item) {
+                        if ($item instanceof OptionValue) {
+                            $values[] = (string)$item->value;
+                        } elseif (is_array($item) && array_key_exists('value', $item)) {
+                            $values[] = (string)$item['value'];
+                        } elseif ($item !== null && $item !== '') {
+                            $values[] = (string)$item;
+                        }
+                    }
+                }
+
+                $payload[$field->handle] = implode(';', $values);
+            } else {
+                $payload[$field->handle] = $value instanceof SingleOptionFieldValue || $value instanceof OptionValue
+                    ? (string)$value->value
+                    : (string)$field->getValueAsString($value, $submission);
+
+                // Existing handlers may still require the pre-3.1.38 external name, e.g. country.value.
+                // Add the alias before the payload event so listeners can override or remove it.
+                $payload[$field->handle . '.value'] = $payload[$field->handle];
+            }
+        }
+
+        // Flatten array to dot-notation
+        $payload = ArrayHelper::flatten($payload);
+
+        // Add in cookie tracking support, if available
+        $trackingData = $this->context['pardot_tracking'] ?? [];
+        $payload = array_merge($payload, $trackingData);
+
+        // Fire a 'modifyPayload' event
+        $event = new ModifyPayloadEvent([
+            'submission' => $submission,
+            'payload' => $payload,
+        ]);
+        $this->trigger(self::EVENT_MODIFY_FORM_HANDLER_PAYLOAD, $event);
+
+        return $event->payload;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _prepareFormHandlerPayload(Submission $submission, array $payload): array
+    {
+        // Pardot requires one same-name parameter per selected option. Only expand Formie's unchanged
+        // generated value so listeners can still replace or remove the semicolon-delimited field.
+        foreach ($submission->getFields() as $field) {
+            if ($field->getIsCosmetic() || !$field instanceof OptionsField || !$field->multi || !array_key_exists($field->handle, $payload)) {
+                continue;
+            }
+
+            $value = $submission->getFieldValue($field->handle);
+            $values = [];
+
+            if ($value instanceof MultiOptionFieldValue) {
+                $values = $value->values();
+            } elseif (is_iterable($value)) {
+                foreach ($value as $item) {
+                    if ($item instanceof OptionValue) {
+                        $values[] = (string)$item->value;
+                    } elseif (is_array($item) && array_key_exists('value', $item)) {
+                        $values[] = (string)$item['value'];
+                    } elseif ($item !== null && $item !== '') {
+                        $values[] = (string)$item;
+                    }
+                }
+            }
+
+            if ($payload[$field->handle] === implode(';', $values)) {
+                $payload[$field->handle] = $values;
+            }
+        }
+
+        return $payload;
+    }
+
+    private function _prepPayload($fields)
+    {
+        $payload = $fields;
+
+        // Check to see if the ownerId is an email, special handling for that
+        $ownerId = $payload['OwnerId'] ?? '';
+
+        if ($ownerId && str_contains($ownerId, '@')) {
+            $ownerId = ArrayHelper::remove($payload, 'OwnerId');
+
+            $payload['Owner'] = [
+                'attributes' => ['type' => 'User'],
+                'Email' => $ownerId,
+            ];
+        }
+
+        return $payload;
+    }
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'Checkbox' => IntegrationField::TYPE_ARRAY,
+            'Multi-Select' => IntegrationField::TYPE_ARRAY,
+            'Number' => IntegrationField::TYPE_NUMBER,
+            'Date' => IntegrationField::TYPE_DATE,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $fields, array $excludeNames = []): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $field) {
+            $type = $field['type'] ?? null;
+
+            if (!$type) {
+                continue;
+            }
+
+            $customFields[] = new IntegrationField([
+                'handle' => $field['field_id'],
+                'name' => $field['name'],
+                'type' => $this->_convertFieldType($type),
+                'sourceType' => $type,
+            ]);
+        }
+
+        return $customFields;
+    }
+}

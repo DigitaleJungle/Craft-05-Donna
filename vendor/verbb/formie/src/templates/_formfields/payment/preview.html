@@ -1,0 +1,21 @@
+<div className="formie-field-preview-layout-payment">
+    <div className="formie-field-preview-control">
+        <input
+            type="text"
+            className="formie-field-preview-input"
+            placeholder={Craft.t('formie', 'Card Number')}
+            value={field.defaultValue || ''}
+            readOnly
+        />
+    </div>
+
+    <div className="formie-field-preview-control formie-field-preview-control--payment-meta">
+        <input
+            type="text"
+            className="formie-field-preview-input"
+            placeholder={Craft.t('formie', 'MM / YY CVC')}
+            value=""
+            readOnly
+        />
+    </div>
+</div>

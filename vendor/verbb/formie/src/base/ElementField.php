@@ -1,0 +1,1495 @@
+<?php
+namespace verbb\formie\base;
+
+use verbb\formie\base\Element as ElementIntegration;
+use verbb\formie\elements\Form;
+use verbb\formie\elements\Submission;
+use verbb\formie\events\ModifyElementFieldQueryEvent;
+use verbb\formie\fields\conditions\ElementFieldConditionRule;
+use verbb\formie\fields\definitions\FieldReferenceValue;
+use verbb\formie\fields\definitions\FieldValueType;
+use verbb\formie\fields\traits\PresentationFieldConfigTrait;
+use verbb\formie\fields\traits\SearchableDropdownFieldTrait;
+use verbb\formie\fields\values\MultiOptionFieldValue;
+use verbb\formie\fields\values\OptionValue;
+use verbb\formie\fields\values\SingleOptionFieldValue;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\FieldBuilderPolicy;
+use verbb\formie\helpers\StringHelper;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\OptionSource;
+use verbb\formie\models\SlotTag;
+use verbb\formie\options\ElementOptionSourceHelper;
+use verbb\formie\options\OptionResolvableInterface;
+use verbb\formie\positions\Hidden as HiddenPosition;
+use verbb\formie\references\ReferenceType;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+use craft\base\conditions\ConditionInterface;
+use craft\base\Element;
+use craft\base\ElementInterface;
+use craft\db\Query;
+use craft\elements\conditions\ElementCondition;
+use craft\elements\conditions\ElementConditionInterface;
+use craft\elements\db\ElementQuery;
+use craft\elements\db\ElementQueryInterface;
+use craft\events\ElementCriteriaEvent;
+use craft\fields\Assets;
+use craft\fields\Categories;
+use craft\fields\Checkboxes;
+use craft\fields\Entries;
+use craft\fields\Matrix;
+use craft\fields\MultiSelect;
+use craft\fields\Table;
+use craft\fields\Tags as CraftTags;
+use craft\fields\Users;
+use craft\helpers\Cp;
+use craft\helpers\Gql as CraftGqlHelper;
+use craft\helpers\Html;
+use craft\helpers\Json;
+use craft\records\EntryType as EntryTypeRecord;
+use craft\services\Elements;
+use craft\services\ElementSources;
+use craft\services\Gql as CraftGqlService;
+
+use yii\base\Event;
+use yii\db\ExpressionInterface;
+
+use ArrayAccess;
+use ReflectionClass;
+use ReflectionProperty;
+use Throwable;
+
+use Faker\Generator as FakerFactory;
+use GraphQL\Type\Definition\Type;
+use Illuminate\Support\Collection;
+
+abstract class ElementField extends Field implements DisplayTypeFieldInterface, ElementFieldInterface, OptionResolvableInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    abstract public static function elementType(): string;
+
+    public static function getOptionSourceDefinition(): ?array
+    {
+        $definition = static::defineOptionSource();
+
+        if ($definition === null) {
+            return null;
+        }
+
+        $handle = trim((string)($definition['handle'] ?? ''));
+
+        if ($handle === '') {
+            return null;
+        }
+
+        return [
+            'handle' => $handle,
+            'label' => trim((string)($definition['label'] ?? static::displayName())),
+        ];
+    }
+
+    public static function queryCondition(array $instances, mixed $value, array &$params): array|string|ExpressionInterface|false|null
+    {
+        $values = [];
+
+        if (is_array($value)) {
+            foreach ($value as $element) {
+                if ($element instanceof ElementInterface) {
+                    $values[] = $element->id;
+                }
+
+                if (is_int($element)) {
+                    $values[] = $element;
+                }
+            }
+        }
+
+        if ($value instanceof ElementInterface) {
+            $values[] = $value->id;
+        }
+
+        if (is_int($value)) {
+            $values[] = $value;
+        }
+
+        return parent::queryCondition($instances, Json::encode($values), $params);
+    }
+
+    protected static function defineOptionSource(): ?array
+    {
+        return null;
+    }
+
+    protected static function gqlElementContentTypeDefinitionFromConfig(array $config, Type $elementType, array $arguments, string $resolverClass): array
+    {
+        return [
+            'name' => $config['handle'] ?? '',
+            'type' => Type::nonNull(Type::listOf($elementType)),
+            'args' => $arguments,
+            'resolve' => $resolverClass . '::resolve',
+            'complexity' => CraftGqlHelper::relatedArgumentComplexity(CraftGqlService::GRAPHQL_COMPLEXITY_EAGER_LOAD),
+        ];
+    }
+
+    protected static function gqlElementContentMutationArgumentTypeDefinitionFromConfig(array $config): array
+    {
+        return [
+            'name' => $config['handle'] ?? '',
+            'type' => Type::listOf(Type::int()),
+            'description' => $config['instructions'] ?? null,
+        ];
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    public const EVENT_MODIFY_ELEMENT_QUERY = 'modifyElementQuery';
+    public const EVENT_DEFINE_SELECTION_CRITERIA = 'defineSelectionCriteria';
+
+
+    // Traits
+    // =========================================================================
+
+    use PresentationFieldConfigTrait;
+    use SearchableDropdownFieldTrait;
+
+
+    // Properties
+    // =========================================================================
+
+    public string|array|null $sources = '*';
+    public ?string $source = null;
+    public bool $allowMultipleSources = true;
+    public bool $limit = false;
+    public ?string $optionLimit = null;
+    public string $displayType = 'dropdown';
+    public string $labelSource = 'title';
+    public string $orderBy = 'title ASC';
+    public bool $multi = false;
+    public ?string $layout = 'vertical';
+    public string $sourceType = 'groups';
+    public array $sourceElements = [];
+
+    protected ?ElementQuery $elementsQuery = null;
+    protected ?string $cpInputJsClass = null;
+    protected string $cpInputTemplate = '_includes/forms/elementSelect';
+
+    private array|null|ElementConditionInterface $_selectionCondition = null;
+    private array $_sourceConditions = [];
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct($config = [])
+    {
+        // Normalize the options
+        if (array_key_exists('multiple', $config)) {
+            $config['multi'] = ArrayHelper::remove($config, 'multiple');
+        }
+
+        parent::__construct($config);
+    }
+
+    public function settingsAttributes(): array
+    {
+        $attributes = parent::settingsAttributes();
+        $attributes[] = 'sources';
+        $attributes[] = 'source';
+        $attributes[] = 'optionLimit';
+        $attributes[] = 'displayType';
+        $attributes[] = 'labelSource';
+        $attributes[] = 'orderBy';
+        $attributes[] = 'multi';
+        $attributes[] = 'layout';
+        $attributes[] = 'sourceType';
+        $attributes[] = 'sourceElements';
+        $attributes[] = 'useSearchable';
+        $attributes[] = 'searchableOptionLimit';
+
+        return $attributes;
+    }
+
+    public function isValueEmpty(mixed $value, ?ElementInterface $element): bool
+    {
+        if ($value instanceof ElementQueryInterface) {
+            return !$value->exists();
+        }
+
+        return $value->isEmpty();
+    }
+
+    public function isSearchableField(): bool
+    {
+        // Element-backed fields can trigger expensive relation queries while indexing.
+        return false;
+    }
+
+    public function normalizeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        if ($value instanceof ElementQueryInterface) {
+            return $value;
+        }
+
+        $query = static::elementType()::find();
+
+        // Restrict elements to be on the current site, for multi-sites
+        if (Craft::$app->getIsMultiSite()) {
+            $query->siteId($this->targetSiteId($element));
+        }
+
+        // Template population can supply a single ID, even for relational fields.
+        if (is_int($value) || (is_string($value) && ctype_digit($value))) {
+            $value = [$value];
+        }
+
+        if (is_array($value)) {
+            // Check if the array contains associative arrays with an 'id' key
+            if (isset($value[0]) && is_array($value[0]) && array_key_exists('id', $value[0])) {
+                $value = ArrayHelper::getColumn($value, 'id');
+            }
+
+            // Cleanup to ensure only valid IDs
+            $ids = array_values(array_filter($value, function($id) {
+                return !empty($id);
+            }));
+
+            $query->id($ids)->fixedOrder();
+        } else {
+            $query->id(false);
+        }
+
+        // Allow any status for now, probably refactor `modifyElementFieldQuery` for next breakpoint
+        $query->status(null);
+
+        return $query;
+    }
+
+    public function normalizeValueFromRequest(mixed $value, ?ElementInterface $element): mixed
+    {
+        if (!$element instanceof Submission) {
+            return $this->normalizeValue($value, $element);
+        }
+
+        [$ids, $invalid] = $this->_parseRequestedElementIds($value);
+
+        if ($invalid) {
+            $ids = [];
+        }
+
+        return $this->normalizeRequestedElementIds($ids, $element, $invalid);
+    }
+
+    public function serializeValueForClientInput(mixed $value, ?ElementInterface $element = null): mixed
+    {
+        return (clone $this->normalizeValue($value, $element))->ids();
+    }
+
+    public function getElementConditionRuleType(): array|string|null
+    {
+        return ElementFieldConditionRule::class;
+    }
+
+    public function getElementValidationRules(): array
+    {
+        $rules = parent::getElementValidationRules();
+        $rules[] = [$this->handle, 'validateRequestSelection', 'skipOnEmpty' => false];
+
+        return $rules;
+    }
+
+    public function validateRequestSelection(ElementInterface $element): void
+    {
+        if (!$element instanceof Submission) {
+            return;
+        }
+
+        if (!isset($element->getContentState()->invalidElementSelectionsByPath[$this->valueKey()])) {
+            return;
+        }
+
+        $element->addError($this->valueKey(), Craft::t('formie', 'Select only valid options.'));
+    }
+
+    public function getElementsQuery(): ElementQueryInterface
+    {
+        $query = static::elementType()::find();
+
+        // Restrict elements to be on the current site, for multi-sites
+        if (Craft::$app->getIsMultiSite()) {
+            $query->siteId(Craft::$app->getSites()->getCurrentSite()->id);
+        }
+
+        if ($this->sourceType === 'groups') {
+            $criteria = [];
+
+            $sources = $this->getInputSources();
+
+            if (is_array($sources)) {
+                foreach ($sources as $sourceKey) {
+                    $elementSource = ArrayHelper::firstWhere($this->availableSources(), 'key', $sourceKey);
+
+                    // Check for custom sources, which use conditions directly on the query
+                    if ($elementSource && ($elementSource['type'] ?? null) === ElementSources::TYPE_CUSTOM) {
+                        // Building rules inspects every entry field layout. Reuse them until the source config changes.
+                        $config = $elementSource['condition'];
+                        $cached = $this->_sourceConditions[$sourceKey] ?? null;
+
+                        if ($cached === null || $cached['config'] !== $config) {
+                            $cached = [
+                                'config' => $config,
+                                'condition' => Craft::$app->getConditions()->createCondition($config),
+                            ];
+                            $this->_sourceConditions[$sourceKey] = $cached;
+                        }
+
+                        $cached['condition']->modifyQuery($query);
+                    } elseif (str_contains($sourceKey, 'type:')) {
+                        // Special-case for entries, maybe redactor?
+                        $entryTypeUid = str_replace('type:', '', $sourceKey);
+                        $entryType = EntryTypeRecord::find()->where(['uid' => $entryTypeUid])->one();
+
+                        if ($entryType) {
+                            $criteria[] = ['typeId' => $entryType->id];
+                        }
+                    } else {
+                        $sourceCriteria = $elementSource['criteria'] ?? [];
+
+                        // Remove anything we don't need/want
+                        unset($sourceCriteria['editable']);
+
+                        $criteria[] = $sourceCriteria;
+                    }
+                }
+            }
+
+            // Merge here for performance
+            $criteria = array_merge_recursive(...$criteria);
+
+            // Apply the criteria on our query
+            Craft::configure($query, $criteria);
+        } elseif ($this->sourceType === 'elements') {
+            $query->id(ArrayHelper::getColumn($this->sourceElements, 'id'));
+        }
+
+        // Ensure selected initial values survive option limits for render-time prefill/default cases.
+        $initialValue = $this->getInitialValue();
+
+        if ($initialValue && $this->optionLimit) {
+            $ids = [];
+
+            // Handle the two ways a default value can be set
+            if ($initialValue instanceof ElementQueryInterface) {
+                $ids = $initialValue->id;
+            } else {
+                $ids = ArrayHelper::getColumn($initialValue, 'id');
+
+                if (!$ids && is_array($initialValue)) {
+                    $ids = $initialValue;
+                }
+            }
+
+            if ($ids) {
+                $query->id($ids);
+            }
+        }
+
+        if ($this->optionLimit) {
+            $query->limit($this->optionLimit);
+        }
+
+        if ($this->orderBy) {
+            $orderBy = $this->_resolveOrderBy();
+
+            if ($orderBy !== null) {
+                $query->orderBy($orderBy);
+            }
+        }
+
+        // Allow any template-defined elementQuery to override
+        if ($this->elementsQuery) {
+            $query = $this->elementsQuery;
+        }
+
+        // Fire a 'modifyElementFieldQuery' event
+        $event = new ModifyElementFieldQueryEvent([
+            'query' => $query,
+            'field' => $this,
+        ]);
+        $this->trigger(self::EVENT_MODIFY_ELEMENT_QUERY, $event);
+
+        return $event->query;
+    }
+
+    public function getDefaultValueQuery()
+    {
+        $defaultValue = $this->getInitialValue() ?? '';
+
+        if ($defaultValue instanceof ElementQuery) {
+            $defaultValue = $defaultValue->all();
+        }
+
+        // If passing in a single ID, normalise it
+        if (!is_array($defaultValue)) {
+            $defaultValue = $defaultValue ? [['id' => $defaultValue]] : [];
+        }
+
+        // Just in case there are empty items
+        $defaultValue = array_filter($defaultValue);
+
+        if ($defaultValue) {
+            // Handle when setting via a multidimensional array with `id`
+            $ids = array_filter(ArrayHelper::getColumn($defaultValue, 'id'));
+
+            // If nothing found, we might be setting an array of IDs
+            if (!$ids) {
+                $ids = $defaultValue;
+            }
+
+            if ($ids) {
+                return static::elementType()::find()->id($ids);
+            }
+        }
+
+        return null;
+    }
+
+    public function getIsMultiDropdown(): bool
+    {
+        return ($this->displayType === 'dropdown' && $this->multi);
+    }
+
+    public function getPreviewElements(): array
+    {
+        $elementsService = Craft::$app->getElements();
+        $currentUser = Craft::$app->getUser()->getIdentity();
+        $options = [];
+        $total = 0;
+
+        // Element authorization can depend on PHP policy, so count and sample in one batched pass.
+        foreach ($this->getElementsQuery()->each() as $element) {
+            if (!$elementsService->canView($element, $currentUser)) {
+                continue;
+            }
+
+            $total++;
+
+            if (count($options) < 5) {
+                $options[] = ['label' => $this->getElementLabel($element), 'value' => $element->id];
+            }
+        }
+
+        return [
+            'total' => (string)$total,
+            'options' => $options,
+        ];
+    }
+
+    public function getPreviewHtml(mixed $value, ElementInterface $element): string
+    {
+        if ($value instanceof ElementQueryInterface) {
+            return Cp::elementPreviewHtml((clone $value)->all());
+        }
+
+        return '';
+    }
+
+    public function getInputTemplateVariables(Form $form, mixed $value): array
+    {
+        $inputOptions = parent::getInputTemplateVariables($form, $value);
+
+        $inputOptions['elementsQuery'] = $this->getElementsQuery();
+
+        return $inputOptions;
+    }
+
+    public function populateValue(mixed $value, ?Submission $submission): void
+    {
+        if ($value) {
+            if ($value instanceof ElementQuery) {
+                $query = $value;
+            } else {
+                $query = static::elementType()::find()->id($value);
+            }
+
+            // Ensure that disabled elements can be populated, just in case
+            $query->status(null);
+
+            // Rendering can use a different form instance from the saved submission.
+            // Its option query must see the selected value before applying the limit.
+            parent::populateValue($query, $this->getForm() ? null : $submission);
+        }
+    }
+
+    public function getFieldOptions(): array
+    {
+        return $this->getResolvedOptions();
+    }
+
+    public function getResolvedOptions(): array
+    {
+        $options = [];
+
+        foreach ($this->getElementsQuery()->all() as $element) {
+            // Important to cast as a string, otherwise Twig will struggle to compare
+            $options[] = ['label' => $this->getElementLabel($element), 'value' => (string)$element->id];
+        }
+
+        return $options;
+    }
+
+    public function toOptionSource(): ?OptionSource
+    {
+        $provider = ElementOptionSourceHelper::getProviderForFieldClass(static::class);
+
+        if (!$provider) {
+            return null;
+        }
+
+        return new OptionSource([
+            'type' => 'element',
+            'provider' => $provider,
+            'params' => $this->getOptionSourceParams(),
+        ]);
+    }
+
+    public function getDisplayTypeFieldConfig(): array
+    {
+        $config = [
+            'options' => $this->getFieldOptions(),
+            'hasMultiNamespace' => true,
+            'multi' => $this->multi,
+            'useSearchable' => $this->useSearchable,
+            'searchableOptionLimit' => $this->searchableOptionLimit,
+            'layout' => $this->layout,
+        ];
+
+        // Set the parent field and namespace, but in a specific way due to nested field handling.
+        if ($this->getParentField()) {
+            // Note the order here is important, due to Repeaters (and other nested fields)
+            // can set the namespace with `setParentFIeld()`, but we want to specifically use the
+            // namespace value we already have, which has already been set anyway.
+            $config['parentField'] = $this->getParentField();
+            $config['namespace'] = $this->getNamespace();
+        } else {
+            $config['namespace'] = $this->getNamespace();
+        }
+
+        // Grab just the properties for this field, defined in the base `Field` class
+        $class = new ReflectionClass($this);
+
+        foreach ($class->getProperties(ReflectionProperty::IS_PUBLIC) as $property) {
+            if (!$property->isStatic() && $property->class === Field::class) {
+                $config[$property->getName()] = $this->{$property->getName()};
+            }
+        }
+
+        return $config;
+    }
+
+    public function getPresentationDisplayType(): string
+    {
+        return $this->displayType;
+    }
+
+    public function getDisplayTypeField(): ?FieldInterface
+    {
+        return $this->resolvePresentationField(
+            $this->getPresentationDisplayType(),
+            $this->getDisplayTypeFieldConfig(),
+        );
+    }
+
+    public function getDisplayTypeValue(?ElementQuery $value): MultiOptionFieldValue|SingleOptionFieldValue|null
+    {
+        // Setup the default value, if the value is empty
+        if ($this->isValueEmpty($value, null)) {
+            if ($defaultValue = $this->getDefaultValueQuery()) {
+                $value = $defaultValue;
+            }
+        }
+
+        if ($this->displayType === 'checkboxes' || $this->getIsMultiDropdown()) {
+            $options = [];
+
+            foreach ((clone $value)->all() as $element) {
+                $options[] = new OptionValue($this->getElementLabel($element), $element->id, true);
+            }
+
+            return new MultiOptionFieldValue($options);
+        }
+
+        if ($this->displayType === 'radio') {
+            if ($element = $value->one()) {
+                return new SingleOptionFieldValue($this->getElementLabel($element), $element->id, true);
+            }
+
+            return null;
+        }
+
+        if ($this->displayType === 'dropdown') {
+            if ($element = $value->one()) {
+                return new SingleOptionFieldValue($this->getElementLabel($element), $element->id, true);
+            }
+
+            return null;
+        }
+
+        return $value;
+    }
+
+    public function setElementsQuery(?ElementQuery $query): void
+    {
+        $this->elementsQuery = $query;
+    }
+
+    public function defineLabelSourceOptions(): array
+    {
+        return [];
+    }
+
+    public function getLabelSourceOptions(): array
+    {
+        return array_merge([
+            ['value' => 'id', 'label' => Craft::t('app', 'ID')],
+        ], $this->defineLabelSourceOptions(), [
+            ['value' => 'dateCreated', 'label' => Craft::t('app', 'Date Created')],
+            ['value' => 'dateUpdated', 'label' => Craft::t('app', 'Date Updated')],
+        ]);
+    }
+
+    public function getOrderByOptions(): array
+    {
+        $options = [];
+
+        foreach ($this->getLabelSourceOptions() as $opt) {
+            $options[] = ['value' => $opt['value'] . ' ASC', 'label' => $opt['label'] . ' Ascending'];
+            $options[] = ['value' => $opt['value'] . ' DESC', 'label' => $opt['label'] . ' Descending'];
+        }
+
+        return $options;
+    }
+
+    public function getSourceOptions(): array
+    {
+        $options = array_map(fn($s) => [
+            'label' => $s['label'],
+            'value' => $s['key'],
+            'data' => [
+                'structure-id' => $s['structureId'] ?? null,
+            ],
+        ], $this->availableSources());
+
+        ArrayHelper::multisort($options, 'label', SORT_ASC, SORT_NATURAL | SORT_FLAG_CASE);
+
+        return $options;
+    }
+
+    public function getOptionSourceMode(): string
+    {
+        return $this->allowMultipleSources ? 'multiple' : 'single';
+    }
+
+    public function getOptionSourceParams(): array
+    {
+        $params = [
+            'labelSource' => $this->labelSource,
+            'orderBy' => $this->orderBy,
+        ];
+
+        if ($this->optionLimit) {
+            $params['optionLimit'] = $this->optionLimit;
+        }
+
+        if ($this->getOptionSourceMode() === 'multiple') {
+            $params['sources'] = $this->sources ?? '*';
+        } else {
+            $params['source'] = $this->source;
+        }
+
+        return $params;
+    }
+
+    public function getOptionSourceFieldConfig(array $params = []): array
+    {
+        $config = [];
+
+        if (!empty($params['labelSource'])) {
+            $config['labelSource'] = (string)$params['labelSource'];
+        }
+
+        if (!empty($params['orderBy'])) {
+            $config['orderBy'] = (string)$params['orderBy'];
+        }
+
+        if (!empty($params['optionLimit'])) {
+            $config['optionLimit'] = (string)$params['optionLimit'];
+        }
+
+        if ($this->getOptionSourceMode() === 'multiple') {
+            $sources = $params['sources'] ?? '*';
+
+            if (is_string($sources) && $sources !== '') {
+                $config['sources'] = $sources;
+            } elseif (is_array($sources) && $sources !== []) {
+                $config['sources'] = $sources;
+            } else {
+                $config['sources'] = '*';
+            }
+        } else {
+            $source = $params['source'] ?? null;
+
+            if (!$source && !empty($params['sources'])) {
+                $sources = $params['sources'];
+                $source = is_array($sources) ? ($sources[0] ?? null) : $sources;
+            }
+
+            if ($source) {
+                $config['source'] = (string)$source;
+            }
+        }
+
+        return $config;
+    }
+
+    public function getOptionSourceOptions(): array
+    {
+        return $this->getSourceOptions();
+    }
+
+    public function getOptionSourceOrderByOptions(): array
+    {
+        return $this->getOrderByOptions();
+    }
+
+    public function getOptionSourceWarning(array $sourceOptions): ?string
+    {
+        return $sourceOptions === []
+            ? Craft::t('formie', 'No sources available for this element type.')
+            : null;
+    }
+
+    public function getInputSources(?ElementInterface $element = null): array|string|null
+    {
+        if ($this->allowMultipleSources) {
+            $sources = $this->sources;
+        } else {
+            $sources = [$this->source];
+        }
+
+        return $sources;
+    }
+
+    public function getInputSelectionCriteria(): array
+    {
+        // Fire a 'defineSelectionCriteria event
+        if ($this->hasEventHandlers(self::EVENT_DEFINE_SELECTION_CRITERIA)) {
+            $event = new ElementCriteriaEvent();
+            $this->trigger(self::EVENT_DEFINE_SELECTION_CRITERIA, $event);
+
+            return $event->criteria;
+        }
+
+        return [];
+    }
+
+    public function getSelectionCondition(): ?ElementConditionInterface
+    {
+        if ($this->_selectionCondition !== null && !$this->_selectionCondition instanceof ConditionInterface) {
+            $condition = Craft::$app->getConditions()->createCondition($this->_selectionCondition);
+
+            if (!empty($condition->getConditionRules())) {
+                $this->_selectionCondition = $condition;
+            } else {
+                $this->_selectionCondition = null;
+            }
+        }
+
+        return $this->_selectionCondition;
+    }
+
+    public function setSelectionCondition(mixed $condition): void
+    {
+        if ($condition instanceof ConditionInterface && !$condition->getConditionRules()) {
+            $condition = null;
+        }
+
+        // Don't instantiate it unless we actually end up needing it.
+        // Avoids an infinite recursion bug (ElementCondition::selectableConditionRules() => getAllFields() => setSelectionCondition() => ...)
+        $this->_selectionCondition = $condition;
+    }
+
+    public function fieldKind(): string
+    {
+        $displayType = (string)($this->displayType ?? 'dropdown');
+
+        return match ($displayType) {
+            'radio' => self::KIND_RADIO_GROUP,
+            'checkboxes' => self::KIND_CHECKBOX_GROUP,
+            default => self::KIND_SELECT,
+        };
+    }
+
+    public function getIsMultiOptionsField(): bool
+    {
+        return false;
+    }
+
+    public function getSafeElementUrl(object $element, bool $forCp = false): ?string
+    {
+        $url = null;
+
+        if ($forCp && method_exists($element, 'getCpEditUrl')) {
+            $url = $element->getCpEditUrl();
+        }
+
+        if (!$forCp && method_exists($element, 'getUrl')) {
+            $url = $element->getUrl();
+        }
+
+        return StringHelper::sanitizeUrlAttribute(is_string($url) ? $url : null);
+    }
+
+    /**
+     * Resolve a variable-picker property against one related element.
+     *
+     * Handles Formie reference aliases (`url`, `cpUrl`, `__toString`) plus
+     * normal element attributes / ArrayAccess keys used by field subclasses.
+     */
+    public function resolveElementProperty(ElementInterface $element, string $property): mixed
+    {
+        $property = trim($property);
+
+        // Empty property = the field's formatted label (same as bare field token intent).
+        if ($property === '' || $property === '__toString') {
+            return $this->getElementLabel($element);
+        }
+
+        if ($property === 'url') {
+            return $this->getSafeElementUrl($element);
+        }
+
+        if ($property === 'cpUrl') {
+            return $this->getSafeElementUrl($element, true);
+        }
+
+        // Prefer ArrayAccess so custom fields and attributes resolve the Craft way.
+        if ($element instanceof ArrayAccess) {
+            try {
+                if (isset($element[$property])) {
+                    return $element[$property];
+                }
+            } catch (Throwable) {
+                // Fall through to attribute / dotted path access.
+            }
+        }
+
+        try {
+            if (isset($element->{$property})) {
+                return $element->{$property};
+            }
+        } catch (Throwable) {
+            // Ignore inaccessible dynamic properties.
+        }
+
+        if (str_contains($property, '.')) {
+            return ArrayHelper::getValue($element, $property);
+        }
+
+        return null;
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return array_merge(parent::getSettingGqlTypes(), $this->defineSearchableDropdownLimitGqlType(), [
+            'sources' => [
+                'name' => 'sources',
+                'type' => Type::string(),
+                'resolve' => function($field) {
+                    $value = $field->sources;
+
+                    return is_array($value) ? Json::encode($value) : $value;
+                },
+            ],
+            'source' => [
+                'name' => 'source',
+                'type' => Type::string(),
+            ],
+            'optionLimit' => [
+                'name' => 'optionLimit',
+                'type' => Type::string(),
+            ],
+            'displayType' => [
+                'name' => 'displayType',
+                'type' => Type::string(),
+            ],
+            'labelSource' => [
+                'name' => 'labelSource',
+                'type' => Type::string(),
+            ],
+            'orderBy' => [
+                'name' => 'orderBy',
+                'type' => Type::string(),
+            ],
+            'multi' => [
+                'name' => 'multi',
+                'type' => Type::boolean(),
+            ],
+            'useSearchable' => [
+                'name' => 'useSearchable',
+                'type' => Type::boolean(),
+            ],
+            'layout' => [
+                'name' => 'layout',
+                'type' => Type::string(),
+            ],
+            'defaultValue' => [
+                'name' => 'defaultValue',
+                'type' => Type::string(),
+                'resolve' => function($field) {
+                    $value = $field->defaultValue;
+
+                    return is_array($value) ? Json::encode($value) : $value;
+                },
+            ],
+        ]);
+    }
+
+    public function getContentGqlMutationArgumentType(): Type|array
+    {
+        return [
+            'name' => $this->handle,
+            'type' => Type::listOf(Type::int()),
+            'description' => $this->instructions->isEmpty() ? null : $this->instructions->toPlainText(),
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineValueType(): FieldValueType
+    {
+        return FieldValueType::relationQuery(static::elementType());
+    }
+
+    /**
+     * Accept only IDs the field currently offers, while allowing an existing
+     * submission to retain or remove historical selections that became unavailable.
+     */
+    protected function normalizeRequestedElementIds(array $ids, ?ElementInterface $element, bool $invalid = false, array $trustedIds = []): mixed
+    {
+        [$ids, $parseInvalid] = $this->_parseRequestedElementIds($ids);
+        [$trustedIds] = $this->_parseRequestedElementIds($trustedIds);
+        $invalid = $invalid || $parseInvalid;
+        $path = $this->valueKey();
+        $previousIds = $this->_previousElementIds($element);
+        $allowedIds = array_map('intval', (clone $this->getElementsQuery())->ids());
+        $allowed = array_fill_keys(array_merge($allowedIds, $previousIds, $trustedIds), true);
+        $acceptedIds = [];
+
+        foreach ($ids as $id) {
+            if (isset($allowed[$id])) {
+                $acceptedIds[] = $id;
+            } else {
+                $invalid = true;
+            }
+        }
+
+        if ($element instanceof Submission) {
+            if ($invalid) {
+                $element->getContentState()->invalidElementSelectionsByPath[$path] = true;
+            } else {
+                unset($element->getContentState()->invalidElementSelectionsByPath[$path]);
+            }
+        }
+
+        return $this->normalizeValue($acceptedIds, $element);
+    }
+
+    protected function defineValueForDb(mixed $value, ?ElementInterface $element): mixed
+    {
+        $query = clone $this->normalizeValue($value, $element);
+
+        return $query->status(null)->ids();
+    }
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        $form = $context->form;
+
+        $id = $this->getHtmlId($form);
+
+        if (in_array($this->displayType, ['checkboxes', 'radio'])) {
+            if ($key === 'fieldLayout') {
+                return SlotTag::make('fieldset')
+                    ->core([
+                        'data-formie-field-layout' => true,
+                        'data-formie-element-field-layout' => true,
+                        'data-formie-layout' => $this->layout ?? 'vertical',
+                        'aria-describedby' => $this->hasInstructions() ? "{$id}-instructions" : null,
+                    ])
+                    ->theme([
+                        'class' => [
+                            'formie-field-layout',
+                            'formie-element-field-layout',
+                            'formie-layout-' . ($this->layout ?? 'vertical'),
+                        ],
+                    ]);
+            }
+
+            if ($key === 'fieldLabel') {
+                $labelPosition = $context->get('labelPosition');
+
+                return SlotTag::make('legend')
+                    ->core([
+                        'data-formie-label' => true,
+                        'data-formie-field-label' => true,
+                        'data-formie-element-field-label' => true,
+                        'data-formie-sr-only' => $labelPosition instanceof HiddenPosition ? true : false,
+                    ])
+                    ->theme([
+                        'class' => [
+                            'formie-label',
+                            'formie-field-label',
+                            'formie-element-field-label',
+                            $labelPosition instanceof HiddenPosition ? 'formie-sr-only' : false,
+                        ],
+                    ]);
+            }
+        }
+
+        return parent::defineSlotTag($key, $context);
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        $displayType = (string)($this->displayType ?? 'dropdown');
+        $clientInput = parent::defineClientRenderedInput();
+        $clientInput['multiple'] = $this->getIsMultiOptionsField();
+
+        // Upload fields collect new assets and must not enumerate existing elements.
+        if (!$this->providesClientRenderedOptions()) {
+            return $clientInput;
+        }
+
+        $clientInput['layout'] = in_array($displayType, ['radio', 'checkboxes'], true) ? ($this->layout ?? 'vertical') : null;
+        $clientInput['useSearchable'] = $this->useSearchable;
+        $clientInput['searchableOptionLimit'] = $this->searchableOptionLimit;
+        $clientInput['options'] = array_values(array_map(static function(array $option) {
+            return [
+                'label' => $option['label'] ?? '',
+                'value' => $option['value'] ?? '',
+                'selected' => (bool)($option['default'] ?? false),
+                'disabled' => (bool)($option['disabled'] ?? false),
+            ];
+        }, $this->getFieldOptions()));
+
+        return $clientInput;
+    }
+
+    /**
+     * Whether the client-rendered definition lists elements visitors can select.
+     */
+    protected function providesClientRenderedOptions(): bool
+    {
+        return true;
+    }
+
+    protected function defineElementFieldMultiSelectAppearanceSchema(): array
+    {
+        return FieldBuilderPolicy::multiSelectDropdownSchema([
+            'if' => 'displayType == "dropdown"',
+        ]);
+    }
+
+    protected function defineElementFieldSearchableDropdownAppearanceSchema(): array
+    {
+        return [
+            $this->defineSearchableDropdownSettingSchema([
+                'if' => 'displayType == "dropdown"',
+            ]),
+            $this->defineSearchableDropdownLimitSettingSchema([
+                'if' => 'displayType == "dropdown" && useSearchable',
+            ]),
+        ];
+    }
+
+    protected function defineBrowserModules(): array
+    {
+        $modules = parent::defineBrowserModules();
+
+        foreach ($this->defineSearchableDropdownBrowserModules() as $module) {
+            $modules[] = $module;
+        }
+
+        return $modules;
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+        $rules = array_merge($rules, $this->defineSearchableDropdownRules());
+
+        return $rules;
+    }
+
+    protected function cpInputTemplateVariables(array|ElementQueryInterface $value = null, ?ElementInterface $element = null): array
+    {
+        return [
+            'id' => Html::id($this->handle),
+            'jsClass' => $this->cpInputJsClass,
+            'elementType' => static::elementType(),
+            'storageKey' => 'field.' . $this->id,
+            'condition' => [],
+            'criteria' => [],
+            'fieldId' => $this->id,
+            'selectionLabel' => Craft::t('formie', 'Choose'),
+            'name' => $this->handle,
+            'elements' => $value,
+            'sources' => $this->getInputSources($element),
+            'sourceElementId' => !empty($element->id) ? $element->id : null,
+            'showSiteMenu' => 'auto',
+            'viewMode' => 'list',
+            'limit' => $this->optionLimit ? $this->optionLimit : null,
+            'defaultPlacement' => 'end',
+            'modalSettings' => [
+                'defaultSiteId' => $element->siteId ?? null,
+            ],
+        ];
+    }
+
+    protected function defineSubmissionHtml(mixed $value, ?ElementInterface $element, bool $inline): string
+    {
+        // Ensure that the element query allows all statuses for the CP
+        $value = clone $value;
+        $value->status(null);
+
+        return Craft::$app->getView()->renderTemplate($this->cpInputTemplate, $this->cpInputTemplateVariables((clone $value)->all(), $element));
+    }
+
+    protected function availableSources(): array
+    {
+        $sources = ArrayHelper::where(
+            Craft::$app->getElementSources()->getSources(static::elementType(), 'modal'),
+            fn($s) => $s['type'] !== ElementSources::TYPE_HEADING
+        );
+
+        // Ensure that we always include a "All" option, even if people are removing it from sources in events
+        if ($this->allowMultipleSources) {
+            $hasAllSource = false;
+
+            foreach ($sources as $key => $source) {
+                if (isset($source['key']) && $source['key'] === '*') {
+                    $hasAllSource = true;
+                }
+            }
+
+            if (!$hasAllSource) {
+                array_unshift($sources, [
+                    'key' => '*',
+                    'label' => Craft::t('formie', 'All'),
+                ]);
+            }
+        }
+
+        return $sources;
+    }
+
+    protected function setPrePopulatedValue(mixed $value): array
+    {
+        $ids = [];
+
+        // Normalize setting from query param.
+        if (is_array($value)) {
+            $ids = array_values(array_filter($value));
+        } else {
+            $ids = [$value];
+        }
+
+        return $ids;
+    }
+
+    protected function normalizePrefillValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        return $this->normalizeValue($value, $element);
+    }
+
+    protected function defineValueAsString(mixed $value, ElementInterface $element = null): string
+    {
+        return implode(', ', array_map(function($item) {
+            return $this->getElementLabel($item);
+        }, (clone $value)->all()));
+    }
+
+    protected function defineValueForCondition(mixed $value, Submission $submission): mixed
+    {
+        return (clone $this->normalizeValue($value, $submission))->ids();
+    }
+
+    protected function defineValueAsData(mixed $value, ElementInterface $element = null): mixed
+    {
+        return array_map(static fn($item) => [
+            'id' => (int)$item->id,
+            'title' => (string)$item,
+            'url' => $item->getUrl(),
+        ], (clone $this->normalizeValue($value, $element))->all());
+    }
+
+    protected function defineValueForIntegration(mixed $value, IntegrationField $integrationField, IntegrationInterface $integration, ElementInterface $element = null, string $fieldKey = ''): mixed
+    {
+        // Project a query copy so consumer criteria never alter the normalized value.
+        $value = clone $value;
+        $value->status(null);
+
+        // Send through a CSV of element titles, when mapping to a string
+        if ($integrationField->getType() === IntegrationField::TYPE_STRING) {
+            return $this->defineValueAsString($value, $element);
+        }
+
+        if ($integrationField->getType() === IntegrationField::TYPE_ARRAY) {
+            // When an array, assume a collection of titles for most integrations, except element integrations
+            if ($integration instanceof ElementIntegration) {
+                return (clone $value)->ids();
+            }
+
+            // All other instances should use the title (or title-value)
+            return array_map(function($item) {
+                return $this->getElementLabel($item);
+            }, (clone $value)->all());
+        }
+
+        // When a number, assume a single ID
+        if ($integrationField->getType() === IntegrationField::TYPE_NUMBER) {
+            return $value->ids()[0] ?? null;
+        }
+
+        // When a number, assume a single ID
+        if ($integrationField->getType() === IntegrationField::TYPE_FLOAT) {
+            return $value->ids()[0] ?? null;
+        }
+
+        return null;
+    }
+
+    protected function defineValueForEmailPreview(FakerFactory $faker): mixed
+    {
+        $query = $this->getElementsQuery();
+
+        if (Craft::$app->getDb()->getIsMysql()) {
+            $query->orderBy('RAND()');
+        } else {
+            $query->orderBy('RANDOM()');
+        }
+
+        // Check if we should limit to 1 if a (single) dropdown or radio
+        if ($this->displayType === 'radio' || ($this->displayType === 'dropdown' && !$this->multi)) {
+            $query->limit(1);
+        }
+
+        return $query;
+    }
+
+    protected function getStringCustomFieldOptions(array $fields): array
+    {
+        $options = [];
+
+        // Better to opt-out fields, so we can always allow third-party ones which are impossible to check
+        $excludedFields = [
+            Assets::class,
+            Categories::class,
+            Checkboxes::class,
+            Entries::class,
+            Matrix::class,
+            MultiSelect::class,
+            Table::class,
+            CraftTags::class,
+            Users::class,
+        ];
+
+        foreach ($fields as $field) {
+            if (in_array(get_class($field), $excludedFields)) {
+                continue;
+            }
+
+            $options[] = ['label' => $field->name, 'value' => $field->handle];
+        }
+
+        return $options;
+    }
+
+    protected function getElementLabel(ElementInterface $element): string
+    {
+        try {
+            return (string)$element->{$this->labelSource};
+        } catch (Throwable $e) {
+
+        }
+
+        return $element->title;
+    }
+
+    protected function targetSiteId(?ElementInterface $element = null): int
+    {
+        return $element->siteId ?? Craft::$app->getSites()->getCurrentSite()->id;
+    }
+
+    protected function createSelectionCondition(): ?ElementConditionInterface
+    {
+        return null;
+    }
+
+    protected function defineReferenceValues(): array
+    {
+        return [
+            FieldReferenceValue::primary(Craft::t('formie', 'Formatted')),
+            FieldReferenceValue::selector('title', Craft::t('formie', 'Title'), supportsFieldSelect: false),
+            FieldReferenceValue::selector('url', Craft::t('formie', 'Public URL'), [ReferenceType::Text, ReferenceType::Url], supportsFieldSelect: false),
+            FieldReferenceValue::selector('cpUrl', Craft::t('formie', 'Control Panel URL'), [ReferenceType::Text, ReferenceType::Url], supportsFieldSelect: false),
+        ];
+    }
+
+    protected function supportedDefaults(): array
+    {
+        return ['displayType', 'labelSource', 'orderBy', 'optionLimit'];
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _resolveOrderBy(): ?array
+    {
+        $configuredValue = trim($this->orderBy);
+        $configuredMatches = [];
+
+        if (!preg_match('/^([A-Za-z_][A-Za-z0-9_.]*)\\s+(ASC|DESC)$/i', $configuredValue, $configuredMatches)) {
+            return null;
+        }
+
+        foreach ($this->getOptionSourceOrderByOptions() as $option) {
+            $allowedValue = trim((string)($option['value'] ?? ''));
+            $allowedMatches = [];
+
+            if (!preg_match('/^([A-Za-z_][A-Za-z0-9_.]*)\\s+(ASC|DESC)$/i', $allowedValue, $allowedMatches)) {
+                continue;
+            }
+
+            if ($allowedMatches[1] === $configuredMatches[1]
+                && strtoupper($allowedMatches[2]) === strtoupper($configuredMatches[2])) {
+                return [
+                    $allowedMatches[1] => strtoupper($allowedMatches[2]) === 'DESC' ? SORT_DESC : SORT_ASC,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    private function _parseRequestedElementIds(mixed $value): array
+    {
+        if ($value === null || $value === '' || $value === []) {
+            return [[], false];
+        }
+
+        if (!is_array($value) || !array_is_list($value)) {
+            return [[], true];
+        }
+
+        $ids = [];
+        $seen = [];
+        $invalid = false;
+
+        foreach ($value as $item) {
+            if (is_array($item)) {
+                if (!array_key_exists('id', $item)) {
+                    $invalid = true;
+
+                    continue;
+                }
+
+                $item = $item['id'];
+            }
+
+            if ($item === null || $item === '') {
+                continue;
+            }
+
+            $id = $this->_parsePositiveElementId($item);
+
+            if ($id === null) {
+                $invalid = true;
+
+                continue;
+            }
+
+            if (!isset($seen[$id])) {
+                $ids[] = $id;
+                $seen[$id] = true;
+            }
+        }
+
+        return [$ids, $invalid];
+    }
+
+    private function _parsePositiveElementId(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value > 0 ? $value : null;
+        }
+
+        if (!is_string($value) || !preg_match('/^[1-9][0-9]*$/D', $value)) {
+            return null;
+        }
+
+        $id = filter_var($value, FILTER_VALIDATE_INT, [
+            'options' => ['min_range' => 1],
+        ]);
+
+        return is_int($id) ? $id : null;
+    }
+
+    private function _previousElementIds(?ElementInterface $element): array
+    {
+        if (!$element instanceof Submission || !$element->id) {
+            return [];
+        }
+
+        $value = $element->getFieldValue($this->valueKey());
+
+        if (!$value instanceof ElementQueryInterface) {
+            return [];
+        }
+
+        return array_map('intval', (clone $value)->status(null)->ids());
+    }
+
+    private function _elementToArray(ElementInterface $element)
+    {
+        // Get all attributes, exclude custom fields which can cause recursion
+        $array = $element->getAttributes();
+
+        // Add in some useful extras
+        $array['url'] = $element->getUrl();
+        $array['link'] = $element->getLink();
+        $array['uriFormat'] = $element->getUriFormat();
+        $array['isHomepage'] = $element->getIsHomepage();
+        $array['uiLabel'] = $element->getUiLabel();
+        $array['cpEditUrl'] = $element->getCpEditUrl();
+        $array['postEditUrl'] = $element->getPostEditUrl();
+        $array['cpRevisionsUrl'] = $element->getCpRevisionsUrl();
+        $array['status'] = $element->getStatus();
+
+        // Get the custom fields
+        $array = array_merge($array, $element->getSerializedFieldValues());
+
+        ksort($array);
+
+        return Json::decode(Json::encode($array));
+    }
+}

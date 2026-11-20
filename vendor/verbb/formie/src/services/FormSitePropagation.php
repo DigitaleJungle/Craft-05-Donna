@@ -1,0 +1,378 @@
+<?php
+namespace verbb\formie\services;
+
+use verbb\formie\Formie;
+use verbb\formie\elements\Form;
+use verbb\formie\models\FormGroup;
+use verbb\formie\models\FormSitePolicy;
+
+use Craft;
+use craft\db\Query;
+use craft\db\Table as CraftTable;
+use craft\elements\User;
+use craft\helpers\Cp;
+use craft\helpers\Db;
+use craft\models\Site;
+use craft\web\Request;
+
+use yii\base\Component;
+
+class FormSitePropagation extends Component
+{
+    // Public Methods
+    // =========================================================================
+
+    public function isEnabled(): bool
+    {
+        return Craft::$app->getIsMultiSite();
+    }
+
+    public function getSitePolicy(?FormGroup $group): FormSitePolicy
+    {
+        if (!$group) {
+            return new FormSitePolicy();
+        }
+
+        $settings = Formie::$plugin->getFormGroupPolicy()->getSettings($group);
+        $sitePolicy = $settings->sitePolicy ?? [];
+
+        return FormSitePolicy::fromArray(is_array($sitePolicy) ? $sitePolicy : []);
+    }
+
+    public function getEditableSiteIds(?User $user = null): array
+    {
+        $user ??= Craft::$app->getUser()->getIdentity();
+
+        if ($user) {
+            $sites = Craft::$app->getSites();
+
+            if (!Craft::$app->getIsMultiSite()) {
+                return $sites->getAllSiteIds(true);
+            }
+
+            // Craft's editable-site cache belongs to the current session and
+            // does not accept a user argument. Resolve this identity directly.
+            return array_values(array_map(
+                fn(Site $site) => (int)$site->id,
+                array_filter($sites->getAllSites(true), fn(Site $site) => $user->can('editSite:' . $site->uid)),
+            ));
+        }
+
+        return Craft::$app->getSites()->getAllSiteIds();
+    }
+
+    public function getEditableSites(?User $user = null): array
+    {
+        $editableIds = $this->getEditableSiteIds($user);
+
+        return array_values(array_filter(
+            Craft::$app->getSites()->getAllSites(),
+            fn(Site $site) => in_array((int)$site->id, $editableIds, true),
+        ));
+    }
+
+    public function getSiteOptionsForEditor(?User $user = null): array
+    {
+        return array_map(function(Site $site) {
+            return [
+                'value' => (int)$site->id,
+                'label' => $site->name,
+                'handle' => $site->handle,
+                'language' => $site->language,
+                'primary' => (bool)$site->primary,
+            ];
+        }, $this->getEditableSites($user));
+    }
+
+    public function resolveSiteIdsForForm(Form $form): array
+    {
+        if (!$this->isEnabled()) {
+            return [(int)Craft::$app->getSites()->getPrimarySite()->id];
+        }
+
+        $group = $form->getGroup();
+        $policy = $this->getSitePolicy($group);
+        $candidateIds = $this->_resolveCandidateSiteIds($policy, $form);
+
+        return array_values(array_unique(array_map('intval', $candidateIds)));
+    }
+
+    public function validateFormSiteAvailability(Form $form): ?string
+    {
+        if (!$this->isEnabled()) {
+            return null;
+        }
+
+        $siteOverrides = Formie::$plugin->getFormSiteOverrides();
+
+        if (!$form->sourceSiteId) {
+            $form->sourceSiteId = $siteOverrides->resolveSourceSiteIdForNewForm($form);
+        }
+
+        if ($this->resolveSiteIdsForForm($form) === []) {
+            return Craft::t('formie', 'This form could not be enabled on any sites for the selected group propagation policy.');
+        }
+
+        return null;
+    }
+
+    public function isFormAvailableForSite(Form $form, int $siteId): bool
+    {
+        if (!$this->isEnabled()) {
+            return true;
+        }
+
+        return in_array($siteId, $this->resolveSiteIdsForForm($form), true);
+    }
+
+    public function resolveSiteIdsForGroup(?FormGroup $group): array
+    {
+        if (!$this->isEnabled()) {
+            return $this->getEditableSiteIds();
+        }
+
+        $policy = $this->getSitePolicy($group);
+        $editableIds = $this->getEditableSiteIds();
+        $enabledIds = $policy->enabledSiteIds ?? $editableIds;
+        $enabledIds = array_values(array_intersect(
+            array_map('intval', $enabledIds),
+            $editableIds,
+        ));
+
+        return $enabledIds;
+    }
+
+    public function isGroupAvailableForSite(?FormGroup $group, int $siteId): bool
+    {
+        if (!$this->isEnabled()) {
+            return true;
+        }
+
+        return in_array((int)$siteId, $this->resolveSiteIdsForGroup($group), true);
+    }
+
+    public function resolveCreationSiteIdForForm(Form $form): ?int
+    {
+        if (!$this->isEnabled() || $form->id) {
+            return null;
+        }
+
+        $supportedSiteIds = $this->resolveSiteIdsForForm($form);
+
+        if ($supportedSiteIds === []) {
+            return null;
+        }
+
+        $request = Craft::$app->getRequest();
+        $requestedSite = Cp::requestedSite();
+        $requestedSiteId = $request instanceof Request ? $request->getParam('siteId') : null;
+        $candidateIds = array_filter([
+            $requestedSiteId,
+            $requestedSite?->id,
+            $form->siteId,
+            Craft::$app->getSites()->getCurrentSite()->id,
+        ], fn(mixed $siteId) => $siteId !== null && $siteId !== '');
+
+        foreach ($candidateIds as $candidateId) {
+            $candidateId = (int)$candidateId;
+
+            if (in_array($candidateId, $supportedSiteIds, true)) {
+                return $candidateId;
+            }
+        }
+
+        return (int)reset($supportedSiteIds);
+    }
+
+    public function syncFormSites(Form $form): void
+    {
+        if (!$this->isEnabled() || !$form->id) {
+            return;
+        }
+
+        $enabledSiteIds = $this->resolveSiteIdsForForm($form);
+        $canonicalTitle = (string)$form->title;
+
+        foreach (Craft::$app->getSites()->getAllSiteIds() as $siteId) {
+            $enabled = $enabledSiteIds !== [] && in_array($siteId, $enabledSiteIds, true);
+
+            $row = (new Query())
+                ->select(['id', 'enabled'])
+                ->from([CraftTable::ELEMENTS_SITES])
+                ->where(['elementId' => $form->id, 'siteId' => $siteId])
+                ->one();
+
+            if ($row) {
+                if ((bool)$row['enabled'] !== $enabled) {
+                    Db::update(CraftTable::ELEMENTS_SITES, ['enabled' => $enabled], ['id' => $row['id']]);
+                }
+
+                continue;
+            }
+
+            if ($enabled) {
+                $title = $this->_resolveElementSiteTitle((int)$form->id, (int)$siteId, $canonicalTitle);
+
+                Db::insert(CraftTable::ELEMENTS_SITES, [
+                    'elementId' => $form->id,
+                    'siteId' => $siteId,
+                    'title' => $title !== '' ? $title : null,
+                    'enabled' => true,
+                ]);
+            }
+        }
+
+        $this->syncElementSiteTitles((int)$form->id, $canonicalTitle);
+    }
+
+    public function syncElementSiteTitles(int $formId, ?string $canonicalTitle = null): void
+    {
+        if (!$this->isEnabled() || !$formId) {
+            return;
+        }
+
+        $siteOverrides = Formie::$plugin->getFormSiteOverrides();
+        $sourceSiteId = $siteOverrides->getSourceSiteIdForFormId($formId);
+
+        if ($canonicalTitle === null) {
+            $canonicalTitle = (new Query())
+                ->select(['title'])
+                ->from([CraftTable::ELEMENTS_SITES])
+                ->where(['elementId' => $formId, 'siteId' => $sourceSiteId])
+                ->scalar();
+        }
+
+        $canonicalTitle = (string)($canonicalTitle ?? '');
+
+        if ($canonicalTitle === '') {
+            $form = Form::find()->id($formId)->siteId($sourceSiteId)->status(null)->one();
+
+            if (!$form) {
+                $form = Form::find()->id($formId)->status(null)->site('*')->one();
+            }
+
+            if (!$form) {
+                return;
+            }
+
+            $canonicalTitle = (string)($form->title ?: $form->handle);
+        }
+
+        $form = Form::find()->id($formId)->siteId($sourceSiteId)->status(null)->one()
+            ?? Form::find()->id($formId)->status(null)->site('*')->one();
+
+        if (!$form) {
+            return;
+        }
+
+        foreach ($this->resolveSiteIdsForForm($form) as $siteId) {
+            $siteId = (int)$siteId;
+            $title = $this->_resolveElementSiteTitle($formId, $siteId, $canonicalTitle);
+
+            if ($title === '') {
+                continue;
+            }
+
+            $row = (new Query())
+                ->select(['id', 'title'])
+                ->from([CraftTable::ELEMENTS_SITES])
+                ->where(['elementId' => $formId, 'siteId' => $siteId])
+                ->one();
+
+            if (!$row) {
+                continue;
+            }
+
+            if ((string)($row['title'] ?? '') === $title) {
+                continue;
+            }
+
+            Db::update(CraftTable::ELEMENTS_SITES, ['title' => $title], ['id' => $row['id']]);
+        }
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _resolveCandidateSiteIds(FormSitePolicy $policy, Form $form): array
+    {
+        $sitesService = Craft::$app->getSites();
+        $referenceSite = $this->_resolveReferenceSite($form);
+        // Availability belongs to the shared form policy, not the editor saving it.
+        // Builder choices are filtered separately by the user's editable sites.
+        $siteIds = $sitesService->getAllSiteIds();
+        $enabledIds = $policy->enabledSiteIds ?? $siteIds;
+        $enabledIds = array_values(array_intersect(
+            array_map('intval', $enabledIds),
+            $siteIds,
+        ));
+
+        $sitesById = [];
+
+        foreach ($sitesService->getAllSites() as $site) {
+            $sitesById[(int)$site->id] = $site;
+        }
+
+        $candidates = array_values(array_filter(
+            $enabledIds,
+            fn(int $siteId) => isset($sitesById[$siteId]),
+        ));
+
+        return match ($policy->propagation) {
+            FormSitePolicy::PROPAGATION_CREATED_SITE_ONLY => $this->_filterCreatedSiteOnly($form, $candidates, $referenceSite),
+            FormSitePolicy::PROPAGATION_SAME_LANGUAGE => $this->_filterSameLanguage($candidates, $referenceSite, $sitesById),
+            FormSitePolicy::PROPAGATION_SAME_SITE_GROUP => $this->_filterSameSiteGroup($candidates, $referenceSite, $sitesById),
+            default => $candidates,
+        };
+    }
+
+    private function _resolveReferenceSite(Form $form): Site
+    {
+        $sourceSiteId = Formie::$plugin->getFormSiteOverrides()->getSourceSiteId($form);
+        $site = Craft::$app->getSites()->getSiteById($sourceSiteId);
+
+        return $site ?? Craft::$app->getSites()->getPrimarySite();
+    }
+
+    private function _filterCreatedSiteOnly(Form $form, array $candidateIds, Site $referenceSite): array
+    {
+        $createdSiteId = (int)($form->sourceSiteId ?: $form->siteId ?: $referenceSite->id);
+
+        if (in_array($createdSiteId, $candidateIds, true)) {
+            return [$createdSiteId];
+        }
+
+        return [];
+    }
+
+    private function _filterSameLanguage(array $candidateIds, Site $referenceSite, array $sitesById): array
+    {
+        $language = $referenceSite->language;
+
+        return array_values(array_filter(
+            $candidateIds,
+            fn(int $siteId) => ($sitesById[$siteId]->language ?? null) === $language,
+        ));
+    }
+
+    private function _filterSameSiteGroup(array $candidateIds, Site $referenceSite, array $sitesById): array
+    {
+        $groupId = $referenceSite->groupId;
+
+        return array_values(array_filter(
+            $candidateIds,
+            fn(int $siteId) => ($sitesById[$siteId]->groupId ?? null) === $groupId,
+        ));
+    }
+
+    private function _resolveElementSiteTitle(int $formId, int $siteId, string $canonicalTitle): string
+    {
+        $titles = Formie::$plugin->getFormSiteOverrides()->resolveFormTitlesForSite(
+            [$formId => $canonicalTitle],
+            $siteId,
+        );
+
+        return (string)($titles[$formId] ?? $canonicalTitle);
+    }
+}

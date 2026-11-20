@@ -1,0 +1,512 @@
+<?php
+namespace verbb\formie\fields;
+
+use verbb\formie\Formie;
+use verbb\formie\base\Field;
+use verbb\formie\base\Integration;
+use verbb\formie\base\IntegrationInterface;
+use verbb\formie\base\Payment as PaymentIntegration;
+use verbb\formie\elements\Submission;
+use verbb\formie\fields\definitions\FieldValueType;
+use verbb\formie\fields\values\PaymentFieldValue;
+use verbb\formie\gql\types\input\PaymentInputType;
+use verbb\formie\gql\types\Json as GqlJson;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\BrowserModuleContext;
+use verbb\formie\models\SlotTag;
+use verbb\formie\theme\context\RenderContext;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\helpers\DateTimeHelper;
+use craft\helpers\Json;
+use craft\helpers\StringHelper;
+use craft\helpers\Template;
+
+use Faker\Generator as FakerFactory;
+use GraphQL\Type\Definition\Type;
+use Twig\Markup;
+
+class Payment extends Field
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Payment');
+    }
+
+    public static function getSvgIconPath(): string
+    {
+        return 'formie/_formfields/payment/icon.svg';
+    }
+
+    public static function gqlContentTypeFromConfig(array $config): Type|array
+    {
+        return PaymentInputType::getTypeFromConfig($config);
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $paymentIntegration = null;
+    public ?string $paymentIntegrationType = null;
+    public ?array $providerSettings = [];
+
+    private static ?array $_paymentIntegrationsCache = null;
+    private static ?array $_paymentProviderOptionsCache = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function fieldKind(): string
+    {
+        return self::KIND_PAYMENT;
+    }
+
+    public function init(): void
+    {
+        parent::init();
+    }
+
+    public function modifyFieldSettings(array $settings): array
+    {
+        if ($integration = $this->getPaymentIntegration()) {
+            return $integration->modifyFieldSettings($settings);
+        }
+
+        return $settings;
+    }
+
+    public function normalizeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        $value = parent::normalizeValue($value, $element);
+
+        if ($value instanceof PaymentFieldValue) {
+            return $value;
+        }
+
+        $value = Json::decodeIfJson($value);
+
+        if (!is_array($value)) {
+            $value = [];
+        }
+
+        $data = new PaymentFieldValue($value);
+
+        return $data;
+    }
+
+    public function getContentGqlType(): Type|array
+    {
+        $integration = $this->getPaymentIntegration();
+
+        if (!$integration instanceof PaymentIntegration) {
+            return GqlJson::getType();
+        }
+
+        $keys = $integration->getGqlPaymentInputFieldKeys($this);
+
+        if (!$keys) {
+            return GqlJson::getType();
+        }
+
+        return PaymentInputType::getType($this);
+    }
+
+    public function serializeValueForClientInput(mixed $value, ?ElementInterface $element = null): mixed
+    {
+        return $this->normalizeValue($value, $element)->getSafeAttributes();
+    }
+
+    public function defineFormBuilderPreviewSchema(): array
+    {
+        return [
+            SchemaHelper::previewPayment(),
+        ];
+    }
+
+    public function getPaymentHtml(): Markup
+    {
+        $integration = $this->getPaymentIntegration();
+
+        if (!$integration) {
+            return Template::raw('');
+        }
+
+        return Template::raw($integration->renderFieldHtml($this));
+    }
+
+    public function getPaymentSubFields(): array
+    {
+        $integration = $this->getPaymentIntegration();
+
+        return $integration?->getPaymentSubFields($this) ?? [];
+    }
+
+    public function getPaymentIntegration(): ?IntegrationInterface
+    {
+        if (!$this->paymentIntegration) {
+            return null;
+        }
+
+        $integration = Formie::$plugin->getIntegrations()->getIntegrationByHandle($this->paymentIntegration);
+
+        // Keep payment integrations field-aware in all contexts (CP edit, summary rendering, workflow).
+        if ($integration instanceof PaymentIntegration) {
+            $integration->setField($this);
+        }
+
+        return $integration instanceof PaymentIntegration ? $integration : null;
+    }
+
+    public function beforeSave(bool $isNew): bool
+    {
+        if (!parent::beforeSave($isNew)) {
+            return false;
+        }
+
+        if ($this->paymentIntegration) {
+            $this->_ensureProviderSettingsDefaultsForHandle($this->paymentIntegration);
+        }
+
+        if ($integration = $this->getPaymentIntegration()) {
+            $this->paymentIntegrationType = get_class($integration);
+        }
+
+        return true;
+    }
+
+    public function getProviderSettingsSchemaForHandle(string $handle, string $schemaGroup): array
+    {
+        $integration = $this->_getPaymentIntegrationByHandle($handle);
+
+        if (!$integration || !method_exists($integration, $schemaGroup)) {
+            return [];
+        }
+
+        return $integration->$schemaGroup();
+    }
+
+    public function getProviderSettingsDefaultsForHandle(string $handle): array
+    {
+        $integration = $this->_getPaymentIntegrationByHandle($handle);
+
+        if (!($integration instanceof PaymentIntegration)) {
+            return [];
+        }
+
+        return $integration->getPaymentFieldSettingsDefaults();
+    }
+
+    public function getSettingGqlTypes(): array
+    {
+        return array_merge(parent::getSettingGqlTypes(), [
+            'paymentIntegration' => [
+                'name' => 'paymentIntegration',
+                'type' => Type::string(),
+            ],
+            'paymentIntegrationType' => [
+                'name' => 'paymentIntegrationType',
+                'type' => Type::string(),
+            ],
+            'providerSettings' => [
+                'name' => 'providerSettings',
+                'type' => Type::string(),
+                'resolve' => function($source, $arguments) {
+                    return Json::encode($source->providerSettings);
+                },
+            ],
+        ]);
+    }
+
+    public function defineFormBuilderGeneralSchema(): array
+    {
+        return [
+            SchemaHelper::labelField(),
+            SchemaHelper::selectField([
+                'label' => Craft::t('formie', 'Payment Provider'),
+                'instructions' => Craft::t('formie', 'Select which payment provider this field should use.'),
+                'name' => 'paymentIntegration',
+                'validation' => 'required',
+                'required' => true,
+                'options' => array_merge(
+                    [['label' => Craft::t('formie', 'Select an option'), 'value' => '']],
+                    $this->_getPaymentOptions()
+                ),
+            ]),
+            SchemaHelper::paymentProviderSettingsField([
+                'name' => 'providerSettings',
+                'schemaGroup' => 'defineFormBuilderGeneralSchema',
+                'fieldType' => static::class,
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderSettingsSchema(): array
+    {
+        return [
+            SchemaHelper::paymentProviderSettingsField([
+                'name' => 'providerSettings',
+                'schemaGroup' => 'defineFormBuilderSettingsSchema',
+                'fieldType' => static::class,
+            ]),
+            SchemaHelper::includeInEmailFieldSummariesField(),
+        ];
+    }
+
+    public function defineFormBuilderValidationSchema(): array
+    {
+        return [
+            SchemaHelper::requiredField(),
+            SchemaHelper::requiredValidationMessage(),
+        ];
+    }
+
+    public function defineFormBuilderAppearanceSchema(): array
+    {
+        return [
+            SchemaHelper::visibility(),
+            SchemaHelper::labelPosition($this),
+            SchemaHelper::instructions(),
+            SchemaHelper::instructionsPosition($this),
+            SchemaHelper::errorMessagePosition($this),
+            SchemaHelper::paymentProviderSettingsField([
+                'name' => 'providerSettings',
+                'schemaGroup' => 'defineFormBuilderAppearanceSchema',
+                'fieldType' => static::class,
+            ]),
+        ];
+    }
+
+    public function defineFormBuilderAdvancedSchema(): array
+    {
+        return [
+            SchemaHelper::handleField(),
+        ];
+    }
+
+    public function defineFormBuilderConditionsSchema(): array
+    {
+        return [
+            SchemaHelper::enableConditionsField(),
+            SchemaHelper::conditionsField(),
+        ];
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineValueType(): FieldValueType
+    {
+        return FieldValueType::object(PaymentFieldValue::class);
+    }
+
+    protected function defineValueAsData(mixed $value, ElementInterface $element = null): mixed
+    {
+        return $this->normalizeValue($value, $element)->getSafeAttributes();
+    }
+
+    protected function defineValueForDb(mixed $value, ?ElementInterface $element): mixed
+    {
+        $value = $this->normalizeValue($value, $element);
+
+        if (!$value instanceof PaymentFieldValue) {
+            return [];
+        }
+
+        // Payment records retain transaction details; credentials stay request-scoped.
+        return $value->getSafeAttributes();
+    }
+
+    protected function defineValueForReport(mixed $value, ?ElementInterface $element = null, bool $useOptionLabels = true): mixed
+    {
+        // Report the persisted transaction, rather than the request's payment input.
+        $values = array_filter($this->defineValueForExport($value, $element), static fn($part) => $part !== null && $part !== '');
+
+        return implode(', ', $values);
+    }
+
+    protected function defineValueForExport(mixed $value, ?ElementInterface $element = null): array
+    {
+        $label = $element ? $this->getExportLabel($element) : $this->label;
+        $column = fn(string $name): string => $label . ': ' . Craft::t('formie', $name);
+        $exportValues = [
+            $column('Provider') => '',
+            $column('Type') => '',
+            $column('Status') => '',
+            $column('Amount') => '',
+            $column('Currency') => '',
+            $column('Date') => '',
+            $column('Transaction Reference') => '',
+        ];
+
+        if (!$element instanceof Submission) {
+            return $exportValues;
+        }
+
+        $payments = array_values(array_filter(
+            $element->getPayments() ?? [],
+            fn($payment): bool => (int)$payment->fieldId === (int)$this->id,
+        ));
+        $payment = $payments ? $payments[array_key_last($payments)] : null;
+
+        if (!$payment) {
+            return $exportValues;
+        }
+
+        $integration = $payment->getIntegration() ?? $this->getPaymentIntegration();
+        $type = $payment->subscriptionId ? 'Subscription' : 'Single';
+
+        return [
+            $column('Provider') => $integration ? $integration::displayName() : '',
+            $column('Type') => Craft::t('formie', $type),
+            $column('Status') => Craft::t('formie', StringHelper::toTitleCase($payment->status ?? '')),
+            $column('Amount') => $payment->amount,
+            $column('Currency') => strtoupper($payment->currency ?? ''),
+            $column('Date') => $payment->dateCreated ? DateTimeHelper::toIso8601($payment->dateCreated) : '',
+            $column('Transaction Reference') => $payment->reference ?? '',
+        ];
+    }
+
+    protected function defineSlotTag(string $key, RenderContext $context): ?SlotTag
+    {
+        if ($integration = $this->getPaymentIntegration()) {
+            return $integration->renderSlotTag($key, $context) ?? parent::defineSlotTag($key, $context);
+        }
+
+        return parent::defineSlotTag($key, $context);
+    }
+
+    protected function defineSubmissionHtml(mixed $value, ?ElementInterface $element, bool $inline): string
+    {
+        return Craft::$app->getView()->renderTemplate('formie/_formfields/payment/input', [
+            'name' => $this->handle,
+            'value' => $value,
+            'field' => $this,
+        ]);
+    }
+
+    protected function defineValueForSummary(mixed $value, ElementInterface $element = null): mixed
+    {
+        // Summaries are shown to the person submitting, and these are only provider IDs.
+        return false;
+    }
+
+    protected function defineValueAsString(mixed $value, ElementInterface $element = null): string
+    {
+        return Json::encode($this->normalizeValue($value, $element)->getSafeAttributes());
+    }
+
+    protected function defineValueForEmailPreview(FakerFactory $faker): mixed
+    {
+        // Payment fields can't really be previewed without real payment data
+        return [];
+    }
+
+    protected function defineClientRenderedInput(): array
+    {
+        return array_merge(parent::defineClientRenderedInput(), [
+            'integration' => $this->paymentIntegration,
+        ]);
+    }
+
+    protected function defineContextualBrowserModules(BrowserModuleContext $context): array
+    {
+        $modules = parent::defineContextualBrowserModules($context);
+        $integration = $this->getPaymentIntegration();
+
+        if (!$integration) {
+            return $modules;
+        }
+
+        $browserModule = $integration->getBrowserModule(new BrowserModuleContext([
+            'form' => $context->form,
+            'field' => $this,
+            'integration' => $integration,
+            'surface' => $context->surface,
+        ]));
+
+        if ($browserModule) {
+            $modules[] = $browserModule->withProjectionDefaults($integration->getType(), $context->getTargets());
+        }
+
+        return $modules;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _getPaymentOptions(): array
+    {
+        if (self::$_paymentProviderOptionsCache !== null) {
+            return self::$_paymentProviderOptionsCache;
+        }
+
+        $paymentProviderOptions = [];
+
+        foreach ($this->_getPaymentIntegrations() as $paymentProvider) {
+            if (!$paymentProvider->getEnabled()) {
+                continue;
+            }
+
+            $paymentProviderOptions[] = [
+                'label' => $paymentProvider->getName(),
+                'value' => $paymentProvider->getHandle(),
+            ];
+        }
+
+        self::$_paymentProviderOptionsCache = $paymentProviderOptions;
+
+        return self::$_paymentProviderOptionsCache;
+    }
+
+    private function _getPaymentIntegrations(): array
+    {
+        if (self::$_paymentIntegrationsCache !== null) {
+            return self::$_paymentIntegrationsCache;
+        }
+
+        self::$_paymentIntegrationsCache = Formie::$plugin->getIntegrations()->getAllIntegrationsForType(Integration::TYPE_PAYMENT);
+
+        return self::$_paymentIntegrationsCache;
+    }
+
+    private function _getPaymentIntegrationByHandle(string $handle): ?IntegrationInterface
+    {
+        if ($handle === '') {
+            return null;
+        }
+
+        foreach ($this->_getPaymentIntegrations() as $integration) {
+            if ($integration->getHandle() === $handle) {
+                return $integration;
+            }
+        }
+
+        return null;
+    }
+
+    private function _ensureProviderSettingsDefaultsForHandle(string $handle): void
+    {
+        if ($handle === '') {
+            return;
+        }
+
+        $defaults = $this->getProviderSettingsDefaultsForHandle($handle);
+
+        if (!$defaults) {
+            return;
+        }
+
+        $providerSettings = is_array($this->providerSettings) ? $this->providerSettings : [];
+        $existing = is_array($providerSettings[$handle] ?? null) ? $providerSettings[$handle] : [];
+        $providerSettings[$handle] = array_merge($defaults, $existing);
+        $this->providerSettings = $providerSettings;
+    }
+}

@@ -1,0 +1,17 @@
+{% set elements = value.all() %}
+
+{% if elements | length %}
+    <ul>
+        {% for element in elements %}
+            {% set url = field.getSafeElementUrl(element, field.emailFieldSummaryValue == 'cpUrl') %}
+                
+            <li>
+                {% if url %}
+                    <a href="{{ url }}">{{ element.name }}</a>
+                {% else %}
+                    {{ element.name }}
+                {% endif %}
+            </li>
+        {% endfor %}
+    </ul>
+{% endif %}

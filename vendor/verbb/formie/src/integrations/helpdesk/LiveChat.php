@@ -1,0 +1,207 @@
+<?php
+namespace verbb\formie\integrations\helpdesk;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\HelpDesk;
+use verbb\formie\base\Integration;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\RichTextHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\ArrayHelper;
+use craft\helpers\Json;
+use craft\helpers\StringHelper;
+
+use Throwable;
+
+use League\HTMLToMarkdown\HtmlConverter;
+use verbb\auth\base\OAuthProviderInterface;
+use verbb\auth\providers\LiveChat as LiveChatProvider;
+
+class LiveChat extends HelpDesk implements OAuthProviderInterface
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function supportsOAuthConnection(): bool
+    {
+        return true;
+    }
+
+    public static function getOAuthProviderClass(): string
+    {
+        return LiveChatProvider::class;
+    }
+
+    public static function displayName(): string
+    {
+        return 'Live Chat';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?string $licenseId = null;
+
+    #[FormIntegrationSetting]
+    public ?string $message = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToTicket = false;
+
+    #[FormIntegrationSetting]
+    public ?array $ticketFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Send your form content to Live Chat.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            if ($this->mapToTicket && $this->settingsContext->dataKey === 'ticket') {
+                $ticketFields = [
+                new IntegrationField([
+                    'handle' => 'email',
+                    'name' => Craft::t('formie', 'Email'),
+                    'required' => true,
+                ]),
+                new IntegrationField([
+                    'handle' => 'name',
+                    'name' => Craft::t('formie', 'Name'),
+                ]),
+                new IntegrationField([
+                    'handle' => 'subject',
+                    'name' => Craft::t('formie', 'Subject'),
+                    'required' => true,
+                ]),
+                new IntegrationField([
+                    'handle' => 'tags',
+                    'name' => Craft::t('formie', 'Tags'),
+                ]),
+            ];
+
+                $settings['ticket'] = $ticketFields;
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $ticketValues = $this->getFieldMappingValues($submission, $this->ticketFieldMapping, 'ticket');
+
+            $payload = [];
+
+            $licenseId = App::parseEnv($this->licenseId);
+            $email = ArrayHelper::remove($ticketValues, 'email');
+            $name = ArrayHelper::remove($ticketValues, 'name');
+            $subject = ArrayHelper::remove($ticketValues, 'subject');
+            $tags = ArrayHelper::remove($ticketValues, 'tags') ?? [];
+            $tags = is_array($tags) ? $tags : array_filter(array_map('trim', explode(',', $tags)));
+
+            $payload = [
+                'visitor_id' => 'visitor_' . StringHelper::randomString(10),
+                'ticket_message' => $this->_renderMessage($submission),
+                'offline_message' => $this->_renderMessage($submission),
+                'requester' => [
+                    'name' => $name,
+                    'mail' => $email,
+                ],
+                'subject' => $subject,
+                'licence_id' => $licenseId,
+            ];
+
+            $response = $this->deliverPayload($submission, 'v2/tickets/new', $payload);
+
+            if ($response === false) {
+                return $this->resultForPayload(true);
+            }
+
+            $ticketId = $response['id'] ?? '';
+
+            if (!$ticketId) {
+                Integration::error($this, Craft::t('formie', 'Missing return “ticketId” {response}. Sent payload {payload}', [
+                    'response' => Json::encode($response),
+                    'payload' => Json::encode($payload),
+                ]), true);
+
+                return $this->resultForPayload(false);
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['licenseId'], 'required'];
+
+        // Validate the following when saving form settings
+        $rules[] = [['message'], 'required', 'on' => [Integration::SCENARIO_FORM]];
+
+        return $rules;
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToTicket',
+            'label' => Craft::t('formie', 'Map to {name}', ['name' => 'Ticket']),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Tickets']),
+        ]);
+        $schema[] = $this->createFieldMappingField([
+            'name' => 'ticketFieldMapping',
+            'if' => 'mapToTicket',
+            'dataLabel' => 'Ticket',
+            'dataKey' => 'ticket',
+        ]);
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _renderMessage($submission): array|string
+    {
+        $html = RichTextHelper::getHtmlContent($this->message, $submission, false);
+
+        $converter = new HtmlConverter(['strip_tags' => true]);
+        $markdown = $converter->convert($html);
+
+        return $markdown;
+    }
+}

@@ -1,0 +1,8 @@
+{% for image in entry.images %}
+    {{ image.render({
+        size,
+        class: "py-2 " ~ entry.hoverAnimation,
+        link,
+        gallery: entry.id
+    }) }}
+{% endfor %}

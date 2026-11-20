@@ -1,0 +1,149 @@
+{% extends 'formie/_layouts/settings' %}
+{% set title = 'Submissions' | t('formie') %}
+
+{% import '_includes/forms' as forms %}
+{% import 'verbb-base/_macros' as macros %}
+
+{% block content %}
+
+<h2>{{ 'Submissions' | t('formie') }}</h2>
+
+<form action="" method="post" accept-charset="UTF-8" data-saveshortcut>
+    <input type="hidden" name="action" value="formie/settings/save-settings">
+    <input type="hidden" name="page" value="submissions">
+    {{ redirectInput('formie/settings/submissions') }}
+    {{ csrfInput() }}
+
+    {% namespace 'settings' %}
+        {{ forms.textField({
+            first: true,
+            type: 'number',
+            label: 'Maximum Incomplete Submission Age' | t('formie'),
+            instructions: 'The maximum age of an incomplete submission in days before it is deleted by scheduled cleanup. Set to 0 to disable automatic deletion.' | t('formie'),
+            id: 'maxIncompleteSubmissionAge',
+            name: 'maxIncompleteSubmissionAge',
+            value: settings.maxIncompleteSubmissionAge,
+            autofocus: true,
+            warning: macros.configWarning('maxIncompleteSubmissionAge', 'formie'),
+        }) }}
+
+        {{ forms.lightswitchField({
+            label: 'Enable CSRF Validation for Guests' | t('formie'),
+            instructions: 'Whether to enable Craft‘s CSRF validation checks for anonymous form submissions.' | t('formie'),
+            id: 'enableCsrfValidationForGuests',
+            name: 'enableCsrfValidationForGuests',
+            on: settings.enableCsrfValidationForGuests,
+            warning: macros.configWarning('enableCsrfValidationForGuests', 'formie'),
+        }) }}
+
+        {{ forms.selectField({
+            label: 'Default Submissions State' | t('formie'),
+            instructions: 'Set what sorts of submissions should be shown by default when viewing submissions.' | t('formie'),
+            id: 'submissionsBehaviour',
+            name: 'submissionsBehaviour',
+            value: settings.submissionsBehaviour,
+            options: [
+                { label: 'All', value: 'all' },
+                { label: 'Complete', value: 'complete' },
+                { label: 'Incomplete', value: 'incomplete' },
+                { label: 'Spam', value: 'spam' },
+            ],
+            warning: macros.configWarning('submissionsBehaviour', 'formie'),
+        }) }}
+
+        {{ forms.selectField({
+            label: 'Submissions Sidebar Form Order' | t('formie'),
+            instructions: 'Controls how forms are listed in the left sidebar on the Submissions element index.' | t('formie'),
+            id: 'submissionSidebarFormOrder',
+            name: 'submissionSidebarFormOrder',
+            value: settings.submissionSidebarFormOrder,
+            options: [
+                { label: 'Date created (newest first)' | t('formie'), value: 'dateCreatedDesc' },
+                { label: 'Date created (oldest first)' | t('formie'), value: 'dateCreatedAsc' },
+                { label: 'Form title (A-Z)' | t('formie'), value: 'titleAsc' },
+                { label: 'Form title (Z-A)' | t('formie'), value: 'titleDesc' },
+                { label: 'Form handle (A-Z)' | t('formie'), value: 'handleAsc' },
+                { label: 'Form handle (Z-A)' | t('formie'), value: 'handleDesc' },
+            ],
+            warning: macros.configWarning('submissionSidebarFormOrder', 'formie'),
+        }) }}
+
+        {{ forms.selectField({
+            label: 'Control Panel Field Conditions' | t('formie'),
+            instructions: 'The default behaviour when viewing or editing submissions in the control panel for forms that do not override this setting.' | t('formie'),
+            id: 'defaultCpSubmissionFieldConditions',
+            name: 'defaultCpSubmissionFieldConditions',
+            value: settings.defaultCpSubmissionFieldConditions,
+            options: [
+                { label: 'Follow field conditions' | t('formie'), value: 'follow' },
+                { label: 'Follow field conditions (show hidden fields collapsed)' | t('formie'), value: 'muted' },
+                { label: 'Show all fields' | t('formie'), value: 'show-all' },
+            ],
+            warning: macros.configWarning('defaultCpSubmissionFieldConditions', 'formie'),
+        }) }}
+
+        <hr>
+
+        <h3>{{ 'Reports' | t('formie') }}</h3>
+
+        {{ forms.textField({
+            type: 'number',
+            label: 'Report Table Page Size' | t('formie'),
+            instructions: 'The number of submissions shown per page in report tables.' | t('formie'),
+            id: 'reportTablePageSize',
+            name: 'reportTablePageSize',
+            value: settings.reportTablePageSize,
+            min: 1,
+            max: 100,
+            warning: macros.configWarning('reportTablePageSize', 'formie'),
+        }) }}
+
+        {{ forms.textField({
+            type: 'number',
+            label: 'Report Async Export Row Threshold' | t('formie'),
+            instructions: 'Reports with more submissions than this are exported in the background via the queue, and the user is notified when the file is ready.' | t('formie'),
+            id: 'reportAsyncExportRowThreshold',
+            name: 'reportAsyncExportRowThreshold',
+            value: settings.reportAsyncExportRowThreshold,
+            min: 1,
+            warning: macros.configWarning('reportAsyncExportRowThreshold', 'formie'),
+        }) }}
+
+        {{ forms.textField({
+            type: 'number',
+            label: 'Report Interactive Export Expiry (hours)' | t('formie'),
+            instructions: 'How long queued interactive export download links remain valid.' | t('formie'),
+            id: 'reportInteractiveExportExpiryHours',
+            name: 'reportInteractiveExportExpiryHours',
+            value: settings.reportInteractiveExportExpiryHours,
+            min: 1,
+            warning: macros.configWarning('reportInteractiveExportExpiryHours', 'formie'),
+        }) }}
+
+        {{ forms.textField({
+            type: 'number',
+            label: 'Report Scheduled Export Expiry (hours)' | t('formie'),
+            instructions: 'How long scheduled report download links remain valid when the export is too large to email.' | t('formie'),
+            id: 'reportScheduledExportExpiryHours',
+            name: 'reportScheduledExportExpiryHours',
+            value: settings.reportScheduledExportExpiryHours,
+            min: 1,
+            warning: macros.configWarning('reportScheduledExportExpiryHours', 'formie'),
+        }) }}
+
+        {{ forms.lightswitchField({
+            label: 'Single-Use Report Export Downloads' | t('formie'),
+            instructions: 'When enabled, each signed download link works only once. Control panel downloads are not affected.' | t('formie'),
+            id: 'reportExportSingleUseDownload',
+            name: 'reportExportSingleUseDownload',
+            on: settings.reportExportSingleUseDownload,
+            warning: macros.configWarning('reportExportSingleUseDownload', 'formie'),
+        }) }}
+    {% endnamespace %}
+
+    <hr>
+
+    <input type="submit" class="btn submit" value="{{ 'Save' | t('formie') }}">
+</form>
+
+{% endblock %}

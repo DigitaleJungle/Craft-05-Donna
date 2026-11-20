@@ -1,0 +1,325 @@
+<?php
+namespace verbb\formie\integrations\miscellaneous;
+
+use verbb\formie\attributes\FormIntegrationSetting;
+use verbb\formie\attributes\Sensitive;
+use verbb\formie\base\FormInterface;
+use verbb\formie\base\Integration;
+use verbb\formie\base\Miscellaneous;
+use verbb\formie\elements\Submission;
+use verbb\formie\helpers\ArrayHelper;
+use verbb\formie\helpers\SchemaHelper;
+use verbb\formie\models\IntegrationConfig;
+use verbb\formie\models\IntegrationField;
+use verbb\formie\models\IntegrationResult;
+
+use Craft;
+use craft\helpers\App;
+use craft\helpers\Json;
+
+use Throwable;
+
+use GuzzleHttp\Client;
+
+class Recruitee extends Miscellaneous
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return 'Recruitee';
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    #[Sensitive]
+    public ?string $apiKey = null;
+
+    public ?string $subdomain = null;
+
+    #[FormIntegrationSetting]
+    public bool $mapToCandidate = false;
+
+    #[FormIntegrationSetting]
+    public ?array $candidateFieldMapping = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getDescription(): string
+    {
+        return Craft::t('formie', 'Apply for Recruitee job offers.');
+    }
+
+    public function fetchConfig(): IntegrationConfig
+    {
+        $settings = [];
+
+        try {
+            $response = $this->request('GET', 'offers');
+            $offers = $response['offers'] ?? [];
+
+            $candidateFields = array_merge([
+                new IntegrationField([
+                    'handle' => 'offer_slug',
+                    'name' => Craft::t('formie', 'Offer Slug'),
+                    'required' => true,
+                ]),
+                new IntegrationField([
+                    'handle' => 'email',
+                    'name' => Craft::t('formie', 'Email'),
+                    'required' => true,
+                ]),
+                new IntegrationField([
+                    'handle' => 'name',
+                    'name' => Craft::t('formie', 'Name'),
+                    'required' => true,
+                ]),
+                new IntegrationField([
+                    'handle' => 'phone',
+                    'name' => Craft::t('formie', 'Phone'),
+                ]),
+                new IntegrationField([
+                    'handle' => 'remote_cv_url',
+                    'name' => Craft::t('formie', 'CV'),
+                ]),
+                new IntegrationField([
+                    'handle' => 'referrer',
+                    'name' => Craft::t('formie', 'Referrer'),
+                ]),
+                new IntegrationField([
+                    'handle' => 'photo',
+                    'name' => Craft::t('formie', 'Photo'),
+                ]),
+                new IntegrationField([
+                    'handle' => 'cover_letter',
+                    'name' => Craft::t('formie', 'Cover Letter'),
+                ]),
+            ], $this->_getCustomFields($offers));
+
+            $settings = [
+                'candidate' => $candidateFields,
+            ];
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+        }
+
+        return new IntegrationConfig($settings);
+    }
+
+    public function getFieldMappingValues(Submission $submission, ?array $fieldMapping, mixed $fieldSettings = null)
+    {
+        // A quick shortcut to keep CRM's simple, just pass in a string to the namespace
+        $fields = is_string($fieldSettings) ? $this->getConfigValue($fieldSettings) : $fieldSettings;
+
+        return parent::getFieldMappingValues($submission, $fieldMapping, $fields);
+    }
+
+    public function fetchConnection(): bool
+    {
+        try {
+            $response = $this->request('GET', 'offers');
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return false;
+        }
+
+        return true;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function executePayload(Submission $submission): IntegrationResult
+    {
+        $this->beginPayloadDelivery($submission);
+
+        try {
+            $candidateValues = $this->getFieldMappingValues($submission, $this->candidateFieldMapping, 'candidate');
+
+            // Extract the offer slug
+            $offerSlug = ArrayHelper::remove($candidateValues, 'offer_slug');
+
+            // Handle open questions
+            $candidateValues['open_question_answers_attributes'] = $this->_prepCustomFields($candidateValues);
+
+            if ($this->mapToCandidate) {
+                $candidatePayload = [
+                    'candidate' => $candidateValues,
+                ];
+
+                $response = $this->deliverPayload($submission, "offers/{$offerSlug}/candidates", $candidatePayload);
+
+                if ($response === false) {
+                    return $this->resultForPayload(true);
+                }
+
+                $candidateId = $response['candidate']['id'] ?? '';
+
+                if (!$candidateId) {
+                    Integration::error($this, Craft::t('formie', 'Missing return “candidateId” {response}. Sent payload {payload}', [
+                        'response' => Json::encode($response),
+                        'payload' => Json::encode($candidatePayload),
+                    ]), true);
+
+                    return $this->resultForPayload(false);
+                }
+            }
+        } catch (Throwable $e) {
+            Integration::apiError($this, $e);
+
+            return $this->resultForPayload(false);
+        }
+
+        return $this->resultForPayload(true);
+    }
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['apiKey', 'subdomain'], 'required'];
+
+        $candidate = $this->getConfigValue('candidate');
+
+        // Validate the following when saving form settings
+        $rules[] = [
+            ['candidateFieldMapping'], 'validateFieldMapping', 'params' => $candidate, 'when' => function($model) {
+                return $model->enabled && $model->mapToCandidate;
+            }, 'on' => [Integration::SCENARIO_FORM], 'skipOnEmpty' => false,
+        ];
+
+        return $rules;
+    }
+
+    protected function defineClient(): Client
+    {
+        $subdomain = App::parseEnv($this->subdomain);
+
+        return Craft::createGuzzleClient([
+            'base_uri' => "https://{$subdomain}.recruitee.com/api/",
+        ]);
+    }
+
+    protected function defineFormSettingsSchema(FormInterface $form): array
+    {
+        $schema = parent::defineFormSettingsSchema($form);
+        $schema[] = SchemaHelper::lightswitchField([
+            'name' => 'mapToCandidate',
+            'label' => Craft::t('formie', 'Map to Candidate'),
+            'instructions' => Craft::t('formie', 'Whether to map form data to {name} {label}.', ['name' => $this->displayName(), 'label' => 'Candidates']),
+        ]);
+
+        $candidate = $this->getConfigValue('candidate');
+        $schemaFields = is_array($candidate) ? $this->convertIntegrationFieldsToSchema($candidate) : [];
+        $candidateMappingSchema = array_map(fn(array $f) => SchemaHelper::fieldSelectField([
+            'name' => $f['handle'],
+            'label' => $f['name'],
+            'required' => $f['required'],
+            'options' => $f['options'] ?? [],
+        ]), $schemaFields);
+
+        if ($candidateMappingSchema) {
+            $schema[] = SchemaHelper::groupField([
+                'name' => 'candidateFieldMapping',
+                'label' => Craft::t('formie', 'Candidate Field Mapping'),
+                'instructions' => Craft::t('formie', 'Choose how your form fields should map to your {name} {label} fields.', ['name' => $this->displayName(), 'label' => 'Candidate']),
+                'if' => 'mapToCandidate',
+                'children' => $candidateMappingSchema,
+            ]);
+        }
+
+        return $schema;
+    }
+
+
+    // Private Methods
+    // =========================================================================
+
+    private function _convertFieldType(string $fieldType): string
+    {
+        $fieldTypes = [
+            'boolean' => IntegrationField::TYPE_BOOLEAN,
+            'legal' => IntegrationField::TYPE_BOOLEAN,
+            'multi_choice' => IntegrationField::TYPE_ARRAY,
+        ];
+
+        return $fieldTypes[$fieldType] ?? IntegrationField::TYPE_STRING;
+    }
+
+    private function _getCustomFields(array $offers): array
+    {
+        $customFields = [];
+
+        $types = [
+            'boolean' => 'flag',
+            'legal' => 'flag',
+            'multi_choice' => 'multi_content',
+            'file' => 'remote_file_url',
+        ];
+
+        foreach ($offers as $offer) {
+            $openQuestions = $offer['open_questions'] ?? [];
+
+            foreach ($openQuestions as $openQuestion) {
+                $options = [];
+
+                $fieldOptions = $openQuestion['open_question_options'] ?? [];
+
+                foreach ($fieldOptions as $key => $fieldOption) {
+                    $options[] = [
+                        'label' => $fieldOption['body'],
+                        'value' => $fieldOption['id'],
+                    ];
+                }
+
+                if ($options) {
+                    $options = [
+                        'label' => $openQuestion['body'],
+                        'options' => $options,
+                    ];
+                }
+
+                // Get the right type we need to pass in later for the value param
+                $typeKey = $types[$openQuestion['kind']] ?? 'content';
+
+                $customFields[] = new IntegrationField([
+                    'handle' => 'open_questions:' . $typeKey . ':' . $openQuestion['id'],
+                    'name' => $openQuestion['body'],
+                    'type' => $this->_convertFieldType($openQuestion['kind']),
+                    'sourceType' => $openQuestion['kind'],
+                    'options' => $options,
+                ]);
+            }
+        }
+
+        return $customFields;
+    }
+
+    private function _prepCustomFields(&$fields, $extras = []): array
+    {
+        $customFields = [];
+
+        foreach ($fields as $key => $value) {
+            if (str_starts_with($key, 'open_questions:')) {
+                $field = ArrayHelper::remove($fields, $key);
+
+                $typeKey = str_replace('open_questions:', '', $key);
+                $typeKey = explode(':', $typeKey);
+
+                $customFields[] = [
+                    'open_question_id' => $typeKey[1],
+                    $typeKey[0] => $value,
+                ];
+            }
+        }
+
+        return $customFields;
+    }
+}

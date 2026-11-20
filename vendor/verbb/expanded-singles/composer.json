@@ -1,0 +1,44 @@
+{
+    "name": "verbb/expanded-singles",
+    "description": "A Craft CMS plugin that lists Single sections individually in the Entries sidebar.",
+    "type": "craft-plugin",
+    "version": "3.0.11",
+    "keywords": [
+        "craft",
+        "cms",
+        "craftcms",
+        "craft-plugin",
+        "expanded singles"
+    ],
+    "support": {
+        "email": "support@verbb.io",
+        "issues": "https://github.com/verbb/expanded-singles/issues?state=open",
+        "source": "https://github.com/verbb/expanded-singles",
+        "docs": "https://github.com/verbb/expanded-singles",
+        "rss": "https://github.com/verbb/expanded-singles/commits/v2.atom"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Verbb",
+            "homepage": "https://verbb.io"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "craftcms/cms": "^5.0.0",
+        "verbb/base": "^3.0.20"
+    },
+    "autoload": {
+        "psr-4": {
+            "verbb\\expandedsingles\\": "src/"
+        }
+    },
+    "extra": {
+        "name": "Expanded Singles",
+        "handle": "expanded-singles",
+        "documentationUrl": "https://github.com/verbb/expanded-singles",
+        "changelogUrl": "https://raw.githubusercontent.com/verbb/expanded-singles/craft-5/CHANGELOG.md",
+        "class": "verbb\\expandedsingles\\ExpandedSingles"
+    }
+}

@@ -1,0 +1,113 @@
+<?php
+namespace verbb\formie\fields;
+
+use verbb\formie\elements\db\FormQuery;
+use verbb\formie\elements\Form;
+use verbb\formie\gql\arguments\FormArguments;
+use verbb\formie\gql\interfaces\FormInterface;
+use verbb\formie\gql\resolvers\FormResolver;
+use verbb\formie\helpers\Gql as GqlHelper;
+
+use Craft;
+use craft\base\ElementInterface;
+use craft\db\Table;
+use craft\elements\ElementCollection;
+use craft\fields\BaseRelationField;
+use craft\helpers\Db;
+
+use GraphQL\Type\Definition\Type;
+
+class Forms extends BaseRelationField
+{
+    // Static Methods
+    // =========================================================================
+
+    public static function displayName(): string
+    {
+        return Craft::t('formie', 'Forms (Formie)');
+    }
+
+    public static function icon(): string
+    {
+        return '@verbb/formie/icon-mask.svg';
+    }
+
+    public static function elementType(): string
+    {
+        return Form::class;
+    }
+
+    public static function defaultSelectionLabel(): string
+    {
+        return Craft::t('formie', 'Add a form');
+    }
+
+    public static function phpType(): string
+    {
+        return sprintf('\\%s|\\%s<\\%s>', FormQuery::class, ElementCollection::class, Form::class);
+    }
+
+
+    // Constants
+    // =========================================================================
+
+    // Added here to back-support Craft <5.9.
+    public const VIEW_MODE_LIST = 'list';
+    public const VIEW_MODE_LIST_INLINE = 'list-inline';
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function getContentGqlType(): array|Type
+    {
+        return [
+            'name' => $this->handle,
+            'type' => Type::listOf(FormInterface::getType()),
+            'args' => FormArguments::getArguments(),
+            'resolve' => FormResolver::class . '::resolve',
+        ];
+    }
+
+    public function normalizeValue(mixed $value, ?ElementInterface $element): mixed
+    {
+        $value = parent::normalizeValue($value, $element);
+
+        // The CP form index only lists forms the user can view, but a relation's value isn't that index. Without this,
+        // editors who can't view the related forms see an empty field and remove the relations when they save.
+        if ($value instanceof FormQuery) {
+            $value->withoutCpIndexScope();
+        }
+
+        return $value;
+    }
+
+    public function getEagerLoadingGqlConditions(): ?array
+    {
+        // Eager-loaded values skip the resolver's schema check, so apply the same form scope here.
+        if (!GqlHelper::canQueryForms()) {
+            return null;
+        }
+
+        if (GqlHelper::canSchema('formieForms.all')) {
+            return [];
+        }
+
+        $formUids = GqlHelper::extractAllowedEntitiesFromSchema('read')['formieForms'] ?? [];
+        $formIds = $formUids ? array_values(Db::idsByUids(Table::ELEMENTS, $formUids)) : [];
+
+        return $formIds ? ['id' => $formIds] : null;
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function supportedViewModes(): array
+    {
+        return [
+            self::VIEW_MODE_LIST => Craft::t('app', 'List'),
+            self::VIEW_MODE_LIST_INLINE => Craft::t('app', 'Inline list'),
+        ];
+    }
+}

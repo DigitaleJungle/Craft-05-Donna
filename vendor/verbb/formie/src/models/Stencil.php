@@ -1,0 +1,342 @@
+<?php
+namespace verbb\formie\models;
+
+use verbb\formie\Formie;
+use verbb\formie\base\FormInterface;
+use verbb\formie\elements\Form;
+use verbb\formie\services\Stencils as StencilsService;
+use verbb\formie\services\SubmissionStatuses;
+
+use Craft;
+use craft\base\Model;
+use craft\db\SoftDeleteTrait;
+use craft\elements\Entry;
+use craft\helpers\Json;
+use craft\helpers\UrlHelper;
+use craft\validators\HandleValidator;
+
+use DateTime;
+
+class Stencil extends Model implements FormInterface
+{
+    // Traits
+    // =========================================================================
+
+    use SoftDeleteTrait {
+        behaviors as softDeleteBehaviors;
+    }
+
+
+    // Properties
+    // =========================================================================
+
+    public ?int $id = null;
+    public ?string $name = null;
+    public ?string $handle = null;
+    public string $scope = StencilsService::SCOPE_PROJECT;
+    public ?StencilData $data = null;
+    public ?int $templateId = null;
+    public ?int $redirectEntryId = null;
+    public ?int $redirectEntrySiteId = null;
+    public ?int $defaultStatusId = null;
+    public ?DateTime $dateDeleted = null;
+    public ?string $uid = null;
+
+    private ?FormTemplate $_template = null;
+    private ?SubmissionStatus $_defaultStatus = null;
+    private mixed $_redirectEntry = null;
+
+
+    // Public Methods
+    // =========================================================================
+
+    public function __construct($config = [])
+    {
+        // Config normalization
+        if (array_key_exists('data', $config)) {
+            // Older site-scoped stencils were encoded before being assigned to
+            // a native JSON column, leaving one additional JSON string layer.
+            for ($layer = 0; $layer < 2 && is_string($config['data']); $layer++) {
+                $config['data'] = Json::decodeIfJson($config['data']);
+            }
+
+            if (is_array($config['data'])) {
+                $config['data'] = new StencilData($config['data']);
+            }
+
+            if (!($config['data'] instanceof StencilData)) {
+                $config['data'] = new StencilData();
+            }
+        } else {
+            $config['data'] = new StencilData();
+        }
+
+        parent::__construct($config);
+    }
+
+    public function __toString()
+    {
+        return $this->getDisplayName();
+    }
+
+    public function getTitle(): string
+    {
+        return $this->name;
+    }
+
+    public function setTitle(string $value): void
+    {
+        $this->name = $value;
+    }
+
+    public function getCpEditUrl(): ?string
+    {
+        return UrlHelper::cpUrl('formie/stencils/edit/' . $this->id);
+    }
+
+    public function isProjectScope(): bool
+    {
+        return $this->scope === StencilsService::SCOPE_PROJECT;
+    }
+
+    public function isSiteScope(): bool
+    {
+        return $this->scope === StencilsService::SCOPE_SITE;
+    }
+
+    public function getScopeLabel(): string
+    {
+        if ($this->isSiteScope()) {
+            return '';
+        }
+
+        return Craft::t('formie', 'Project');
+    }
+
+    public function canEdit(): bool
+    {
+        if ($this->isSiteScope()) {
+            return true;
+        }
+
+        return (bool)Craft::$app->getConfig()->getGeneral()->allowAdminChanges;
+    }
+
+    public function canDelete(): bool
+    {
+        return $this->canEdit();
+    }
+
+    public function getDisplayName(): string
+    {
+        if ($this->dateDeleted !== null) {
+            return Craft::t('formie', '{title} (Trashed)', ['title' => $this->name]);
+        }
+
+        return $this->name;
+    }
+
+    public function getNotifications(): array
+    {
+        return $this->data->notifications ?? [];
+    }
+
+    public function getId(): ?int
+    {
+        return $this->id;
+    }
+
+    public function getHandle(): ?string
+    {
+        return $this->handle;
+    }
+
+    public function getFormLayout(): FieldLayout
+    {
+        return $this->data->getFieldLayout();
+    }
+
+    public function getSettings(): FormSettings
+    {
+        return $this->data->settings;
+    }
+
+    public function getFormBuilderConfig(): array
+    {
+        return [
+            'id' => $this->id,
+            'title' => $this->getTitle(),
+            'handle' => $this->handle,
+            'errors' => $this->getErrors(),
+            'templateId' => $this->templateId,
+            'pages' => $this->getFormLayout()->getFormBuilderConfig(),
+            'settings' => $this->getSettings()->getFormBuilderConfig(),
+            'isStencil' => true,
+        ];
+    }
+
+    public function getNotificationsConfig(): array
+    {
+        return Formie::$plugin->getNotifications()->getNotificationsConfig($this->getNotifications());
+    }
+
+    public function getConfig(): array
+    {
+        return [
+            'name' => $this->name,
+            'handle' => $this->handle,
+            'template' => $this->getTemplate()->uid ?? null,
+            'defaultStatus' => $this->getDefaultStatus()->uid ?? null,
+            'redirectEntry' => $this->getRedirectEntry()->uid ?? null,
+            'data' => $this->data->getSerializedData(),
+        ];
+    }
+
+    public function getTemplate(): ?FormTemplate
+    {
+        if (!$this->_template) {
+            if ($this->templateId) {
+                $this->_template = Formie::$plugin->getFormTemplates()->getTemplateById($this->templateId);
+            } else {
+                return null;
+            }
+        }
+
+        return $this->_template;
+    }
+
+    public function setTemplate(?FormTemplate $template): void
+    {
+        if ($template) {
+            $this->_template = $template;
+            $this->templateId = $template->id;
+        } else {
+            $this->_template = $this->templateId = null;
+        }
+    }
+
+    public function getRedirectEntry(): ?Entry
+    {
+        if (!$this->redirectEntryId) {
+            return null;
+        }
+
+        if (!$this->_redirectEntry) {
+            $siteId = $this->redirectEntrySiteId ?: '*';
+
+            $this->_redirectEntry = Craft::$app->getEntries()->getEntryById($this->redirectEntryId, $siteId);
+        }
+
+        return $this->_redirectEntry;
+    }
+
+    /** @deprecated Use redirectEntryId. */
+    public function getSubmitActionEntryId(): ?int
+    {
+        return $this->redirectEntryId;
+    }
+
+    /** @deprecated Use redirectEntryId. */
+    public function setSubmitActionEntryId(?int $value): void
+    {
+        $this->redirectEntryId = $value;
+    }
+
+    /** @deprecated Use redirectEntrySiteId. */
+    public function getSubmitActionEntrySiteId(): ?int
+    {
+        return $this->redirectEntrySiteId;
+    }
+
+    /** @deprecated Use redirectEntrySiteId. */
+    public function setSubmitActionEntrySiteId(?int $value): void
+    {
+        $this->redirectEntrySiteId = $value;
+    }
+
+    public function getDefaultStatus(): SubmissionStatus
+    {
+        if (!$this->_defaultStatus) {
+            if ($this->defaultStatusId) {
+                $this->_defaultStatus = Formie::$plugin->getSubmissionStatuses()->getStatusById($this->defaultStatusId);
+            } else {
+                $this->_defaultStatus = Formie::$plugin->getSubmissionStatuses()->getAllStatuses()[0] ?? null;
+            }
+        }
+
+        // Check if for whatever reason there isn't a default status - create it
+        if ($this->_defaultStatus === null) {
+            // But check for admin changes, as it's a project config setting change to make.
+            if (Craft::$app->getConfig()->getGeneral()->allowAdminChanges) {
+                $projectConfig = Craft::$app->getProjectConfig();
+
+                // Maybe the project config didn't get applied? Check for existing values
+                // This can likely be removed later, as this fix is already in place when installing Formie
+                $statuses = $projectConfig->get(SubmissionStatuses::CONFIG_SUBMISSION_STATUSES_KEY, true) ?? [];
+
+                foreach ($statuses as $statusUid => $statusData) {
+                    $projectConfig->processConfigChanges(SubmissionStatuses::CONFIG_SUBMISSION_STATUSES_KEY . '.' . $statusUid, true);
+                }
+
+                // If there's _still_ not a status, just go ahead and create it...
+                $this->_defaultStatus = Formie::$plugin->getSubmissionStatuses()->getAllStatuses()[0] ?? null;
+
+                if ($this->_defaultStatus === null) {
+                    $this->_defaultStatus = new SubmissionStatus([
+                        'name' => 'New',
+                        'handle' => 'new',
+                        'color' => 'turquoise',
+                        'sortOrder' => 1,
+                        'isDefault' => 1,
+                    ]);
+
+                    Formie::$plugin->getSubmissionStatuses()->saveStatus($this->_defaultStatus);
+                }
+            }
+        }
+
+        return $this->_defaultStatus;
+    }
+
+    public function setDefaultStatus(?SubmissionStatus $status): void
+    {
+        if ($status) {
+            $this->_defaultStatus = $status;
+            $this->defaultStatusId = $status->id;
+        } else {
+            $this->_defaultStatus = $this->defaultStatusId = null;
+        }
+    }
+
+    public function applyStencilToForm(Form $form, bool $regenerateFieldReferences = false): void
+    {
+        $this->data->populateToForm($form, $regenerateFieldReferences);
+
+        foreach ($this->data->warnings as $warning) {
+            Formie::warning($warning);
+        }
+
+        $form->layoutSaveContext = new LayoutSaveContext('stencil');
+        $form->setTemplate($this->getTemplate());
+        $form->setDefaultStatus($this->getDefaultStatus());
+    }
+
+
+    // Protected Methods
+    // =========================================================================
+
+    protected function defineRules(): array
+    {
+        $rules = parent::defineRules();
+
+        $rules[] = [['name', 'handle'], 'required'];
+        $rules[] = [['name', 'handle'], 'string', 'max' => 255];
+        $rules[] = [['scope'], 'in', 'range' => [StencilsService::SCOPE_PROJECT, StencilsService::SCOPE_SITE]];
+        $rules[] = [
+            ['handle'],
+            HandleValidator::class,
+            'reservedWords' => ['id', 'dateCreated', 'dateUpdated', 'uid', 'title'],
+        ];
+        return $rules;
+    }
+}

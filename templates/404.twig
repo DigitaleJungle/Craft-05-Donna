@@ -1,0 +1,14 @@
+{% extends "_snips/_layout.twig" %}
+{% set title = "Pagina niet gevonden" %}
+{% block body %}
+<section class="pb-18" data-animated-id="1">
+    <div class="container text-center">
+        <div class="content-404-wrapper">
+            <h1 class="fs-142px">404</h1>
+            <h4 class="fs-3 mb-5">Pagina niet gevonden</h4>
+            <p class="mb-11">{{ message ?? "De pagina die je zoekt bestaat niet (meer) of is verplaatst." }}</p>
+            <a href="{{ currentSite.baseUrl }}" class="btn btn-dark btn-hover-border-primary btn-hover-bg-primary">Terug naar de homepage</a>
+        </div>
+    </div>
+</section>
+{% endblock %}
