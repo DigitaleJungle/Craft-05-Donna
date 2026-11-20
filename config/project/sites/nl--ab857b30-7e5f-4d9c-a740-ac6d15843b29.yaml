@@ -3,7 +3,7 @@ enabled: true
 handle: nl
 hasUrls: true
 language: nl-BE
-name: Sandbox
+name: Nederlands
 primary: true
 siteGroup: c5c66daa-734e-4c55-8b7a-fb3bc33dc9e8 # $PROJECT_NAME
 sortOrder: 1

@@ -6,7 +6,7 @@ maxNodes: null
 name: 'main Menu'
 propagationMethod: all
 sites:
-  ab857b30-7e5f-4d9c-a740-ac6d15843b29: # Sandbox
+  ab857b30-7e5f-4d9c-a740-ac6d15843b29: # Nederlands
     enabled: true
   d4ecdb56-3a81-4556-9fa7-7b28a2ff0918: # Engels
     enabled: true
