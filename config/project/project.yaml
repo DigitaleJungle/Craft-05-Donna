@@ -1,4 +1,4 @@
-dateModified: 1795192817
+dateModified: 1795193352
 fs:
   cloudinary:
     name: Cloudinary
@@ -229,7 +229,8 @@ plugins:
 system:
   edition: solo
   live: true
-  name: Test
+  name: $PROJECT_NAME
+  retryDuration: null
   schemaVersion: 5.12.0.2
   timeZone: Europe/Brussels
 users:
